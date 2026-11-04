@@ -291,7 +291,7 @@ class _NewChatSheetState extends State<NewChatSheet> {
       final result = await Supabase.instance.client.from('profiles')
         .select('id,display_name,username')
         .neq('id', me)
-        .or('username.ilike.%${value}%,display_name.ilike.%${value}%')
+        .or('username.ilike.%$value%,display_name.ilike.%$value%')
         .limit(20);
       setState(() { users = result.cast<Map<String, dynamic>>(); error = null; });
     } catch (_) { setState(() => error = 'تعذر البحث عن المستخدمين.'); }
