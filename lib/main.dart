@@ -280,7 +280,10 @@ class NewChatSheet extends StatefulWidget {
 class _NewChatSheetState extends State<NewChatSheet> {
   final controller = TextEditingController();
   List<Map<String, dynamic>> users = [];
+  final Set<String> selectedIds = {};
+  final groupTitle = TextEditingController();
   bool busy = false;
+  bool creatingGroup = false;
   String? error;
 
   Future<void> findUsers(String value) async {
@@ -298,6 +301,28 @@ class _NewChatSheetState extends State<NewChatSheet> {
     finally { if (mounted) setState(() => busy = false); }
   }
 
+  Future<void> createGroup() async {
+    if (groupTitle.text.trim().length < 2 || selectedIds.isEmpty) {
+      setState(() => error = 'اكتب اسم المجموعة واختر عضواً واحداً على الأقل.');
+      return;
+    }
+    setState(() { busy = true; error = null; });
+    try {
+      final result = await Supabase.instance.client.rpc(
+        'create_group_conversation',
+        params: {'group_title': groupTitle.text.trim(), 'member_ids': selectedIds.toList()},
+      );
+      if (!mounted) return;
+      final title = groupTitle.text.trim();
+      Navigator.pop(context);
+      Navigator.push(context, MaterialPageRoute(builder: (_) => ChatPage(conversationId: result.toString(), title: title)));
+    } catch (_) {
+      if (mounted) setState(() => error = 'تعذر إنشاء المجموعة. تأكد من تطبيق ترحيل قاعدة البيانات رقم 002.');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
   Future<void> startChat(Map<String, dynamic> user) async {
     setState(() => busy = true);
     try {
@@ -310,13 +335,25 @@ class _NewChatSheetState extends State<NewChatSheet> {
   }
 
   @override
-  void dispose() { controller.dispose(); super.dispose(); }
+  void dispose() { controller.dispose(); groupTitle.dispose(); super.dispose(); }
   @override
   Widget build(BuildContext context) => Padding(
     padding: EdgeInsets.fromLTRB(18, 18, 18, MediaQuery.of(context).viewInsets.bottom + 24),
     child: Column(mainAxisSize: MainAxisSize.min, children: [
-      const Text('محادثة جديدة', style: TextStyle(fontSize: 21, fontWeight: FontWeight.bold)),
-      const SizedBox(height: 14),
+      Row(children: [
+        Expanded(child: Text(creatingGroup ? 'إنشاء مجموعة' : 'محادثة جديدة', style: const TextStyle(fontSize: 21, fontWeight: FontWeight.bold))),
+        TextButton.icon(
+          onPressed: () => setState(() { creatingGroup = !creatingGroup; selectedIds.clear(); error = null; }),
+          icon: Icon(creatingGroup ? Icons.person_outline : Icons.groups_outlined),
+          label: Text(creatingGroup ? 'محادثة فردية' : 'مجموعة'),
+        ),
+      ]),
+      if (creatingGroup) ...[
+        const SizedBox(height: 10),
+        TextField(controller: groupTitle, decoration: const InputDecoration(labelText: 'اسم المجموعة', border: OutlineInputBorder())),
+        const SizedBox(height: 10),
+      ],
+      const SizedBox(height: 8),
       TextField(controller: controller, onChanged: findUsers, decoration: const InputDecoration(hintText: 'ابحث بالاسم أو اسم المستخدم', prefixIcon: Icon(Icons.search), border: OutlineInputBorder())),
       if (busy) const Padding(padding: EdgeInsets.all(10), child: LinearProgressIndicator()),
       if (error != null) Text(error!, style: const TextStyle(color: Colors.red)),
@@ -324,8 +361,32 @@ class _NewChatSheetState extends State<NewChatSheet> {
         leading: const CircleAvatar(child: Icon(Icons.person)),
         title: Text(u['display_name']?.toString() ?? ''),
         subtitle: Text('@${u['username'] ?? ''}'),
-        onTap: () => startChat(u),
+        trailing: creatingGroup ? Checkbox(
+          value: selectedIds.contains(u['id'].toString()),
+          onChanged: (checked) => setState(() {
+            final id = u['id'].toString();
+            if (checked == true) { selectedIds.add(id); } else { selectedIds.remove(id); }
+          }),
+        ) : null,
+        onTap: () {
+          if (creatingGroup) {
+            setState(() {
+              final id = u['id'].toString();
+              if (!selectedIds.add(id)) selectedIds.remove(id);
+            });
+          } else {
+            startChat(u);
+          }
+        },
       )).toList())),
+      if (creatingGroup) Padding(
+        padding: const EdgeInsets.only(top: 10),
+        child: SizedBox(width: double.infinity, child: FilledButton.icon(
+          onPressed: busy ? null : createGroup,
+          icon: const Icon(Icons.group_add_outlined),
+          label: Text('إنشاء المجموعة (${selectedIds.length})'),
+        )),
+      ),
     ]),
   );
 }
