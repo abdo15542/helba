@@ -3,6 +3,6 @@ import 'package:helba/main.dart';
 
 void main() {
   test('HELBA brand color is configured', () {
-    expect(green.value, 0xFF087A4B);
+    expect(green.toARGB32(), 0xFF087A4B);
   });
 }
