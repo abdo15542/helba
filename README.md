@@ -30,8 +30,9 @@ flutter run \
 1. أنشئ مشروع Supabase.
 2. شغّل `supabase/schema.sql` داخل SQL Editor.
 3. فعّل تأكيد البريد الإلكتروني في Authentication.
-4. أضف جدول `messages` إلى Realtime publication من لوحة Supabase.
-5. أضف بيانات المستخدم إلى `profiles` بعد التسجيل (النسخة الحالية لا تحتوي بعد على شاشة استكمال الملف الشخصي).
+4. شغّل ملف الترحيل `supabase/migrations/202611050001_profiles_and_direct_chat.sql` بعد المخطط الأساسي؛ ينشئ ملف المستخدم تلقائياً عند التسجيل ويعالج إنشاء المحادثة المباشرة المتزامن.
+5. أضف جدول `messages` إلى Realtime publication من لوحة Supabase.
+6. راجع إعدادات SMTP وقوالب تأكيد البريد واستعادة كلمة المرور قبل فتح التسجيل للعامة.
 
 ## بناء APK
 بعد توليد منصة Android وضبط مفاتيح Supabase:
