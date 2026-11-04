@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'dart:ui' as ui;
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:intl/intl.dart';
@@ -9,9 +10,9 @@ const secureStore = FlutterSecureStorage();
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   const url = String.fromEnvironment('SUPABASE_URL');
-  const key = String.fromEnvironment('SUPABASE_ANON_KEY');
+  const key = String.fromEnvironment('SUPABASE_PUBLISHABLE_KEY', defaultValue: String.fromEnvironment('SUPABASE_ANON_KEY'));
   if (url.isNotEmpty && key.isNotEmpty) {
-    await Supabase.initialize(url: url, anonKey: key);
+    await Supabase.initialize(url: url, publishableKey: key);
   }
   runApp(const HelbaApp());
 }
@@ -28,7 +29,7 @@ class HelbaApp extends StatelessWidget {
       scaffoldBackgroundColor: const Color(0xFFF5F8F6),
       fontFamily: 'Arial',
     ),
-    home: const Directionality(textDirection: TextDirection.rtl, child: AuthGate()),
+    home: Directionality(textDirection: ui.TextDirection.rtl, child: const AuthGate()),
   );
 }
 
