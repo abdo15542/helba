@@ -3,6 +3,8 @@ import 'dart:ui' as ui;
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:intl/intl.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 const green = Color(0xFF087A4B);
 const secureStore = FlutterSecureStorage();
@@ -403,6 +405,86 @@ class _ChatPageState extends State<ChatPage> {
   bool sending = false;
   final client = Supabase.instance.client;
 
+
+  String? _mimeFor(String extension) {
+    switch (extension.toLowerCase()) {
+      case 'jpg':
+      case 'jpeg': return 'image/jpeg';
+      case 'png': return 'image/png';
+      case 'webp': return 'image/webp';
+      case 'gif': return 'image/gif';
+      case 'mp4': return 'video/mp4';
+      case 'mov': return 'video/quicktime';
+      case 'mp3': return 'audio/mpeg';
+      case 'm4a': return 'audio/mp4';
+      case 'aac': return 'audio/aac';
+      case 'ogg': return 'audio/ogg';
+      case 'wav': return 'audio/wav';
+      case 'pdf': return 'application/pdf';
+      case 'txt': return 'text/plain';
+      case 'zip': return 'application/zip';
+      default: return null;
+    }
+  }
+
+  Future<void> sendAttachment() async {
+    if (sending) return;
+    try {
+      final result = await FilePicker.platform.pickFiles(withData: true, type: FileType.any);
+      if (result == null || result.files.isEmpty) return;
+      final file = result.files.single;
+      final bytes = file.bytes;
+      final mime = _mimeFor(file.extension ?? '');
+      if (bytes == null || mime == null) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('نوع الملف غير مدعوم. اختر صورة أو فيديو أو صوتاً أو PDF أو TXT أو ZIP.')),
+        );
+        return;
+      }
+      if (bytes.length > 50 * 1024 * 1024) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('الحد الأقصى لحجم الملف هو 50 ميغابايت.')),
+        );
+        return;
+      }
+      setState(() => sending = true);
+      final uid = client.auth.currentUser!.id;
+      final safeName = file.name.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+      final path = widget.conversationId + '/' + uid + '/' +
+          DateTime.now().microsecondsSinceEpoch.toString() + '_' + safeName;
+      await client.storage.from('helba-chat-media').uploadBinary(
+        path, bytes, fileOptions: FileOptions(contentType: mime, upsert: false),
+      );
+      final type = mime.startsWith('image/') ? 'image'
+          : mime.startsWith('video/') ? 'video'
+          : mime.startsWith('audio/') ? 'audio' : 'file';
+      await client.from('messages').insert({
+        'conversation_id': widget.conversationId,
+        'sender_id': uid,
+        'body': file.name,
+        'message_type': type,
+        'attachment_path': path,
+      });
+    } catch (_) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('تعذر رفع الملف. تحقق من الاتصال ونوع الملف.')),
+      );
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
+  }
+
+  Future<void> openAttachment(String path) async {
+    try {
+      final url = await client.storage.from('helba-chat-media').createSignedUrl(path, 300);
+      await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+    } catch (_) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('تعذر فتح المرفق أو انتهت صلاحيته.')),
+      );
+    }
+  }
+
   Future<void> send() async {
     final body = input.text.trim();
     if (body.isEmpty || sending) return;
@@ -451,7 +533,19 @@ class _ChatPageState extends State<ChatPage> {
                     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                     decoration: BoxDecoration(color: mine ? const Color(0xFFDDF3E6) : Colors.white, borderRadius: BorderRadius.circular(16)),
                     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Text(row['body']?.toString() ?? ''),
+                      if (row['attachment_path'] != null)
+                        InkWell(
+                          onTap: () => openAttachment(row['attachment_path'].toString()),
+                          child: Row(mainAxisSize: MainAxisSize.min, children: [
+                            const Icon(Icons.attach_file, size: 18, color: green),
+                            const SizedBox(width: 5),
+                            Flexible(child: Text(row['body']?.toString() ?? 'مرفق', style: const TextStyle(decoration: TextDecoration.underline))),
+                            const SizedBox(width: 5),
+                            const Icon(Icons.download_rounded, size: 17, color: green),
+                          ]),
+                        )
+                      else
+                        Text(row['body']?.toString() ?? ''),
                       if (time != null) Text(DateFormat('HH:mm').format(time), style: const TextStyle(fontSize: 10, color: Colors.black54)),
                     ]),
                   ),
@@ -463,6 +557,11 @@ class _ChatPageState extends State<ChatPage> {
         SafeArea(child: Padding(
           padding: const EdgeInsets.fromLTRB(10, 6, 10, 10),
           child: Row(children: [
+            IconButton(
+              tooltip: 'إرفاق ملف',
+              onPressed: sending ? null : sendAttachment,
+              icon: const Icon(Icons.attach_file),
+            ),
             Expanded(child: TextField(controller: input, minLines: 1, maxLines: 4, decoration: InputDecoration(hintText: 'اكتب رسالة...', filled: true, fillColor: Colors.white, border: OutlineInputBorder(borderRadius: BorderRadius.circular(22), borderSide: BorderSide.none)))),
             const SizedBox(width: 8),
             IconButton.filled(onPressed: sending ? null : send, icon: const Icon(Icons.send), style: IconButton.styleFrom(backgroundColor: green, foregroundColor: Colors.white)),
