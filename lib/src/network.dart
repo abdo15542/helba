@@ -254,6 +254,10 @@ class HelbaHttpOverrides extends io.HttpOverrides {
   @override
   io.HttpClient createHttpClient(io.SecurityContext? context) {
     final client = super.createHttpClient(context);
+    // Identify as a normal browser client (see browserUserAgent): some
+    // networks answer Dart's default agent with an HTML challenge page
+    // instead of the JSON Supabase returns.
+    client.userAgent = browserUserAgent;
     // When the phone has a system proxy (WiFi/APN), route every request
     // through it like the browser does. When there is none, leave the
     // default (environment proxy, if any) untouched.

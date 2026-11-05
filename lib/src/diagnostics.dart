@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io' as io;
 
 import 'package:flutter/material.dart';
@@ -24,6 +25,12 @@ String describeAddresses(List<io.InternetAddress> addresses) =>
     addresses.isEmpty
         ? 'لم يتم العثور على عناوين'
         : addresses.map((a) => a.address).join(', ');
+
+/// True when a response body is JSON (Supabase's real answer), false when
+/// it is an HTML page from bot protection or an ISP middlebox standing in
+/// for the server — the case that makes signup fail with
+/// 'Failed to decode error response'.
+bool isJsonResponseBody(String body) => body.trimLeft().startsWith('{');
 
 class DiagnosticResult {
   const DiagnosticResult({
@@ -55,6 +62,7 @@ class _NetworkDiagnosticsPageState extends State<NetworkDiagnosticsPage> {
     'DNS عبر HTTPS',
     'الاتصال المباشر بعنوان الخادم',
     'الوصول إلى Supabase Auth',
+    'فحص التسجيل',
   ];
 
   List<DiagnosticResult> _results = [];
@@ -80,6 +88,7 @@ class _NetworkDiagnosticsPageState extends State<NetworkDiagnosticsPage> {
     await _runOne(2, _checkDoh);
     await _runOne(3, _checkSeedDial);
     await _runOne(4, _checkAuthHealth);
+    await _runOne(5, _checkSignupProbe);
     if (mounted) setState(() => _running = false);
   }
 
@@ -192,6 +201,50 @@ class _NetworkDiagnosticsPageState extends State<NetworkDiagnosticsPage> {
     } catch (e) {
       return DiagnosticResult(
         title: _titles[4],
+        status: CheckStatus.failed,
+        detail: e.toString(),
+      );
+    } finally {
+      client.close();
+    }
+  }
+
+  Future<DiagnosticResult> _checkSignupProbe() async {
+    // Probe the exact endpoint signup uses, with a deliberately invalid
+    // email, so no account is ever created. A healthy path returns a
+    // JSON 400 ('Unable to validate email address'); an HTML body means
+    // something on the network (bot protection / an ISP page) is
+    // answering in place of Supabase — which is exactly what makes
+    // signup fail with 'Failed to decode error response'.
+    final client = io.HttpClient();
+    try {
+      final request = await client
+          .postUrl(Uri.parse('https://$supabaseHost/auth/v1/signup'))
+          .timeout(const Duration(seconds: 15));
+      request.headers.set('apikey', supabasePublishableKey);
+      request.headers.set('Content-Type', 'application/json');
+      request.write(jsonEncode({
+        'email': 'diagnostic-invalid',
+        'password': 'DiagnosticProbe123!',
+      }));
+      final response =
+          await request.close().timeout(const Duration(seconds: 15));
+      final body = await response
+          .transform(utf8.decoder)
+          .join()
+          .timeout(const Duration(seconds: 10));
+      final snippet =
+          body.length > 200 ? '${body.substring(0, 200)}…' : body;
+      return DiagnosticResult(
+        title: _titles[5],
+        status: isJsonResponseBody(body)
+            ? CheckStatus.passed
+            : CheckStatus.failed,
+        detail: 'رمز الحالة: ${response.statusCode}\n$snippet',
+      );
+    } catch (e) {
+      return DiagnosticResult(
+        title: _titles[5],
         status: CheckStatus.failed,
         detail: e.toString(),
       );

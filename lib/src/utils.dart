@@ -22,5 +22,12 @@ String? networkErrorMessage(Object e) {
       text.contains('Failed host lookup')) {
     return 'تعذّر الوصول إلى خادم هلبة. تحقق من اتصالك بالإنترنت وحاول مجدداً.';
   }
+  // The server answered, but with a body the Auth client could not parse
+  // (usually an HTML page from bot protection or an ISP middlebox standing
+  // in for Supabase). Say so plainly instead of showing the raw English.
+  if (text.contains('Failed to decode error response') ||
+      text.contains('Received an empty response')) {
+    return 'وصل رد غير متوقع من الخادم أثناء إنشاء الحساب. جرّب شبكة أخرى أو أعد المحاولة.';
+  }
   return null;
 }
