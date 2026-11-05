@@ -1,7 +1,10 @@
 import 'dart:io' as io;
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:helba/main.dart';
+import 'package:helba/src/config.dart';
+import 'package:helba/src/diagnostics.dart';
+import 'package:helba/src/network.dart';
+import 'package:helba/src/utils.dart';
 
 void main() {
   test('HELBA brand color is configured', () {
@@ -105,4 +108,28 @@ void main() {
       client.close();
     }
   }, timeout: const Timeout(Duration(seconds: 30)));
+
+  group('diagnostics helpers', () {
+    test('checkStatusLabel returns Arabic labels', () {
+      expect(checkStatusLabel(CheckStatus.running), 'جارٍ…');
+      expect(checkStatusLabel(CheckStatus.passed), 'ناجح');
+      expect(checkStatusLabel(CheckStatus.failed), 'فاشل');
+    });
+
+    test('describeProxy reports a proxy or its absence', () {
+      expect(describeProxy(null), 'لا يوجد بروكسي');
+      expect(describeProxy('10.0.0.1:8080'), 'البروكسي: 10.0.0.1:8080');
+    });
+
+    test('describeAddresses joins resolved addresses', () {
+      expect(describeAddresses([]), 'لم يتم العثور على عناوين');
+      expect(
+        describeAddresses([
+          io.InternetAddress('104.18.38.10'),
+          io.InternetAddress('172.64.149.246'),
+        ]),
+        '104.18.38.10, 172.64.149.246',
+      );
+    });
+  });
 }
