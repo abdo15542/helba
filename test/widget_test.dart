@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io' as io;
 
 import 'package:flutter_test/flutter_test.dart';
@@ -5,6 +6,17 @@ import 'package:helba/src/config.dart';
 import 'package:helba/src/diagnostics.dart';
 import 'package:helba/src/network.dart';
 import 'package:helba/src/utils.dart';
+
+/// True when the process runs behind a proxy (sandboxed environment):
+/// direct TCP is intercepted there, so tests that need a direct TLS
+/// handshake cannot run and must skip instead of failing.
+bool get _hasProxyEnvironment {
+  final env = io.Platform.environment;
+  return env['https_proxy'] != null ||
+      env['HTTPS_PROXY'] != null ||
+      env['http_proxy'] != null ||
+      env['HTTP_PROXY'] != null;
+}
 
 void main() {
   test('HELBA brand color is configured', () {
@@ -99,11 +111,69 @@ void main() {
       final request = await client.getUrl(Uri.parse(
           'https://mpgnybncdiaaohjaqejq.supabase.co/auth/v1/health'));
       final response = await request.close();
+      final body = await response.transform(utf8.decoder).join();
       // Without an API key the live Auth service answers 401 (some edges
       // answer 400); either proves we reached it instead of failing in
-      // the network layer.
+      // the network layer. The body must be Supabase's JSON — a status
+      // alone also matches nginx's HTML 'plain HTTP on HTTPS port' page.
       expect(response.statusCode, isIn([400, 401]));
-      await response.drain<void>();
+      expect(body.trimLeft().startsWith('{'), isTrue);
+    } finally {
+      client.close();
+    }
+  }, timeout: const Timeout(Duration(seconds: 30)));
+
+  test('Helba overrides perform a real TLS handshake (no plain HTTP)',
+      () async {
+    // A direct network path is required: in a sandboxed environment the
+    // egress proxy intercepts TCP, so no TLS handshake can complete.
+    // On CI (no proxy variables) the test runs for real.
+    if (_hasProxyEnvironment) {
+      markTestSkipped('Direct network path unavailable in this environment');
+      return;
+    }
+    io.HttpOverrides.global = HelbaHttpOverrides();
+    final client = io.HttpClient();
+    // Force the direct path (no environment proxy): this is the path the
+    // phone takes, and the one that used to send plain HTTP to port 443.
+    client.findProxy = (_) => 'DIRECT';
+    try {
+      final request = await client.getUrl(Uri.parse(
+          'https://mpgnybncdiaaohjaqejq.supabase.co/auth/v1/health'));
+      final response = await request.close();
+      final body = await response.transform(utf8.decoder).join();
+      expect(response.statusCode, isIn([400, 401]));
+      // Before the TLS fix the server answered with nginx's HTML
+      // '400 The plain HTTP request was sent to HTTPS port' page.
+      expect(body.trimLeft().startsWith('{'), isTrue);
+    } finally {
+      client.close();
+    }
+  }, timeout: const Timeout(Duration(seconds: 30)));
+
+  test('signup probe reaches Supabase as JSON, not an HTML error page',
+      () async {
+    if (_hasProxyEnvironment) {
+      markTestSkipped('Direct network path unavailable in this environment');
+      return;
+    }
+    io.HttpOverrides.global = HelbaHttpOverrides();
+    final client = io.HttpClient();
+    client.findProxy = (_) => 'DIRECT';
+    try {
+      final request = await client.postUrl(Uri.parse(
+          'https://mpgnybncdiaaohjaqejq.supabase.co/auth/v1/signup'));
+      request.headers.set('apikey', supabasePublishableKey);
+      request.headers.set('Content-Type', 'application/json');
+      request.write(jsonEncode({
+        'email': 'diagnostic-invalid',
+        'password': 'DiagnosticProbe123!',
+      }));
+      final response = await request.close();
+      final body = await response.transform(utf8.decoder).join();
+      expect(response.statusCode, 400);
+      expect(body.trimLeft().startsWith('{'), isTrue);
+      expect(body, contains('Unable to validate email address'));
     } finally {
       client.close();
     }
