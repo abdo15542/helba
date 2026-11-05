@@ -180,13 +180,22 @@ class _LoginPageState extends State<LoginPage> {
           const SizedBox(height: 18),
           FilledButton(onPressed: busy ? null : submit, child: busy ? const CircularProgressIndicator() : Text(signup ? 'إنشاء الحساب' : 'دخول')),
           TextButton(onPressed: busy ? null : () => setState(() { signup = !signup; error = null; message = null; }), child: Text(signup ? 'لديك حساب؟ سجل الدخول' : 'ليس لديك حساب؟ أنشئ حساباً')),
-          TextButton(onPressed: () async {
-            final e = email.text.trim();
-            if (e.contains('@')) {
+          TextButton(onPressed: busy ? null : () async {
+            final e = email.text.trim().toLowerCase();
+            if (!e.contains('@')) {
+              setState(() => error = 'أدخل بريدك الإلكتروني أولاً.');
+              return;
+            }
+            setState(() { busy = true; error = null; message = null; });
+            try {
               await Supabase.instance.client.auth.resetPasswordForEmail(e);
               if (mounted) setState(() => message = 'إذا كان البريد مسجلاً فستصلك رسالة استعادة كلمة المرور.');
-            } else {
-              setState(() => error = 'أدخل بريدك الإلكتروني أولاً.');
+            } on AuthException catch (ex) {
+              if (mounted) setState(() => error = ex.message);
+            } catch (_) {
+              if (mounted) setState(() => error = 'تعذر إرسال رسالة الاستعادة. تحقق من الاتصال وحاول مجدداً.');
+            } finally {
+              if (mounted) setState(() => busy = false);
             }
           }, child: const Text('نسيت كلمة المرور؟')),
         ],
