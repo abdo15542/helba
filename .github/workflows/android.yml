@@ -37,6 +37,38 @@ jobs:
       - name: Generate Android platform files
         run: flutter create --platforms=android .
 
+      - name: Set Android compile SDK to 36
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          candidates = [
+              Path("android/app/build.gradle.kts"),
+              Path("android/app/build.gradle"),
+          ]
+          for path in candidates:
+              if not path.exists():
+                  continue
+              source = path.read_text()
+              updated = source.replace(
+                  "compileSdk = flutter.compileSdkVersion",
+                  "compileSdk = 36",
+              ).replace(
+                  "compileSdkVersion flutter.compileSdkVersion",
+                  "compileSdkVersion 36",
+              )
+              if updated == source:
+                  if "compileSdk = 36" in source or "compileSdkVersion 36" in source:
+                      print(f"{path} already targets compile SDK 36")
+                      raise SystemExit(0)
+                  continue
+              path.write_text(updated)
+              print(f"Updated {path} to compile SDK 36")
+              raise SystemExit(0)
+          raise SystemExit("Could not find a supported Android app Gradle file or compileSdk setting")
+          PY
+
       - name: Install Android compile SDK
         run: |
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
