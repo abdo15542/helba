@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'config.dart';
+import 'deeplink.dart';
 import 'diagnostics.dart';
 import 'inbox.dart';
 import 'utils.dart';
@@ -62,6 +63,11 @@ class _HelbaAppState extends State<HelbaApp> {
       _configError = null;
     });
     final error = await initializeHelba();
+    if (error == null) {
+      // Supabase is ready: start listening for the email-confirmation
+      // link that returns the user to the app.
+      await setupDeepLinks();
+    }
     if (mounted) {
       setState(() {
         _starting = false;
@@ -187,15 +193,40 @@ class _UnconfirmedEmailPageState extends State<UnconfirmedEmailPage> {
   String? message;
   String? error;
 
+  @override
+  void initState() {
+    super.initState();
+    deepLinkError.addListener(_onDeepLinkError);
+    // A link may already have failed before this screen appeared.
+    if (deepLinkError.value != null) {
+      error = deepLinkError.value;
+    }
+  }
+
+  void _onDeepLinkError() {
+    if (mounted && deepLinkError.value != null) {
+      setState(() => error = deepLinkError.value);
+    }
+  }
+
+  @override
+  void dispose() {
+    deepLinkError.removeListener(_onDeepLinkError);
+    super.dispose();
+  }
+
   Future<void> _resend() async {
+    deepLinkError.value = null;
     setState(() {
       busy = true;
       message = null;
       error = null;
     });
     try {
-      await Supabase.instance.client.auth
-          .resend(email: widget.email, type: OtpType.signup);
+      await Supabase.instance.client.auth.resend(
+          email: widget.email,
+          type: OtpType.signup,
+          emailRedirectTo: authCallbackUrl);
       if (mounted) {
         setState(
             () => message = 'أرسلنا رابط تأكيد جديد إلى بريدك الإلكتروني.');
@@ -225,7 +256,7 @@ class _UnconfirmedEmailPageState extends State<UnconfirmedEmailPage> {
           const Text('أكد بريدك الإلكتروني أولاً',
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
-          Text('أرسلنا رابط تأكيد إلى ${widget.email}. افتحه ثم سجل الدخول.',
+          Text('أرسلنا رابط تأكيد إلى ${widget.email}. افتحه وستعود إلى التطبيق مباشرة.',
               textAlign: TextAlign.center),
           if (message != null)
             Padding(
@@ -326,7 +357,10 @@ class _LoginPageState extends State<LoginPage> {
     try {
       final auth = Supabase.instance.client.auth;
       if (signup) {
-        final result = await auth.signUp(email: e, password: password.text);
+        final result = await auth.signUp(
+            email: e,
+            password: password.text,
+            emailRedirectTo: authCallbackUrl);
         // If sign-up created a session (auto-confirm), drop it so the user
         // must confirm the email first; AuthGate enforces the same rule.
         if (result.session != null) {
@@ -462,7 +496,8 @@ class _LoginPageState extends State<LoginPage> {
                               });
                               try {
                                 await Supabase.instance.client.auth
-                                    .resetPasswordForEmail(e);
+                                    .resetPasswordForEmail(e,
+                                        redirectTo: authCallbackUrl);
                                 if (mounted) {
                                   setState(() => message =
                                       'إذا كان البريد مسجلاً فستصلك رسالة استعادة كلمة المرور.');
