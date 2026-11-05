@@ -109,9 +109,13 @@ jobs:
                       path.write_text("\n".join(updated) + "\n")
                       changed.append(f"{path}: {count}")
           if not changed:
-              raise SystemExit("No Android compileSdk declarations needed adjustment")
-          print("Aligned Android compileSdk declarations to 36:")
-          print("\n".join(changed))
+              # Plugins already align: that is a pass, not a failure.
+              # Failing here used to break the build on every Flutter/plugin
+              # update that already shipped compileSdk 36.
+              print("No Android compileSdk declarations needed adjustment")
+          else:
+              print("Aligned Android compileSdk declarations to 36:")
+              print("\n".join(changed))
           PY
 
       - name: Analyze Dart code
@@ -139,7 +143,17 @@ jobs:
       - name: Build release APK
         shell: bash
         run: |
-          flutter build apk --release --verbose
+          # Use repository secrets when configured; otherwise the build falls
+          # back to the defaults compiled into lib/main.dart. Previously the
+          # build silently ignored the secrets entirely.
+          args=(--release --verbose)
+          if [ -n "${{ secrets.SUPABASE_URL }}" ]; then
+            args+=(--dart-define=SUPABASE_URL=${{ secrets.SUPABASE_URL }})
+          fi
+          if [ -n "${{ secrets.SUPABASE_PUBLISHABLE_KEY }}" ]; then
+            args+=(--dart-define=SUPABASE_PUBLISHABLE_KEY=${{ secrets.SUPABASE_PUBLISHABLE_KEY }})
+          fi
+          flutter build apk "${args[@]}"
 
       - name: Verify APK exists
         run: test -s build/app/outputs/flutter-apk/app-release.apk
