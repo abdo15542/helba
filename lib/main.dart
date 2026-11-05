@@ -10,6 +10,28 @@ import 'package:url_launcher/url_launcher.dart';
 const green = Color(0xFF087A4B);
 const secureStore = FlutterSecureStorage();
 
+// Keyboards often auto-insert a space after '.' while typing an email
+// (e.g. 'name@gmail. com'). trim() only removes the ends, so strip every
+// whitespace character inside the address as well.
+String normalizeEmail(String value) => value.replaceAll(RegExp(r'\s+'), '').toLowerCase();
+
+/// Friendly Arabic message for network failures; null for anything else.
+/// Supabase surfaces network failures as an AuthException whose message
+/// contains the underlying 'ClientException with SocketException...' text,
+/// so detect by message content rather than by exception type.
+String? networkErrorMessage(Object e) {
+  if (e is io.SocketException) {
+    return 'تعذّر الوصول إلى خادم هلبة. تحقق من اتصالك بالإنترنت وحاول مجدداً.';
+  }
+  final text = e is AuthException ? e.message : e.toString();
+  if (text.contains('SocketException') ||
+      text.contains('ClientException') ||
+      text.contains('Failed host lookup')) {
+    return 'تعذّر الوصول إلى خادم هلبة. تحقق من اتصالك بالإنترنت وحاول مجدداً.';
+  }
+  return null;
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   const configuredUrl = String.fromEnvironment('SUPABASE_URL', defaultValue: 'https://mpgnybncdiaaohjaqejq.supabase.co');
@@ -82,7 +104,7 @@ class _AuthGateState extends State<AuthGate> {
   }
 
   Future<void> _bind(String email) async {
-    final normalized = email.trim().toLowerCase();
+    final normalized = normalizeEmail(email);
     try {
       await secureStore.write(key: 'helba_bound_email', value: normalized);
     } catch (_) {
@@ -100,7 +122,7 @@ class _AuthGateState extends State<AuthGate> {
       builder: (context, _) {
         final user = Supabase.instance.client.auth.currentUser;
         if (user == null) return LoginPage(boundEmail: boundEmail, onSignedIn: _bind);
-        final email = (user.email ?? '').toLowerCase();
+        final email = normalizeEmail(user.email ?? '');
         if (boundEmail != null && boundEmail != email) {
           return Scaffold(body: Center(child: Padding(
             padding: const EdgeInsets.all(24),
@@ -147,9 +169,9 @@ class _UnconfirmedEmailPageState extends State<UnconfirmedEmailPage> {
       await Supabase.instance.client.auth.resend(email: widget.email, type: OtpType.signup);
       if (mounted) setState(() => message = 'أرسلنا رابط تأكيد جديد إلى بريدك الإلكتروني.');
     } on AuthException catch (ex) {
-      if (mounted) setState(() => error = ex.message);
-    } catch (_) {
-      if (mounted) setState(() => error = 'تعذر إرسال رابط التأكيد. حاول مجدداً.');
+      if (mounted) setState(() => error = networkErrorMessage(ex) ?? ex.message);
+    } catch (e) {
+      if (mounted) setState(() => error = networkErrorMessage(e) ?? 'تعذر إرسال رابط التأكيد. حاول مجدداً.');
     } finally {
       if (mounted) setState(() => busy = false);
     }
@@ -200,7 +222,7 @@ class _LoginPageState extends State<LoginPage> {
   final email = TextEditingController();
   final password = TextEditingController();
   bool signup = false, busy = false, hidePassword = true;
-  String? error, message;
+  String? error, message, errorDetail;
 
   @override
   void initState() {
@@ -211,16 +233,16 @@ class _LoginPageState extends State<LoginPage> {
   void dispose() { email.dispose(); password.dispose(); super.dispose(); }
 
   Future<void> submit() async {
-    final e = email.text.trim().toLowerCase();
+    final e = normalizeEmail(email.text);
     if (!e.contains('@') || password.text.length < 8) {
-      setState(() => error = 'أدخل بريداً صحيحاً وكلمة مرور من 8 أحرف على الأقل.');
+      setState(() { error = 'أدخل بريداً صحيحاً وكلمة مرور من 8 أحرف على الأقل.'; errorDetail = null; });
       return;
     }
     if (widget.boundEmail != null && widget.boundEmail != e) {
-      setState(() => error = 'هذا الجهاز مرتبط بالبريد ${widget.boundEmail} ولا يقبل بريداً آخر.');
+      setState(() { error = 'هذا الجهاز مرتبط بالبريد ${widget.boundEmail} ولا يقبل بريداً آخر.'; errorDetail = null; });
       return;
     }
-    setState(() { busy = true; error = null; message = null; });
+    setState(() { busy = true; error = null; message = null; errorDetail = null; });
     try {
       final auth = Supabase.instance.client.auth;
       if (signup) {
@@ -241,9 +263,11 @@ class _LoginPageState extends State<LoginPage> {
         }
       }
     } on AuthException catch (ex) {
-      setState(() => error = ex.message);
-    } catch (_) {
-      setState(() => error = 'تعذر الاتصال بالخدمة. حاول مجدداً.');
+      final friendly = networkErrorMessage(ex);
+      setState(() { error = friendly ?? ex.message; errorDetail = friendly == null ? null : ex.message; });
+    } catch (e) {
+      final friendly = networkErrorMessage(e);
+      setState(() { error = friendly ?? 'تعذر الاتصال بالخدمة. حاول مجدداً.'; errorDetail = friendly == null ? null : e.toString(); });
     } finally {
       if (mounted) setState(() => busy = false);
     }
@@ -267,24 +291,27 @@ class _LoginPageState extends State<LoginPage> {
           const SizedBox(height: 12),
           TextField(controller: password, obscureText: hidePassword, decoration: InputDecoration(labelText: 'كلمة المرور', prefixIcon: const Icon(Icons.lock_outline), suffixIcon: IconButton(icon: Icon(hidePassword ? Icons.visibility : Icons.visibility_off), onPressed: () => setState(() => hidePassword = !hidePassword)), border: const OutlineInputBorder())),
           if (error != null) Padding(padding: const EdgeInsets.only(top: 12), child: Text(error!, style: const TextStyle(color: Colors.red))),
+          if (errorDetail != null) Padding(padding: const EdgeInsets.only(top: 6), child: Text(errorDetail!, style: const TextStyle(color: Colors.black54, fontSize: 12))),
           if (message != null) Padding(padding: const EdgeInsets.only(top: 12), child: Text(message!, style: const TextStyle(color: green))),
           const SizedBox(height: 18),
           FilledButton(onPressed: busy ? null : submit, child: busy ? const CircularProgressIndicator() : Text(signup ? 'إنشاء الحساب' : 'دخول')),
-          TextButton(onPressed: busy ? null : () => setState(() { signup = !signup; error = null; message = null; }), child: Text(signup ? 'لديك حساب؟ سجل الدخول' : 'ليس لديك حساب؟ أنشئ حساباً')),
+          TextButton(onPressed: busy ? null : () => setState(() { signup = !signup; error = null; message = null; errorDetail = null; }), child: Text(signup ? 'لديك حساب؟ سجل الدخول' : 'ليس لديك حساب؟ أنشئ حساباً')),
           TextButton(onPressed: busy ? null : () async {
-            final e = email.text.trim().toLowerCase();
+            final e = normalizeEmail(email.text);
             if (!e.contains('@')) {
               setState(() => error = 'أدخل بريدك الإلكتروني أولاً.');
               return;
             }
-            setState(() { busy = true; error = null; message = null; });
+            setState(() { busy = true; error = null; message = null; errorDetail = null; });
             try {
               await Supabase.instance.client.auth.resetPasswordForEmail(e);
               if (mounted) setState(() => message = 'إذا كان البريد مسجلاً فستصلك رسالة استعادة كلمة المرور.');
             } on AuthException catch (ex) {
-              if (mounted) setState(() => error = ex.message);
-            } catch (_) {
-              if (mounted) setState(() => error = 'تعذر إرسال رسالة الاستعادة. تحقق من الاتصال وحاول مجدداً.');
+              final friendly = networkErrorMessage(ex);
+              if (mounted) setState(() { error = friendly ?? ex.message; errorDetail = friendly == null ? null : ex.message; });
+            } catch (e) {
+              final friendly = networkErrorMessage(e);
+              if (mounted) setState(() { error = friendly ?? 'تعذر إرسال رسالة الاستعادة. تحقق من الاتصال وحاول مجدداً.'; errorDetail = friendly == null ? null : e.toString(); });
             } finally {
               if (mounted) setState(() => busy = false);
             }
