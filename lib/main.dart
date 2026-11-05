@@ -249,7 +249,9 @@ class _InboxPageState extends State<InboxPage> {
           final chats = (snap.data ?? []).where((r) {
             final c = r['conversations'] as Map<String, dynamic>?;
             final members = (c?['conversation_members'] as List<dynamic>? ?? []);
-            final other = members.cast<Map<String, dynamic>?>().where((m) => m?['user_id']?.toString() != currentUserId).firstOrNull;
+            final others = members.where((m) =>
+              m is Map && m['user_id']?.toString() != currentUserId).toList();
+            final other = others.isEmpty ? null : Map<String, dynamic>.from(others.first as Map);
             final profile = other?['profiles'] as Map<String, dynamic>?;
             final searchable = [
               c?['title']?.toString() ?? '',
@@ -264,7 +266,9 @@ class _InboxPageState extends State<InboxPage> {
             itemBuilder: (context, i) {
               final c = chats[i]['conversations'] as Map<String, dynamic>;
               final members = (c['conversation_members'] as List<dynamic>? ?? []);
-              final other = members.cast<Map<String, dynamic>?>().where((m) => m?['user_id']?.toString() != currentUserId).firstOrNull;
+              final others = members.where((m) =>
+                m is Map && m['user_id']?.toString() != currentUserId).toList();
+              final other = others.isEmpty ? null : Map<String, dynamic>.from(others.first as Map);
               final profile = other?['profiles'] as Map<String, dynamic>?;
               final displayTitle = c['title']?.toString().trim().isNotEmpty == true
                   ? c['title'].toString()
