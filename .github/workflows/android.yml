@@ -189,6 +189,55 @@ jobs:
           raise SystemExit("Could not find a supported Android app Gradle file or compileSdk setting")
           PY
 
+      - name: Enable core library desugaring
+        shell: bash
+        run: |
+          # flutter_local_notifications 22 requires core library desugaring
+          # in the app module, or the build fails at checkReleaseAarMetadata
+          # ("Dependency ':flutter_local_notifications' requires core library
+          # desugaring to be enabled for :app"). The flutter create template
+          # does not enable it, so patch the generated app Gradle file:
+          # turn the flag on in compileOptions and add the desugar library.
+          # Idempotent, and handles both the Kotlin (.kts) and Groovy
+          # (.gradle) templates.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          candidates = [
+              Path("android/app/build.gradle.kts"),
+              Path("android/app/build.gradle"),
+          ]
+          for path in candidates:
+              if not path.exists():
+                  continue
+              source = path.read_text()
+              is_kts = path.suffix == ".kts"
+              if "LibraryDesugaringEnabled" not in source:
+                  marker = "compileOptions {"
+                  if marker not in source:
+                      raise SystemExit("Could not find compileOptions block in " + str(path))
+                  flag = ("isCoreLibraryDesugaringEnabled = true"
+                          if is_kts else
+                          "coreLibraryDesugaringEnabled true")
+                  source = source.replace(marker, marker + "\n        " + flag, 1)
+              dep = 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")'
+              if "desugar_jdk_libs" not in source:
+                  if "dependencies {" in source:
+                      source = source.replace("dependencies {",
+                                              "dependencies {\n    " + dep, 1)
+                  else:
+                      source = source.rstrip() + "\n\ndependencies {\n    " + dep + "\n}\n"
+              path.write_text(source)
+              print(f"Enabled core library desugaring in {path}")
+              raise SystemExit(0)
+          raise SystemExit("Could not find a supported Android app Gradle file")
+          PY
+
+      - name: Verify core library desugaring
+        run: |
+          grep -q 'LibraryDesugaringEnabled' android/app/build.gradle* || (echo "Core library desugaring flag missing from app Gradle file" && exit 1)
+          grep -q 'desugar_jdk_libs' android/app/build.gradle* || (echo "Desugar library missing from app Gradle file" && exit 1)
+
       - name: Install Android compile SDK
         run: |
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
