@@ -504,6 +504,12 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> send() async {
     final body = input.text.trim();
     if (body.isEmpty || sending) return;
+    if (body.length > 4000) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('الحد الأقصى للرسالة 4000 حرف.')),
+      );
+      return;
+    }
     setState(() => sending = true);
     try {
       await client.from('messages').insert({
