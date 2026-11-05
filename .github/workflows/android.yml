@@ -123,7 +123,8 @@ jobs:
       - name: Force compile SDK 36 for every Android module
         shell: bash
         run: |
-          cat > "$RUNNER_TEMP/force-compile-sdk.gradle" <<'EOF'
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/force-compile-sdk.gradle" <<'EOF'
           allprojects {
               afterEvaluate {
                   def androidExtension = extensions.findByName("android")
@@ -138,7 +139,6 @@ jobs:
       - name: Build release APK
         shell: bash
         run: |
-          export GRADLE_OPTS="${GRADLE_OPTS:-} -I $RUNNER_TEMP/force-compile-sdk.gradle"
           flutter build apk --release --verbose
 
       - name: Verify APK exists
