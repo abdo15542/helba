@@ -8,9 +8,15 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:intl/intl.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:native_flutter_proxy/native_flutter_proxy.dart';
 
 const green = Color(0xFF087A4B);
 const secureStore = FlutterSecureStorage();
+
+/// Short commit SHA baked in at build time (the workflow passes
+/// HELBA_COMMIT), shown on the login screen so a screenshot proves which
+/// build is installed.
+const buildCommit = String.fromEnvironment('HELBA_COMMIT', defaultValue: 'dev');
 
 // Keyboards often auto-insert a space after '.' while typing an email
 // (e.g. 'name@gmail. com'). trim() only removes the ends, so strip every
@@ -32,6 +38,36 @@ String? networkErrorMessage(Object e) {
     return 'تعذّر الوصول إلى خادم هلبة. تحقق من اتصالك بالإنترنت وحاول مجدداً.';
   }
   return null;
+}
+
+// --- System proxy --------------------------------------------------------
+// The phone's configured system proxy (WiFi or mobile APN), if any.
+// Browsers use it; Dart's HttpClient does not read it on its own, so the
+// app must ask the native side for it and apply it explicitly. On a
+// network that only lets traffic out through its proxy, every direct
+// connection fails while the browser works — exactly the symptom seen on
+// this phone (system DNS fails, DoH fails, direct IPs fail).
+String? _systemProxy;
+
+/// Read the system proxy once ('host:port'), or null when none is set or
+/// the native lookup is unavailable. Never throws.
+Future<String?> readSystemProxy() async {
+  try {
+    final setting = await NativeProxyReader.proxySetting;
+    if (!setting.enabled) return null;
+    return '${setting.host}:${setting.port}';
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<void> _loadSystemProxy() async {
+  try {
+    _systemProxy = await readSystemProxy()
+        .timeout(const Duration(seconds: 2));
+  } catch (_) {
+    _systemProxy = null;
+  }
 }
 
 // --- DNS-over-HTTPS fallback ---------------------------------------------
@@ -209,35 +245,50 @@ Future<io.Socket> openSocketForUrl(Uri url) async {
     }
   }
   // 3. Resolve over HTTPS (Google, then Cloudflare).
+  Object? dohError;
   try {
     final ips = await resolveViaDoh(host);
     return await connectToFirstIp(ips, port);
-  } catch (_) {
+  } catch (e) {
     // Both providers failed; the seed addresses are the last resort.
+    dohError = e;
   }
   // 4. The host's own Cloudflare edge IPs (see seedIps). The phone's
   // browser proves these are reachable even where the DNS-server IPs
   // that DoH bootstraps from are blocked.
   final seed = seedIps[host];
+  Object? seedError;
   if (seed != null) {
     try {
       final socket = await connectToFirstIp(seed, port,
           timeout: const Duration(seconds: 4));
       await _writeCachedIps(host, seed);
       return socket;
-    } catch (_) {
-      // Nothing left to try; report the original failure below.
+    } catch (e) {
+      // Nothing left to try; report every failure below.
+      seedError = e;
     }
   }
-  // firstError is always set here: reaching this line means the first
-  // attempt threw, and the catch above stored its error.
-  throw firstError;
+  // Report what was actually tried and why each step failed, instead of
+  // rethrowing only the first error: a bare 'Failed host lookup' hides
+  // whether the fallbacks even ran.
+  throw io.SocketException(
+    'Could not reach $host: system DNS failed ($firstError); '
+    'DNS-over-HTTPS failed ($dohError); '
+    'seed IPs failed ($seedError)',
+  );
 }
 
 class HelbaHttpOverrides extends io.HttpOverrides {
   @override
   io.HttpClient createHttpClient(io.SecurityContext? context) {
     final client = super.createHttpClient(context);
+    // When the phone has a system proxy (WiFi/APN), route every request
+    // through it like the browser does. When there is none, leave the
+    // default (environment proxy, if any) untouched.
+    if (_systemProxy != null) {
+      client.findProxy = (_) => 'PROXY $_systemProxy';
+    }
     client.connectionFactory =
         (Uri url, String? proxyHost, int? proxyPort) async {
       if (proxyHost != null) {
@@ -245,8 +296,15 @@ class HelbaHttpOverrides extends io.HttpOverrides {
         // dial the proxy and let HttpClient perform the CONNECT tunnel as
         // usual. The proxy resolves the host, so the DoH fallback below
         // does not apply.
-        return io.ConnectionTask.fromSocket(
-            io.Socket.connect(proxyHost, proxyPort ?? 8080), () {});
+        try {
+          return io.ConnectionTask.fromSocket(
+              io.Socket.connect(proxyHost, proxyPort ?? 8080)
+                  .timeout(const Duration(seconds: 10)),
+              () {});
+        } catch (e) {
+          throw io.SocketException(
+              'Could not reach proxy $proxyHost:${proxyPort ?? 8080}: $e');
+        }
       }
       // No proxy: HttpClient upgrades the returned socket to TLS with
       // SNI/certificate checks for url.host.
@@ -286,6 +344,9 @@ Future<void> main() async {
   // Route Supabase traffic through the DNS-over-HTTPS fallback so the app
   // keeps working on networks whose system DNS cannot resolve Supabase.
   io.HttpOverrides.global = HelbaHttpOverrides();
+  // Read the system proxy before any network client is created, so the app
+  // routes through it exactly like the phone's browser does.
+  await _loadSystemProxy();
   runApp(const HelbaApp());
 }
 
@@ -544,6 +605,7 @@ class _LoginPageState extends State<LoginPage> {
           const SizedBox(height: 12),
           const Text('هلبة', textAlign: TextAlign.center, style: TextStyle(fontSize: 36, fontWeight: FontWeight.w900)),
           const Text('تواصل يجمعنا', textAlign: TextAlign.center),
+          Text('الإصدار ${buildCommit.length >= 7 ? buildCommit.substring(0, 7) : buildCommit}', textAlign: TextAlign.center, style: const TextStyle(fontSize: 11, color: Colors.black45)),
           const SizedBox(height: 36),
           Text(signup ? 'إنشاء حساب جديد' : 'تسجيل الدخول', style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
           const SizedBox(height: 14),
