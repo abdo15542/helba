@@ -66,12 +66,18 @@ List<String> parseDohAnswers(Map<String, dynamic> json) {
   return ips;
 }
 
-Future<io.Socket> connectToFirstIp(List<String> ips, int port) async {
+/// Dial the first reachable IP in [ips]. A reachable anycast address
+/// answers in well under a second; the timeout only bounds blackholed
+/// addresses (some networks silently drop packets to DNS-server IPs).
+Future<io.Socket> connectToFirstIp(
+  List<String> ips,
+  int port, {
+  Duration timeout = const Duration(seconds: 8),
+}) async {
   Object? lastError;
   for (final ip in ips) {
     try {
-      return await io.Socket.connect(ip, port)
-          .timeout(const Duration(seconds: 8));
+      return await io.Socket.connect(ip, port).timeout(timeout);
     } catch (e) {
       lastError = e;
     }
@@ -79,11 +85,55 @@ Future<io.Socket> connectToFirstIp(List<String> ips, int port) async {
   throw lastError ?? io.SocketException('Could not connect to $ips');
 }
 
+/// Last-resort dial addresses for a Supabase host, used only when both the
+/// system resolver AND DNS-over-HTTPS fail. These are the host's own
+/// Cloudflare edge IPs (its current A records) — the phone's browser
+/// already proves TCP to them works, while some networks block the
+/// well-known DNS-server IPs (8.8.8.8, 1.1.1.1) that DoH bootstraps from.
+/// Cloudflare anycast IPs are stable for long periods, and every successful
+/// DoH resolution refreshes the secure-storage cache below, so the seeds
+/// only matter on a network where DoH is blocked too.
+const Map<String, List<String>> seedIps = {
+  'mpgnybncdiaaohjaqejq.supabase.co': ['104.18.38.10', '172.64.149.246'],
+};
+
+/// Persisted copy of the last IPs DoH resolved for a host, so a later
+/// launch on a network where DoH is blocked can still dial the last
+/// known-good addresses instead of failing outright.
+Future<List<String>?> _readCachedIps(String host) async {
+  try {
+    final raw = await secureStore.read(key: 'helba_doh_ips_$host');
+    if (raw == null) return null;
+    final decoded = jsonDecode(raw) as Map<String, dynamic>;
+    final at = DateTime.tryParse(decoded['at']?.toString() ?? '');
+    if (at == null ||
+        DateTime.now().difference(at) > const Duration(days: 7)) {
+      return null;
+    }
+    final ips = decoded['ips'];
+    if (ips is! List || ips.isEmpty) return null;
+    return ips.map((e) => e.toString()).toList();
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<void> _writeCachedIps(String host, List<String> ips) async {
+  try {
+    await secureStore.write(
+      key: 'helba_doh_ips_$host',
+      value: jsonEncode({'ips': ips, 'at': DateTime.now().toIso8601String()}),
+    );
+  } catch (_) {
+    // A failed cache write must never break the connection itself.
+  }
+}
+
 final Map<String, ({List<String> ips, DateTime at})> _dohCache = {};
 io.HttpClient? _dohClient;
 
 /// Resolve [host] via DNS-over-HTTPS (Google first, Cloudflare second).
-/// Results are cached for 5 minutes.
+/// Results are cached in memory for 5 minutes and persisted for 7 days.
 Future<List<String>> resolveViaDoh(String host) async {
   final cached = _dohCache[host];
   if (cached != null &&
@@ -91,6 +141,7 @@ Future<List<String>> resolveViaDoh(String host) async {
     return cached.ips;
   }
   final client = _dohClient ??= io.HttpClient();
+  Object? lastError;
   for (final base in [
     'https://dns.google/resolve',
     'https://cloudflare-dns.com/dns-query',
@@ -99,24 +150,30 @@ Future<List<String>> resolveViaDoh(String host) async {
       final uri = Uri.parse('$base?name=$host&type=A');
       final request = await client
           .getUrl(uri)
-          .timeout(const Duration(seconds: 6));
+          .timeout(const Duration(seconds: 4));
       request.headers.set('accept', 'application/dns-json');
       final response =
-          await request.close().timeout(const Duration(seconds: 6));
+          await request.close().timeout(const Duration(seconds: 4));
       final body = await response
           .transform(utf8.decoder)
           .join()
-          .timeout(const Duration(seconds: 6));
+          .timeout(const Duration(seconds: 4));
       final ips = parseDohAnswers(jsonDecode(body) as Map<String, dynamic>);
       if (ips.isNotEmpty) {
         _dohCache[host] = (ips: ips, at: DateTime.now());
+        await _writeCachedIps(host, ips);
         return ips;
       }
-    } catch (_) {
-      // Try the next DoH provider.
+    } catch (e) {
+      // Keep the cause for the failure message below; try the next provider.
+      lastError = e;
     }
   }
-  throw io.SocketException('DNS-over-HTTPS resolution failed for $host');
+  // Keep the underlying cause in the message: without it the next failure
+  // is undiagnosable (timeout? refused? TLS? blocked IP?).
+  throw io.SocketException(
+    'DNS-over-HTTPS resolution failed for $host (last error: $lastError)',
+  );
 }
 
 Future<io.Socket> openSocketForUrl(Uri url) async {
@@ -124,21 +181,57 @@ Future<io.Socket> openSocketForUrl(Uri url) async {
   final port = url.hasPort ? url.port : (url.scheme == 'https' ? 443 : 80);
   final bootstrap = _dohBootstrapIps[host];
   if (bootstrap != null) {
-    return connectToFirstIp(bootstrap, port);
+    // A DoH endpoint itself: dial it by IP (short timeout — a working
+    // anycast address answers fast, a blocked one just burns time).
+    return connectToFirstIp(bootstrap, port,
+        timeout: const Duration(seconds: 3));
   }
-  if (needsDohFallback(host)) {
+  if (!needsDohFallback(host)) {
+    return io.Socket.connect(host, port);
+  }
+  // 1. The system resolver first — it works on most networks.
+  Object? firstError;
+  try {
+    return await io.Socket.connect(host, port)
+        .timeout(const Duration(seconds: 8));
+  } catch (e) {
+    firstError = e;
+  }
+  // 2. IPs resolved earlier and stored on the device (fast path for a
+  // repeat launch on a network where DNS-over-HTTPS is blocked).
+  final cached = await _readCachedIps(host);
+  if (cached != null) {
     try {
-      return await io.Socket.connect(host, port)
-          .timeout(const Duration(seconds: 8));
-    } on io.SocketException {
-      final ips = await resolveViaDoh(host);
-      return connectToFirstIp(ips, port);
-    } on TimeoutException {
-      final ips = await resolveViaDoh(host);
-      return connectToFirstIp(ips, port);
+      return await connectToFirstIp(cached, port,
+          timeout: const Duration(seconds: 4));
+    } catch (_) {
+      // Stale cache entry; keep falling through to live resolution.
     }
   }
-  return io.Socket.connect(host, port);
+  // 3. Resolve over HTTPS (Google, then Cloudflare).
+  try {
+    final ips = await resolveViaDoh(host);
+    return await connectToFirstIp(ips, port);
+  } catch (_) {
+    // Both providers failed; the seed addresses are the last resort.
+  }
+  // 4. The host's own Cloudflare edge IPs (see seedIps). The phone's
+  // browser proves these are reachable even where the DNS-server IPs
+  // that DoH bootstraps from are blocked.
+  final seed = seedIps[host];
+  if (seed != null) {
+    try {
+      final socket = await connectToFirstIp(seed, port,
+          timeout: const Duration(seconds: 4));
+      await _writeCachedIps(host, seed);
+      return socket;
+    } catch (_) {
+      // Nothing left to try; report the original failure below.
+    }
+  }
+  // firstError is always set here: reaching this line means the first
+  // attempt threw, and the catch above stored its error.
+  throw firstError;
 }
 
 class HelbaHttpOverrides extends io.HttpOverrides {
@@ -163,36 +256,61 @@ class HelbaHttpOverrides extends io.HttpOverrides {
   }
 }
 
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  // Route Supabase traffic through the DNS-over-HTTPS fallback so the app
-  // keeps working on networks whose system DNS cannot resolve Supabase.
-  io.HttpOverrides.global = HelbaHttpOverrides();
+/// Validate the configuration and initialize Supabase. Returns an Arabic
+/// error message, or null when the app is ready to run. Kept separate from
+/// main() so a failed start can be retried from the setup screen instead
+/// of leaving the user on a dead end.
+Future<String?> initializeHelba() async {
   const configuredUrl = String.fromEnvironment('SUPABASE_URL', defaultValue: 'https://mpgnybncdiaaohjaqejq.supabase.co');
   const key = String.fromEnvironment('SUPABASE_PUBLISHABLE_KEY', defaultValue: 'sb_publishable_IZ-P_b8LjdDfjATffyqqDg_yJOu9-Og');
   // Remove accidental spaces/newlines from build-time configuration before parsing the host.
   final url = configuredUrl.trim().replaceAll(RegExp(r'\s+'), '').replaceAll(RegExp(r'/+$'), '');
   final parsedUrl = Uri.tryParse(url);
-  // Never crash before runApp on a bad configuration: show the setup screen
-  // with the problem instead, so a misconfigured build is diagnosable.
-  String? configError;
   if (parsedUrl == null || parsedUrl.scheme != 'https' || parsedUrl.host.isEmpty) {
-    configError = 'رابط Supabase غير صحيح. المتوقع https://<project-ref>.supabase.co';
-  } else if (key.isEmpty) {
-    configError = 'مفتاح Supabase مفقود. أضف SUPABASE_PUBLISHABLE_KEY.';
-  } else {
-    try {
-      await Supabase.initialize(url: url, publishableKey: key);
-    } catch (_) {
-      configError = 'تعذر الاتصال بـ Supabase. تحقق من الرابط والمفتاح والاتصال.';
-    }
+    return 'رابط Supabase غير صحيح. المتوقع https://<project-ref>.supabase.co';
   }
-  runApp(HelbaApp(configError: configError));
+  if (key.isEmpty) {
+    return 'مفتاح Supabase مفقود. أضف SUPABASE_PUBLISHABLE_KEY.';
+  }
+  if (Supabase.instance.isInitialized) return null;
+  try {
+    await Supabase.initialize(url: url, publishableKey: key);
+    return null;
+  } catch (_) {
+    return 'تعذر الاتصال بـ Supabase. تحقق من الرابط والمفتاح والاتصال.';
+  }
 }
 
-class HelbaApp extends StatelessWidget {
-  final String? configError;
-  const HelbaApp({super.key, this.configError});
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Route Supabase traffic through the DNS-over-HTTPS fallback so the app
+  // keeps working on networks whose system DNS cannot resolve Supabase.
+  io.HttpOverrides.global = HelbaHttpOverrides();
+  runApp(const HelbaApp());
+}
+
+class HelbaApp extends StatefulWidget {
+  const HelbaApp({super.key});
+  @override
+  State<HelbaApp> createState() => _HelbaAppState();
+}
+
+class _HelbaAppState extends State<HelbaApp> {
+  bool _starting = true;
+  String? _configError;
+
+  @override
+  void initState() {
+    super.initState();
+    _start();
+  }
+
+  Future<void> _start() async {
+    setState(() { _starting = true; _configError = null; });
+    final error = await initializeHelba();
+    if (mounted) setState(() { _starting = false; _configError = error; });
+  }
+
   @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'هلبة',
@@ -203,13 +321,19 @@ class HelbaApp extends StatelessWidget {
       scaffoldBackgroundColor: const Color(0xFFF5F8F6),
       fontFamily: 'Arial',
     ),
-    home: Directionality(textDirection: ui.TextDirection.rtl, child: AuthGate(configError: configError)),
+    home: Directionality(
+      textDirection: ui.TextDirection.rtl,
+      child: _starting
+          ? const Scaffold(body: Center(child: CircularProgressIndicator()))
+          : _configError != null
+              ? SetupPage(message: _configError, onRetry: _start)
+              : const AuthGate(),
+    ),
   );
 }
 
 class AuthGate extends StatefulWidget {
-  final String? configError;
-  const AuthGate({super.key, this.configError});
+  const AuthGate({super.key});
   @override
   State<AuthGate> createState() => _AuthGateState();
 }
@@ -217,13 +341,11 @@ class AuthGate extends StatefulWidget {
 class _AuthGateState extends State<AuthGate> {
   String? boundEmail;
   bool loading = true;
-  bool configured = false;
   bool _binding = false;
 
   @override
   void initState() {
     super.initState();
-    configured = Supabase.instance.isInitialized;
     _load();
   }
 
@@ -250,7 +372,6 @@ class _AuthGateState extends State<AuthGate> {
   @override
   Widget build(BuildContext context) {
     if (loading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    if (!configured || widget.configError != null) return SetupPage(message: widget.configError);
     return StreamBuilder<AuthState>(
       stream: Supabase.instance.client.auth.onAuthStateChange,
       builder: (context, _) {
@@ -332,7 +453,8 @@ class _UnconfirmedEmailPageState extends State<UnconfirmedEmailPage> {
 
 class SetupPage extends StatelessWidget {
   final String? message;
-  const SetupPage({super.key, this.message});
+  final VoidCallback? onRetry;
+  const SetupPage({super.key, this.message, this.onRetry});
   @override
   Widget build(BuildContext context) => Scaffold(body: Center(child: Padding(
     padding: const EdgeInsets.all(24),
@@ -340,6 +462,10 @@ class SetupPage extends StatelessWidget {
       const Icon(Icons.settings_outlined, size: 48, color: green),
       const SizedBox(height: 12),
       Text(message ?? 'أضف SUPABASE_URL وSUPABASE_PUBLISHABLE_KEY لتفعيل هلبة.', textAlign: TextAlign.center),
+      if (onRetry != null) ...[
+        const SizedBox(height: 16),
+        FilledButton(onPressed: onRetry, child: const Text('إعادة المحاولة')),
+      ],
     ]),
   )));
 }
@@ -539,7 +665,11 @@ class _InboxPageState extends State<InboxPage> {
             ].join(' ').toLowerCase();
             return searchable.contains(query.trim().toLowerCase());
           }).toList();
-          if (chats.isEmpty) return const _EmptyInbox();
+          if (chats.isEmpty) {
+            return query.trim().isEmpty
+                ? const _EmptyInbox()
+                : const Center(child: Text('لا توجد نتائج مطابقة لبحثك.'));
+          }
           return ListView.separated(
             itemCount: chats.length, separatorBuilder: (_, __) => const Divider(indent: 84, height: 1),
             itemBuilder: (context, i) {
@@ -740,6 +870,44 @@ class _ChatPageState extends State<ChatPage> {
   int _lastMessageCount = -1;
   final client = Supabase.instance.client;
 
+  // The message stream must live in state: building it inside build() made
+  // every rebuild (each send, each parent rebuild) resubscribe and flash
+  // the list with a loading spinner.
+  late final Stream<List<Map<String, dynamic>>> _messagesStream;
+  Map<String, String> _memberNames = {};
+  bool _isGroup = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _messagesStream = client.from('messages').stream(primaryKey: ['id'])
+      .eq('conversation_id', widget.conversationId).order('created_at');
+    _loadMembers();
+  }
+
+  /// Member display names, so group messages show who wrote them.
+  Future<void> _loadMembers() async {
+    try {
+      final rows = await client.from('conversation_members')
+        .select('user_id,profiles(display_name,username)')
+        .eq('conversation_id', widget.conversationId);
+      final names = <String, String>{};
+      for (final row in rows as List) {
+        if (row is! Map) continue;
+        final profile = row['profiles'] as Map<String, dynamic>?;
+        final name = profile?['display_name']?.toString().trim().isNotEmpty == true
+            ? profile!['display_name'].toString()
+            : (profile?['username']?.toString().isNotEmpty == true
+                ? '@${profile!['username']}'
+                : '');
+        if (name.isNotEmpty) names[row['user_id'].toString()] = name;
+      }
+      if (mounted) setState(() { _memberNames = names; _isGroup = names.length > 2; });
+    } catch (_) {
+      // Names are a nicety; messages still work without them.
+    }
+  }
+
   void _scrollToBottom() {
     if (!_scroll.hasClients) return;
     final extent = _scroll.position.maxScrollExtent;
@@ -886,13 +1054,11 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   Widget build(BuildContext context) {
-    final stream = client.from('messages').stream(primaryKey: ['id'])
-      .eq('conversation_id', widget.conversationId).order('created_at');
     return Scaffold(
       appBar: AppBar(title: Text(widget.title)),
       body: Column(children: [
         Expanded(child: StreamBuilder<List<Map<String, dynamic>>>(
-          stream: stream,
+          stream: _messagesStream,
           builder: (context, snap) {
             if (snap.hasError) return const Center(child: Text('تعذر تحميل الرسائل'));
             if (!snap.hasData) return const Center(child: CircularProgressIndicator());
@@ -910,6 +1076,7 @@ class _ChatPageState extends State<ChatPage> {
                 final row = rows[i];
                 final myId = client.auth.currentUser?.id;
                 final mine = myId != null && row['sender_id'] == myId;
+                final senderName = _memberNames[row['sender_id']?.toString()];
                 final time = DateTime.tryParse(row['created_at']?.toString() ?? '');
                 return Align(
                   alignment: mine ? Alignment.centerLeft : Alignment.centerRight,
@@ -919,6 +1086,11 @@ class _ChatPageState extends State<ChatPage> {
                     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                     decoration: BoxDecoration(color: mine ? const Color(0xFFDDF3E6) : Colors.white, borderRadius: BorderRadius.circular(16)),
                     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      if (!mine && _isGroup && senderName != null)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 2),
+                          child: Text(senderName, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: green)),
+                        ),
                       if (row['attachment_path'] != null)
                         InkWell(
                           onTap: () => openAttachment(row['attachment_path'].toString()),
