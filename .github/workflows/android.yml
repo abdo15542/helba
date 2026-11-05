@@ -73,21 +73,34 @@ jobs:
         shell: bash
         run: |
           # The email-confirmation link must open the app (helba://auth/...)
-          # instead of a browser page. The generated manifest has no such
-          # filter, so insert one into MainActivity (before </activity>).
+          # instead of a browser page, and so must chat links
+          # (helba://chat/<id>) from push notifications. The generated
+          # manifest has no such filter, so insert one into MainActivity
+          # (before </activity>). Idempotent, and repairs a filter that
+          # only has the auth entry: the guard checks each data entry,
+          # not just the scheme.
           python3 - <<'PY'
           from pathlib import Path
           path = Path("android/app/src/main/AndroidManifest.xml")
           source = path.read_text()
-          if 'android:scheme="helba"' in source:
-              print("Deep-link intent filter already present")
+          auth_entry = '<data android:scheme="helba" android:host="auth" />'
+          chat_entry = '<data android:scheme="helba" android:host="chat" />'
+          if auth_entry in source and chat_entry in source:
+              print("Deep-link intent filter already present (auth + chat)")
+          elif auth_entry in source:
+              # Filter exists but the chat entry is missing: add just that line.
+              source = source.replace(auth_entry,
+                                      auth_entry + '\n            ' + chat_entry, 1)
+              path.write_text(source)
+              print("Added chat deep-link data entry to intent filter")
           else:
               block = (
                   '        <intent-filter>\n'
                   '            <action android:name="android.intent.action.VIEW" />\n'
                   '            <category android:name="android.intent.category.DEFAULT" />\n'
                   '            <category android:name="android.intent.category.BROWSABLE" />\n'
-                  '            <data android:scheme="helba" android:host="auth" />\n'
+                  '            ' + auth_entry + '\n'
+                  '            ' + chat_entry + '\n'
                   '        </intent-filter>\n'
               )
               marker = '</activity>'
@@ -101,6 +114,48 @@ jobs:
       - name: Verify deep-link intent filter in manifest
         run: |
           grep -q 'android:scheme="helba"' android/app/src/main/AndroidManifest.xml || (echo "Deep-link intent filter missing from AndroidManifest.xml" && exit 1)
+          grep -q 'android:host="auth"' android/app/src/main/AndroidManifest.xml || (echo "Auth deep-link entry missing from AndroidManifest.xml" && exit 1)
+          grep -q 'android:host="chat"' android/app/src/main/AndroidManifest.xml || (echo "Chat deep-link entry missing from AndroidManifest.xml" && exit 1)
+
+      - name: Add call permissions to the main manifest
+        shell: bash
+        run: |
+          # Voice/video calls need the microphone and the camera. These
+          # are dangerous permissions: the manifest entries below only
+          # declare them — the app still asks the user at runtime (via
+          # permission_handler) before getUserMedia. Same patch style as
+          # the INTERNET step above; idempotent, skipped if already present.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("android/app/src/main/AndroidManifest.xml")
+          source = path.read_text()
+          wanted = [
+              "android.permission.RECORD_AUDIO",
+              "android.permission.CAMERA",
+          ]
+          missing = [p for p in wanted if p not in source]
+          if not missing:
+              print("Call permissions already present")
+          else:
+              lines = source.splitlines(keepends=True)
+              for i, line in enumerate(lines):
+                  if line.lstrip().startswith("<manifest"):
+                      j = i
+                      while ">" not in lines[j]:
+                          j += 1
+                      for k, perm in enumerate(missing):
+                          lines.insert(j + 1 + k, f'    <uses-permission android:name="{perm}" />\n')
+                      break
+              else:
+                  raise SystemExit("Could not find <manifest> tag in AndroidManifest.xml")
+              path.write_text("".join(lines))
+              print("Added call permissions to AndroidManifest.xml: " + ", ".join(missing))
+          PY
+
+      - name: Verify call permissions in manifest
+        run: |
+          grep -q 'android.permission.RECORD_AUDIO' android/app/src/main/AndroidManifest.xml || (echo "RECORD_AUDIO permission missing from AndroidManifest.xml" && exit 1)
+          grep -q 'android.permission.CAMERA' android/app/src/main/AndroidManifest.xml || (echo "CAMERA permission missing from AndroidManifest.xml" && exit 1)
 
       - name: Set Android compile SDK to 36
         shell: bash
