@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'dart:ui' as ui;
+import 'dart:io' as io;
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:intl/intl.dart';
@@ -479,18 +480,17 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> sendAttachment() async {
-    if (sending) {
-      return;
-    }
+    if (sending) return;
+    String? uploadedPath;
     try {
-      final result = await FilePicker.platform.pickFiles(withData: true, type: FileType.any);
-      if (result == null || result.files.isEmpty) {
-        return;
-      }
+      final result = await FilePicker.platform.pickFiles(
+        withData: false,
+        type: FileType.any,
+      );
+      if (result == null || result.files.isEmpty) return;
       final file = result.files.single;
-      final bytes = file.bytes;
       final mime = _mimeFor(file.extension ?? '');
-      if (bytes == null || mime == null) {
+      if (mime == null) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('نوع الملف غير مدعوم. اختر صورة أو فيديو أو صوتاً أو PDF أو TXT أو ZIP.')),
@@ -498,7 +498,27 @@ class _ChatPageState extends State<ChatPage> {
         }
         return;
       }
-      if (bytes.length > 50 * 1024 * 1024) {
+      const maxBytes = 50 * 1024 * 1024;
+      if (file.size <= 0 || file.size > maxBytes) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('يجب أن يكون حجم الملف أكبر من صفر ولا يتجاوز 50 ميغابايت.')),
+          );
+        }
+        return;
+      }
+      final filePath = file.path;
+      if (filePath == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('تعذر الوصول إلى الملف المحدد.')),
+          );
+        }
+        return;
+      }
+      setState(() => sending = true);
+      final bytes = await io.File(filePath).readAsBytes();
+      if (bytes.length > maxBytes) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('الحد الأقصى لحجم الملف هو 50 ميغابايت.')),
@@ -506,13 +526,13 @@ class _ChatPageState extends State<ChatPage> {
         }
         return;
       }
-      setState(() => sending = true);
       final uid = client.auth.currentUser!.id;
       final safeName = file.name.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
       final path = '${widget.conversationId}/$uid/${DateTime.now().microsecondsSinceEpoch}_$safeName';
       await client.storage.from('helba-chat-media').uploadBinary(
         path, bytes, fileOptions: FileOptions(contentType: mime, upsert: false),
       );
+      uploadedPath = path;
       final type = mime.startsWith('image/') ? 'image'
           : mime.startsWith('video/') ? 'video'
           : mime.startsWith('audio/') ? 'audio' : 'file';
@@ -523,16 +543,22 @@ class _ChatPageState extends State<ChatPage> {
         'message_type': type,
         'attachment_path': path,
       });
+      uploadedPath = null;
     } catch (_) {
+      if (uploadedPath != null) {
+        try {
+          await client.storage.from('helba-chat-media').remove([uploadedPath]);
+        } catch (_) {
+          // Keep the original upload error; an orphan can be cleaned up later.
+        }
+      }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('تعذر رفع الملف. تحقق من الاتصال ونوع الملف.')),
         );
       }
     } finally {
-      if (mounted) {
-        setState(() => sending = false);
-      }
+      if (mounted) setState(() => sending = false);
     }
   }
 
