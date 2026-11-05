@@ -3,6 +3,7 @@ import 'dart:io' as io;
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:helba/src/config.dart';
+import 'package:helba/src/deeplink.dart';
 import 'package:helba/src/diagnostics.dart';
 import 'package:helba/src/network.dart';
 import 'package:helba/src/utils.dart';
@@ -200,6 +201,25 @@ void main() {
       isNotNull,
     );
     expect(networkErrorMessage(Exception('something else')), isNull);
+  });
+
+  group('deep links', () {
+    test('authCallbackUrl is the app callback', () {
+      expect(authCallbackUrl, 'helba://auth/callback');
+    });
+
+    test('isAuthCallback accepts only the app auth callback', () {
+      expect(isAuthCallback(Uri.parse('helba://auth/callback')), isTrue);
+      expect(
+          isAuthCallback(Uri.parse(
+              'helba://auth/callback?code=abc&state=xyz')),
+          isTrue);
+      expect(isAuthCallback(Uri.parse('helba://auth/reset')), isTrue);
+      expect(isAuthCallback(Uri.parse('helba://other/callback')), isFalse);
+      expect(
+          isAuthCallback(Uri.parse('https://example.com/auth/callback')),
+          isFalse);
+    });
   });
 
   group('diagnostics helpers', () {
