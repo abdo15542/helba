@@ -109,6 +109,29 @@ void main() {
     }
   }, timeout: const Timeout(Duration(seconds: 30)));
 
+  test('Helba overrides identify as a browser client', () {
+    final client = HelbaHttpOverrides().createHttpClient(null);
+    expect(client.userAgent, browserUserAgent);
+    expect(client.userAgent, contains('Mozilla/5.0'));
+    client.close();
+  });
+
+  test('networkErrorMessage explains undecodable server replies', () {
+    expect(
+      networkErrorMessage(Exception('Failed to decode error response')),
+      isNotNull,
+    );
+    expect(
+      networkErrorMessage(Exception('Failed to decode error response')),
+      contains('غير متوقع'),
+    );
+    expect(
+      networkErrorMessage(Exception('Received an empty response')),
+      isNotNull,
+    );
+    expect(networkErrorMessage(Exception('something else')), isNull);
+  });
+
   group('diagnostics helpers', () {
     test('checkStatusLabel returns Arabic labels', () {
       expect(checkStatusLabel(CheckStatus.running), 'جارٍ…');
@@ -130,6 +153,14 @@ void main() {
         ]),
         '104.18.38.10, 172.64.149.246',
       );
+    });
+
+    test('isJsonResponseBody distinguishes JSON from HTML pages', () {
+      expect(isJsonResponseBody('{"code":400,"msg":"x"}'), isTrue);
+      expect(isJsonResponseBody('  { "ok": true }'), isTrue);
+      expect(
+          isJsonResponseBody('<html><body>blocked</body></html>'), isFalse);
+      expect(isJsonResponseBody(''), isFalse);
     });
   });
 }
