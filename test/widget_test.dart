@@ -79,6 +79,16 @@ void main() {
     }
   }, timeout: const Timeout(Duration(seconds: 30)));
 
+  test('readSystemProxy returns null without a native channel', () async {
+    // In tests there is no platform channel, so the lookup must fail
+    // gracefully instead of throwing.
+    expect(await readSystemProxy(), isNull);
+  });
+
+  test('buildCommit is a non-empty identifier', () {
+    expect(buildCommit.isNotEmpty, isTrue);
+  });
+
   test('HttpClient with Helba overrides reaches Supabase Auth', () async {
     io.HttpOverrides.global = HelbaHttpOverrides();
     final client = io.HttpClient();
