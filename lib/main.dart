@@ -98,7 +98,7 @@ class SetupPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) => const Scaffold(body: Center(child: Padding(
     padding: EdgeInsets.all(24),
-    child: Text('أضف SUPABASE_URL وSUPABASE_ANON_KEY لتفعيل هلبة.', textAlign: TextAlign.center),
+    child: Text('أضف SUPABASE_URL وSUPABASE_PUBLISHABLE_KEY لتفعيل هلبة.', textAlign: TextAlign.center),
   )));
 }
 
@@ -323,19 +323,35 @@ class _NewChatSheetState extends State<NewChatSheet> {
   bool creatingGroup = false;
   String? error;
 
+  int _searchRequest = 0;
+
   Future<void> findUsers(String value) async {
-    if (value.trim().length < 2) { setState(() => users = []); return; }
-    setState(() => busy = true);
+    final term = value.trim().replaceAll(RegExp(r'[,(){}]'), ' ');
+    final request = ++_searchRequest;
+    if (term.length < 2) {
+      if (mounted) setState(() { users = []; busy = false; error = null; });
+      return;
+    }
+    if (mounted) setState(() { busy = true; error = null; });
     try {
       final me = Supabase.instance.client.auth.currentUser!.id;
+      final safeTerm = term.replaceAll('%', '').replaceAll('_', '');
       final result = await Supabase.instance.client.from('profiles')
         .select('id,display_name,username')
         .neq('id', me)
-        .or('username.ilike.%$value%,display_name.ilike.%$value%')
+        .or('username.ilike.%$safeTerm%,display_name.ilike.%$safeTerm%')
         .limit(20);
+      if (!mounted || request != _searchRequest) return;
       setState(() { users = result.cast<Map<String, dynamic>>(); error = null; });
-    } catch (_) { setState(() => error = 'تعذر البحث عن المستخدمين.'); }
-    finally { if (mounted) setState(() => busy = false); }
+    } catch (_) {
+      if (mounted && request == _searchRequest) {
+        setState(() => error = 'تعذر البحث عن المستخدمين.');
+      }
+    } finally {
+      if (mounted && request == _searchRequest) {
+        setState(() => busy = false);
+      }
+    }
   }
 
   Future<void> createGroup() async {
