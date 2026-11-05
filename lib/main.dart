@@ -384,8 +384,11 @@ class _NewChatSheetState extends State<NewChatSheet> {
       if (!mounted) return;
       Navigator.pop(context);
       Navigator.push(context, MaterialPageRoute(builder: (_) => ChatPage(conversationId: result.toString(), title: user['display_name']?.toString() ?? 'محادثة')));
-    } catch (_) { setState(() => error = 'تعذر إنشاء المحادثة. تحقق من إعداد قاعدة البيانات.'); }
-    finally { if (mounted) setState(() => busy = false); }
+    } catch (_) {
+      if (mounted) setState(() => error = 'تعذر إنشاء المحادثة. تحقق من إعداد قاعدة البيانات.');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
   }
 
   @override
