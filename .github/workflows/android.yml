@@ -37,6 +37,38 @@ jobs:
       - name: Generate Android platform files
         run: flutter create --platforms=android .
 
+      - name: Add INTERNET permission to the main manifest
+        shell: bash
+        run: |
+          # The flutter create template puts INTERNET only in the
+          # debug/profile manifests, so release APKs ship WITHOUT it and
+          # Android denies the app all network access (connect() fails with
+          # EPERM). Patch the main manifest so every build has it.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("android/app/src/main/AndroidManifest.xml")
+          source = path.read_text()
+          if "android.permission.INTERNET" in source:
+              print("INTERNET permission already present")
+          else:
+              lines = source.splitlines(keepends=True)
+              for i, line in enumerate(lines):
+                  if line.lstrip().startswith("<manifest"):
+                      j = i
+                      while ">" not in lines[j]:
+                          j += 1
+                      lines.insert(j + 1, '    <uses-permission android:name="android.permission.INTERNET" />\n')
+                      break
+              else:
+                  raise SystemExit("Could not find <manifest> tag in AndroidManifest.xml")
+              path.write_text("".join(lines))
+              print("Added INTERNET permission to AndroidManifest.xml")
+          PY
+
+      - name: Verify INTERNET permission in manifest
+        run: |
+          grep -q 'android.permission.INTERNET' android/app/src/main/AndroidManifest.xml || (echo "INTERNET permission missing from AndroidManifest.xml" && exit 1)
+
       - name: Set Android compile SDK to 36
         shell: bash
         run: |
