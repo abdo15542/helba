@@ -436,22 +436,25 @@ class _ChatPageState extends State<ChatPage> {
       final bytes = file.bytes;
       final mime = _mimeFor(file.extension ?? '');
       if (bytes == null || mime == null) {
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('نوع الملف غير مدعوم. اختر صورة أو فيديو أو صوتاً أو PDF أو TXT أو ZIP.')),
-        );
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('نوع الملف غير مدعوم. اختر صورة أو فيديو أو صوتاً أو PDF أو TXT أو ZIP.')),
+          );
+        }
         return;
       }
       if (bytes.length > 50 * 1024 * 1024) {
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('الحد الأقصى لحجم الملف هو 50 ميغابايت.')),
-        );
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('الحد الأقصى لحجم الملف هو 50 ميغابايت.')),
+          );
+        }
         return;
       }
       setState(() => sending = true);
       final uid = client.auth.currentUser!.id;
       final safeName = file.name.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
-      final path = widget.conversationId + '/' + uid + '/' +
-          DateTime.now().microsecondsSinceEpoch.toString() + '_' + safeName;
+      final path = '${widget.conversationId}/$uid/${DateTime.now().microsecondsSinceEpoch}_$safeName';
       await client.storage.from('helba-chat-media').uploadBinary(
         path, bytes, fileOptions: FileOptions(contentType: mime, upsert: false),
       );
@@ -466,9 +469,11 @@ class _ChatPageState extends State<ChatPage> {
         'attachment_path': path,
       });
     } catch (_) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('تعذر رفع الملف. تحقق من الاتصال ونوع الملف.')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('تعذر رفع الملف. تحقق من الاتصال ونوع الملف.')),
+        );
+      }
     } finally {
       if (mounted) setState(() => sending = false);
     }
@@ -479,9 +484,11 @@ class _ChatPageState extends State<ChatPage> {
       final url = await client.storage.from('helba-chat-media').createSignedUrl(path, 300);
       await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
     } catch (_) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('تعذر فتح المرفق أو انتهت صلاحيته.')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('تعذر فتح المرفق أو انتهت صلاحيته.')),
+        );
+      }
     }
   }
 
