@@ -69,6 +69,39 @@ jobs:
         run: |
           grep -q 'android.permission.INTERNET' android/app/src/main/AndroidManifest.xml || (echo "INTERNET permission missing from AndroidManifest.xml" && exit 1)
 
+      - name: Add deep-link intent filter to the main manifest
+        shell: bash
+        run: |
+          # The email-confirmation link must open the app (helba://auth/...)
+          # instead of a browser page. The generated manifest has no such
+          # filter, so insert one into MainActivity (before </activity>).
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("android/app/src/main/AndroidManifest.xml")
+          source = path.read_text()
+          if 'android:scheme="helba"' in source:
+              print("Deep-link intent filter already present")
+          else:
+              block = (
+                  '        <intent-filter>\n'
+                  '            <action android:name="android.intent.action.VIEW" />\n'
+                  '            <category android:name="android.intent.category.DEFAULT" />\n'
+                  '            <category android:name="android.intent.category.BROWSABLE" />\n'
+                  '            <data android:scheme="helba" android:host="auth" />\n'
+                  '        </intent-filter>\n'
+              )
+              marker = '</activity>'
+              if marker not in source:
+                  raise SystemExit("Could not find </activity> in AndroidManifest.xml")
+              source = source.replace(marker, block + marker, 1)
+              path.write_text(source)
+              print("Added deep-link intent filter to AndroidManifest.xml")
+          PY
+
+      - name: Verify deep-link intent filter in manifest
+        run: |
+          grep -q 'android:scheme="helba"' android/app/src/main/AndroidManifest.xml || (echo "Deep-link intent filter missing from AndroidManifest.xml" && exit 1)
+
       - name: Set Android compile SDK to 36
         shell: bash
         run: |
