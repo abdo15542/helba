@@ -437,10 +437,14 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> sendAttachment() async {
-    if (sending) return;
+    if (sending) {
+      return;
+    }
     try {
       final result = await FilePicker.platform.pickFiles(withData: true, type: FileType.any);
-      if (result == null || result.files.isEmpty) return;
+      if (result == null || result.files.isEmpty) {
+        return;
+      }
       final file = result.files.single;
       final bytes = file.bytes;
       final mime = _mimeFor(file.extension ?? '');
@@ -484,7 +488,9 @@ class _ChatPageState extends State<ChatPage> {
         );
       }
     } finally {
-      if (mounted) setState(() => sending = false);
+      if (mounted) {
+        setState(() => sending = false);
+      }
     }
   }
 
