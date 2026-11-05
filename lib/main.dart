@@ -17,17 +17,26 @@ Future<void> main() async {
   // Remove accidental spaces/newlines from build-time configuration before parsing the host.
   final url = configuredUrl.trim().replaceAll(RegExp(r'\s+'), '').replaceAll(RegExp(r'/+$'), '');
   final parsedUrl = Uri.tryParse(url);
+  // Never crash before runApp on a bad configuration: show the setup screen
+  // with the problem instead, so a misconfigured build is diagnosable.
+  String? configError;
   if (parsedUrl == null || parsedUrl.scheme != 'https' || parsedUrl.host.isEmpty) {
-    throw StateError('Invalid SUPABASE_URL. Expected https://<project-ref>.supabase.co');
+    configError = 'رابط Supabase غير صحيح. المتوقع https://<project-ref>.supabase.co';
+  } else if (key.isEmpty) {
+    configError = 'مفتاح Supabase مفقود. أضف SUPABASE_PUBLISHABLE_KEY.';
+  } else {
+    try {
+      await Supabase.initialize(url: url, publishableKey: key);
+    } catch (_) {
+      configError = 'تعذر الاتصال بـ Supabase. تحقق من الرابط والمفتاح والاتصال.';
+    }
   }
-  if (key.isNotEmpty) {
-    await Supabase.initialize(url: url, publishableKey: key);
-  }
-  runApp(const HelbaApp());
+  runApp(HelbaApp(configError: configError));
 }
 
 class HelbaApp extends StatelessWidget {
-  const HelbaApp({super.key});
+  final String? configError;
+  const HelbaApp({super.key, this.configError});
   @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'هلبة',
@@ -38,12 +47,13 @@ class HelbaApp extends StatelessWidget {
       scaffoldBackgroundColor: const Color(0xFFF5F8F6),
       fontFamily: 'Arial',
     ),
-    home: Directionality(textDirection: ui.TextDirection.rtl, child: const AuthGate()),
+    home: Directionality(textDirection: ui.TextDirection.rtl, child: AuthGate(configError: configError)),
   );
 }
 
 class AuthGate extends StatefulWidget {
-  const AuthGate({super.key});
+  final String? configError;
+  const AuthGate({super.key, this.configError});
   @override
   State<AuthGate> createState() => _AuthGateState();
 }
@@ -52,6 +62,7 @@ class _AuthGateState extends State<AuthGate> {
   String? boundEmail;
   bool loading = true;
   bool configured = false;
+  bool _binding = false;
 
   @override
   void initState() {
@@ -61,20 +72,29 @@ class _AuthGateState extends State<AuthGate> {
   }
 
   Future<void> _load() async {
-    boundEmail = await secureStore.read(key: 'helba_bound_email');
-    if (mounted) setState(() => loading = false);
+    try {
+      boundEmail = await secureStore.read(key: 'helba_bound_email');
+    } catch (_) {
+      boundEmail = null;
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
   }
 
   Future<void> _bind(String email) async {
     final normalized = email.trim().toLowerCase();
-    await secureStore.write(key: 'helba_bound_email', value: normalized);
+    try {
+      await secureStore.write(key: 'helba_bound_email', value: normalized);
+    } catch (_) {
+      // A failed bind must not block sign-in; the next launch retries it.
+    }
     if (mounted) setState(() => boundEmail = normalized);
   }
 
   @override
   Widget build(BuildContext context) {
     if (loading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    if (!configured) return const SetupPage();
+    if (!configured || widget.configError != null) return SetupPage(message: widget.configError);
     return StreamBuilder<AuthState>(
       stream: Supabase.instance.client.auth.onAuthStateChange,
       builder: (context, _) {
@@ -93,19 +113,78 @@ class _AuthGateState extends State<AuthGate> {
             ]),
           )));
         }
-        if (boundEmail == null) WidgetsBinding.instance.addPostFrameCallback((_) => _bind(email));
+        // Sign-up used to land straight in the inbox without confirming the
+        // email, because only the sign-in path checked emailConfirmedAt.
+        // Enforce confirmation here for every session, whatever created it.
+        if (user.emailConfirmedAt == null) {
+          return UnconfirmedEmailPage(email: email);
+        }
+        if (boundEmail == null && !_binding) {
+          _binding = true;
+          WidgetsBinding.instance.addPostFrameCallback((_) => _bind(email));
+        }
         return const InboxPage();
       },
     );
   }
 }
 
-class SetupPage extends StatelessWidget {
-  const SetupPage({super.key});
+class UnconfirmedEmailPage extends StatefulWidget {
+  final String email;
+  const UnconfirmedEmailPage({super.key, required this.email});
   @override
-  Widget build(BuildContext context) => const Scaffold(body: Center(child: Padding(
-    padding: EdgeInsets.all(24),
-    child: Text('أضف SUPABASE_URL وSUPABASE_PUBLISHABLE_KEY لتفعيل هلبة.', textAlign: TextAlign.center),
+  State<UnconfirmedEmailPage> createState() => _UnconfirmedEmailPageState();
+}
+
+class _UnconfirmedEmailPageState extends State<UnconfirmedEmailPage> {
+  bool busy = false;
+  String? message;
+  String? error;
+
+  Future<void> _resend() async {
+    setState(() { busy = true; message = null; error = null; });
+    try {
+      await Supabase.instance.client.auth.resend(email: widget.email, type: OtpType.signup);
+      if (mounted) setState(() => message = 'أرسلنا رابط تأكيد جديد إلى بريدك الإلكتروني.');
+    } on AuthException catch (ex) {
+      if (mounted) setState(() => error = ex.message);
+    } catch (_) {
+      if (mounted) setState(() => error = 'تعذر إرسال رابط التأكيد. حاول مجدداً.');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(body: Center(child: Padding(
+    padding: const EdgeInsets.all(24),
+    child: Column(mainAxisSize: MainAxisSize.min, children: [
+      const Icon(Icons.mark_email_unread_outlined, size: 48, color: green),
+      const SizedBox(height: 12),
+      const Text('أكد بريدك الإلكتروني أولاً', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8),
+      Text('أرسلنا رابط تأكيد إلى ${widget.email}. افتحه ثم سجل الدخول.', textAlign: TextAlign.center),
+      if (message != null) Padding(padding: const EdgeInsets.only(top: 12), child: Text(message!, style: const TextStyle(color: green))),
+      if (error != null) Padding(padding: const EdgeInsets.only(top: 12), child: Text(error!, style: const TextStyle(color: Colors.red))),
+      const SizedBox(height: 16),
+      FilledButton(onPressed: busy ? null : _resend, child: const Text('إعادة إرسال رابط التأكيد')),
+      const SizedBox(height: 8),
+      TextButton(onPressed: () => Supabase.instance.client.auth.signOut(), child: const Text('تسجيل الخروج')),
+    ]),
+  )));
+}
+
+class SetupPage extends StatelessWidget {
+  final String? message;
+  const SetupPage({super.key, this.message});
+  @override
+  Widget build(BuildContext context) => Scaffold(body: Center(child: Padding(
+    padding: const EdgeInsets.all(24),
+    child: Column(mainAxisSize: MainAxisSize.min, children: [
+      const Icon(Icons.settings_outlined, size: 48, color: green),
+      const SizedBox(height: 12),
+      Text(message ?? 'أضف SUPABASE_URL وSUPABASE_PUBLISHABLE_KEY لتفعيل هلبة.', textAlign: TextAlign.center),
+    ]),
   )));
 }
 
@@ -145,7 +224,12 @@ class _LoginPageState extends State<LoginPage> {
     try {
       final auth = Supabase.instance.client.auth;
       if (signup) {
-        await auth.signUp(email: e, password: password.text);
+        final result = await auth.signUp(email: e, password: password.text);
+        // If sign-up created a session (auto-confirm), drop it so the user
+        // must confirm the email first; AuthGate enforces the same rule.
+        if (result.session != null) {
+          await auth.signOut();
+        }
         setState(() => message = 'أرسلنا رابط تأكيد إلى بريدك الإلكتروني.');
       } else {
         final result = await auth.signInWithPassword(email: e, password: password.text);
@@ -220,15 +304,40 @@ class InboxPage extends StatefulWidget {
 class _InboxPageState extends State<InboxPage> {
   final search = TextEditingController();
   String query = '';
+  // The chats future must live in state: creating it inside build() refetched
+  // from Supabase on every rebuild, including every keystroke in search.
+  late Future<List<Map<String, dynamic>>> _chatsFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _chatsFuture = loadChats();
+  }
+
+  Future<void> _refresh() async {
+    final future = loadChats();
+    if (mounted) setState(() => _chatsFuture = future);
+    // Swallow here: the FutureBuilder above already surfaces the error.
+    try { await future; } catch (_) {}
+  }
+
   @override
   void dispose() { search.dispose(); super.dispose(); }
 
   Future<List<Map<String, dynamic>>> loadChats() async {
-    final uid = Supabase.instance.client.auth.currentUser!.id;
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    if (uid == null) return [];
     final rows = await Supabase.instance.client.from('conversation_members')
       .select('conversation_id, conversations(id,kind,title,updated_at,conversation_members(user_id,profiles(display_name,username)))')
       .eq('user_id', uid);
-    return rows.cast<Map<String, dynamic>>();
+    final chats = rows.cast<Map<String, dynamic>>();
+    // Newest conversation first; the query itself returns no ordering.
+    chats.sort((a, b) {
+      final aUpdated = (a['conversations'] as Map<String, dynamic>?)?['updated_at']?.toString() ?? '';
+      final bUpdated = (b['conversations'] as Map<String, dynamic>?)?['updated_at']?.toString() ?? '';
+      return bUpdated.compareTo(aUpdated);
+    });
+    return chats;
   }
 
   @override
@@ -247,12 +356,14 @@ class _InboxPageState extends State<InboxPage> {
         controller: search, onChanged: (v) => setState(() => query = v),
         decoration: InputDecoration(hintText: 'ابحث في محادثاتك', prefixIcon: const Icon(Icons.search), filled: true, fillColor: Colors.white, border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none)),
       )),
-      Expanded(child: FutureBuilder<List<Map<String, dynamic>>>(
-        future: loadChats(),
+      Expanded(child: RefreshIndicator(
+        onRefresh: _refresh,
+        child: FutureBuilder<List<Map<String, dynamic>>>(
+        future: _chatsFuture,
         builder: (context, snap) {
           if (snap.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
           if (snap.hasError) return Center(child: Text('تعذر تحميل المحادثات: ${snap.error}'));
-          final currentUserId = Supabase.instance.client.auth.currentUser!.id;
+          final currentUserId = Supabase.instance.client.auth.currentUser?.id;
           final chats = (snap.data ?? []).where((r) {
             final c = r['conversations'] as Map<String, dynamic>?;
             final members = (c?['conversation_members'] as List<dynamic>? ?? []);
@@ -291,12 +402,12 @@ class _InboxPageState extends State<InboxPage> {
                 ),
                 title: Text(displayTitle, style: const TextStyle(fontWeight: FontWeight.bold)),
                 subtitle: Text(c['kind'] == 'group' ? 'مجموعة' : 'محادثة فردية'),
-                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ChatPage(conversationId: c['id'].toString(), title: displayTitle))),
+                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ChatPage(conversationId: c['id'].toString(), title: displayTitle))).then((_) => _refresh()),
               );
             },
           );
         },
-      )),
+      ))),
     ]),
   );
 }
@@ -463,8 +574,19 @@ class ChatPage extends StatefulWidget {
 
 class _ChatPageState extends State<ChatPage> {
   final input = TextEditingController();
+  final _scroll = ScrollController();
   bool sending = false;
+  int _lastMessageCount = -1;
   final client = Supabase.instance.client;
+
+  void _scrollToBottom() {
+    if (!_scroll.hasClients) return;
+    final extent = _scroll.position.maxScrollExtent;
+    if (extent > 0) _scroll.jumpTo(extent);
+  }
+
+  @override
+  void dispose() { input.dispose(); _scroll.dispose(); super.dispose(); }
 
 
   String? _mimeFor(String extension) {
@@ -526,20 +648,13 @@ class _ChatPageState extends State<ChatPage> {
         return;
       }
       setState(() => sending = true);
-      final bytes = await io.File(filePath).readAsBytes();
-      if (bytes.length > maxBytes) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('الحد الأقصى لحجم الملف هو 50 ميغابايت.')),
-          );
-        }
-        return;
-      }
+      // Upload the file itself instead of reading up to 50 MB into memory
+      // first; the old code held the whole file in RAM as bytes.
       final uid = client.auth.currentUser!.id;
       final safeName = file.name.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
       final path = '${widget.conversationId}/$uid/${DateTime.now().microsecondsSinceEpoch}_$safeName';
-      await client.storage.from('helba-chat-media').uploadBinary(
-        path, bytes, fileOptions: FileOptions(contentType: mime, upsert: false),
+      await client.storage.from('helba-chat-media').upload(
+        path, io.File(filePath), fileOptions: FileOptions(contentType: mime, upsert: false),
       );
       uploadedPath = path;
       final type = mime.startsWith('image/') ? 'image'
@@ -586,7 +701,8 @@ class _ChatPageState extends State<ChatPage> {
 
   Future<void> send() async {
     final body = input.text.trim();
-    if (body.isEmpty || sending) return;
+    final uid = client.auth.currentUser?.id;
+    if (body.isEmpty || sending || uid == null) return;
     if (body.length > 4000) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('الحد الأقصى للرسالة 4000 حرف.')),
@@ -597,7 +713,7 @@ class _ChatPageState extends State<ChatPage> {
     try {
       await client.from('messages').insert({
         'conversation_id': widget.conversationId,
-        'sender_id': client.auth.currentUser!.id,
+        'sender_id': uid,
         'body': body,
         'message_type': 'text',
       });
@@ -607,8 +723,6 @@ class _ChatPageState extends State<ChatPage> {
     } finally { if (mounted) setState(() => sending = false); }
   }
 
-  @override
-  void dispose() { input.dispose(); super.dispose(); }
   @override
   Widget build(BuildContext context) {
     final stream = client.from('messages').stream(primaryKey: ['id'])
@@ -623,12 +737,18 @@ class _ChatPageState extends State<ChatPage> {
             if (!snap.hasData) return const Center(child: CircularProgressIndicator());
             final rows = snap.data!;
             if (rows.isEmpty) return const Center(child: Text('ابدأ المحادثة برسالة ترحيب 👋'));
+            if (rows.length != _lastMessageCount) {
+              _lastMessageCount = rows.length;
+              WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+            }
             return ListView.builder(
+              controller: _scroll,
               padding: const EdgeInsets.all(14),
               itemCount: rows.length,
               itemBuilder: (context, i) {
                 final row = rows[i];
-                final mine = row['sender_id'] == client.auth.currentUser!.id;
+                final myId = client.auth.currentUser?.id;
+                final mine = myId != null && row['sender_id'] == myId;
                 final time = DateTime.tryParse(row['created_at']?.toString() ?? '');
                 return Align(
                   alignment: mine ? Alignment.centerLeft : Alignment.centerRight,
@@ -651,7 +771,7 @@ class _ChatPageState extends State<ChatPage> {
                         )
                       else
                         Text(row['body']?.toString() ?? ''),
-                      if (time != null) Text(DateFormat('HH:mm').format(time), style: const TextStyle(fontSize: 10, color: Colors.black54)),
+                      if (time != null) Text(DateFormat('HH:mm').format(time.toLocal()), style: const TextStyle(fontSize: 10, color: Colors.black54)),
                     ]),
                   ),
                 );
