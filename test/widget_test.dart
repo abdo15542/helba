@@ -1,11 +1,18 @@
 import 'dart:convert';
 import 'dart:io' as io;
 
+import 'package:cryptography/cryptography.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:helba/src/admin.dart';
+import 'package:helba/src/calls.dart';
+import 'package:helba/src/channels.dart';
 import 'package:helba/src/config.dart';
 import 'package:helba/src/deeplink.dart';
 import 'package:helba/src/diagnostics.dart';
+import 'package:helba/src/e2ee.dart';
 import 'package:helba/src/network.dart';
+import 'package:helba/src/push.dart';
+import 'package:helba/src/stories.dart';
 import 'package:helba/src/utils.dart';
 
 /// True when the process runs behind a proxy (sandboxed environment):
@@ -219,6 +226,593 @@ void main() {
       expect(
           isAuthCallback(Uri.parse('https://example.com/auth/callback')),
           isFalse);
+    });
+  });
+
+  group('push helpers', () {
+    test('parseChatDeepLink accepts only helba://chat/<id>', () {
+      expect(
+          parseChatDeepLink(Uri.parse(
+              'helba://chat/123e4567-e89b-12d3-a456-426614174000')),
+          '123e4567-e89b-12d3-a456-426614174000');
+      expect(parseChatDeepLink(Uri.parse('helba://auth/callback')), isNull);
+      expect(parseChatDeepLink(Uri.parse('https://example.com/chat/abc')),
+          isNull);
+      expect(parseChatDeepLink(Uri.parse('helba://chat/')), isNull);
+      expect(parseChatDeepLink(Uri.parse('helba://chat/a/b')), isNull);
+      expect(parseChatDeepLink(Uri.parse('helba://other/abc')), isNull);
+    });
+
+    test('isChatDeepLink / chatIdFromDeepLink agree with parseChatDeepLink',
+        () {
+      final chat = Uri.parse('helba://chat/abc-123');
+      expect(isChatDeepLink(chat), isTrue);
+      expect(chatIdFromDeepLink(chat), 'abc-123');
+      final auth = Uri.parse('helba://auth/callback');
+      expect(isChatDeepLink(auth), isFalse);
+      expect(chatIdFromDeepLink(auth), isNull);
+    });
+
+    test('buildNotificationTitle falls back to the app name', () {
+      expect(buildNotificationTitle('أحمد'), 'أحمد');
+      expect(buildNotificationTitle('  أحمد  '), 'أحمد');
+      expect(buildNotificationTitle(''), 'هلبة');
+      expect(buildNotificationTitle('   '), 'هلبة');
+      expect(buildNotificationTitle(null), 'هلبة');
+    });
+
+    test('buildNotificationBody truncates long text to ~100 chars', () {
+      final long = 'a' * 150;
+      final body = buildNotificationBody(long, 'text');
+      expect(body.length, pushPreviewMaxLength + 1);
+      expect(body, endsWith('…'));
+      expect(body, startsWith('a' * pushPreviewMaxLength));
+      final exact = 'b' * pushPreviewMaxLength;
+      expect(buildNotificationBody(exact, 'text'), exact);
+      expect(buildNotificationBody('مرحباً', 'text'), 'مرحباً');
+    });
+
+    test('buildNotificationBody falls back for empty body / attachments',
+        () {
+      expect(buildNotificationBody('', 'text'), 'رسالة جديدة');
+      expect(buildNotificationBody(null, 'text'), 'رسالة جديدة');
+      expect(buildNotificationBody('   ', null), 'رسالة جديدة');
+      expect(buildNotificationBody('photo.jpg', 'image'), 'صورة');
+      expect(buildNotificationBody('clip.mp4', 'video'), 'فيديو');
+      expect(buildNotificationBody('voice.mp3', 'audio'), 'ملف صوتي');
+      expect(buildNotificationBody('doc.pdf', 'file'), 'ملف');
+    });
+
+    test('isValidPushToken rejects empty / blank tokens', () {
+      expect(isValidPushToken(''), isFalse);
+      expect(isValidPushToken('   '), isFalse);
+      expect(isValidPushToken(null), isFalse);
+      expect(isValidPushToken('eXaMpLeToKeN:APA91b...'), isTrue);
+    });
+  });
+
+  group('stories helpers', () {
+    final created = DateTime.utc(2026, 11, 5, 10);
+    final expires = created.add(const Duration(hours: 24));
+    Map<String, dynamic> storyRow(DateTime expiresAt) => {
+          'id': 'story-1',
+          'user_id': 'user-1',
+          'media_url': 'user-1/123_photo.jpg',
+          'media_type': 'image',
+          'created_at': created.toIso8601String(),
+          'expires_at': expiresAt.toIso8601String(),
+        };
+
+    test('isStoryExpired: +23h is not expired, +25h is expired', () {
+      expect(
+          isStoryExpired(
+              storyRow(expires), created.add(const Duration(hours: 23))),
+          isFalse);
+      expect(
+          isStoryExpired(
+              storyRow(expires), created.add(const Duration(hours: 25))),
+          isTrue);
+    });
+
+    test('isStoryExpired: exactly at expiry is expired', () {
+      expect(isStoryExpired(storyRow(expires), expires), isTrue);
+      expect(
+          isStoryExpired(
+              storyRow(expires), expires.subtract(const Duration(seconds: 1))),
+          isFalse);
+    });
+
+    test('isStoryExpired: an unparsable expiry is treated as expired', () {
+      expect(isStoryExpired({'expires_at': 'not-a-date'}, created), isTrue);
+      expect(isStoryExpired({}, created), isTrue);
+    });
+
+    test('filterUnexpiredStories keeps only unexpired stories', () {
+      final rows = [
+        storyRow(created.add(const Duration(hours: 24))),
+        storyRow(created.add(const Duration(hours: 1))),
+        storyRow(created.add(const Duration(hours: 48))),
+      ];
+      final now = created.add(const Duration(hours: 23));
+      expect(filterUnexpiredStories(rows, now), hasLength(2));
+      expect(filterUnexpiredStories(rows, now).map((r) => r['expires_at']),
+          contains(rows[0]['expires_at']));
+    });
+
+    test('storyMediaTypeFromMime maps image/video, rejects the rest', () {
+      expect(storyMediaTypeFromMime('image/jpeg'), 'image');
+      expect(storyMediaTypeFromMime('image/png'), 'image');
+      expect(storyMediaTypeFromMime('video/mp4'), 'video');
+      expect(storyMediaTypeFromMime('video/quicktime'), 'video');
+      expect(storyMediaTypeFromMime('application/pdf'), isNull);
+      expect(storyMediaTypeFromMime('audio/mpeg'), isNull);
+      expect(storyMediaTypeFromMime(null), isNull);
+    });
+  });
+
+  group('channels helpers', () {
+    test('canPostInConversation: only channel admins post', () {
+      expect(canPostInConversation('channel', 'member'), isFalse);
+      expect(canPostInConversation('channel', 'admin'), isTrue);
+      expect(canPostInConversation('channel', null), isFalse);
+      expect(canPostInConversation('group', 'member'), isTrue);
+      expect(canPostInConversation('group', 'admin'), isTrue);
+      expect(canPostInConversation('direct', 'member'), isTrue);
+      expect(canPostInConversation('direct', 'admin'), isTrue);
+      // Unknown kinds default to allowed, never silently lock the composer.
+      expect(canPostInConversation('unknown', 'member'), isTrue);
+      expect(canPostInConversation(null, 'member'), isTrue);
+    });
+
+    test('isChannelKind matches only channel', () {
+      expect(isChannelKind('channel'), isTrue);
+      expect(isChannelKind('group'), isFalse);
+      expect(isChannelKind('direct'), isFalse);
+      expect(isChannelKind(null), isFalse);
+    });
+
+    test('joinableChannels filters out joined, non-public, non-channel rows',
+        () {
+      final rows = [
+        {
+          'id': 'c1',
+          'kind': 'channel',
+          'is_public': true,
+          'conversation_members': [
+            {'user_id': 'other'}
+          ],
+        },
+        {
+          'id': 'c2',
+          'kind': 'channel',
+          'is_public': true,
+          'conversation_members': [
+            {'user_id': 'me'},
+            {'user_id': 'other'}
+          ],
+        },
+        {
+          'id': 'c3',
+          'kind': 'channel',
+          'is_public': false,
+          'conversation_members': [],
+        },
+        {
+          'id': 'c4',
+          'kind': 'group',
+          'is_public': true,
+          'conversation_members': [],
+        },
+        {
+          'id': 'c5',
+          'kind': 'channel',
+          'is_public': true,
+          'conversation_members': [],
+        },
+      ];
+      final joinable = joinableChannels(rows, 'me');
+      expect(joinable.map((r) => r['id']), ['c1', 'c5']);
+    });
+
+    test('roleInConversation reads the embedded member role', () {
+      final row = {
+        'conversation_members': [
+          {'user_id': 'me', 'role': 'admin'},
+          {'user_id': 'other', 'role': 'member'},
+        ],
+      };
+      expect(roleInConversation(row, 'me'), 'admin');
+      expect(roleInConversation(row, 'other'), 'member');
+      expect(roleInConversation(row, 'nobody'), 'member');
+      expect(roleInConversation({}, 'me'), 'member');
+    });
+
+    test('channelSubtitle returns Arabic labels', () {
+      expect(channelSubtitle('channel'), 'قناة');
+      expect(channelSubtitle('group'), 'مجموعة');
+      expect(channelSubtitle('direct'), 'محادثة فردية');
+      expect(channelSubtitle(null), 'محادثة فردية');
+    });
+  });
+
+  group('admin helpers', () {
+    test('isAdminProfile / isBannedProfile / canSeeAdminPanel', () {
+      expect(isAdminProfile({'is_admin': true}), isTrue);
+      expect(isAdminProfile({'is_admin': false}), isFalse);
+      expect(isAdminProfile({}), isFalse);
+      expect(isAdminProfile(null), isFalse);
+      expect(isBannedProfile({'is_banned': true}), isTrue);
+      expect(isBannedProfile({'is_banned': false}), isFalse);
+      expect(isBannedProfile({}), isFalse);
+      expect(isBannedProfile(null), isFalse);
+      expect(canSeeAdminPanel({'is_admin': true}), isTrue);
+      expect(canSeeAdminPanel({'is_admin': false}), isFalse);
+      expect(canSeeAdminPanel(null), isFalse);
+    });
+
+    test('reportStatusLabel covers all statuses plus unknown', () {
+      expect(reportStatusLabel('pending'), 'قيد المراجعة');
+      expect(reportStatusLabel('reviewed'), 'تمت المراجعة');
+      expect(reportStatusLabel('dismissed'), 'تم التجاهل');
+      expect(reportStatusLabel('something-else'), 'قيد المراجعة');
+      expect(reportStatusLabel(null), 'قيد المراجعة');
+    });
+
+    test('isValidReportTarget matrix', () {
+      const uuid = '123e4567-e89b-12d3-a456-426614174000';
+      expect(isValidReportTarget('message', uuid), isTrue);
+      expect(isValidReportTarget('user', uuid), isTrue);
+      expect(isValidReportTarget('post', uuid), isTrue);
+      expect(isValidReportTarget('comment', uuid), isFalse);
+      expect(isValidReportTarget(null, uuid), isFalse);
+      expect(isValidReportTarget('message', ''), isFalse);
+      expect(isValidReportTarget('message', null), isFalse);
+      expect(isValidReportTarget('message', 'not-a-uuid'), isFalse);
+      expect(isValidReportTarget('message', '  $uuid  '), isTrue);
+    });
+
+    test('sortReports puts pending first, then newest', () {
+      final rows = [
+        {
+          'id': 'r1',
+          'status': 'reviewed',
+          'created_at': '2026-11-05T10:00:00Z'
+        },
+        {
+          'id': 'r2',
+          'status': 'pending',
+          'created_at': '2026-11-05T09:00:00Z'
+        },
+        {
+          'id': 'r3',
+          'status': 'pending',
+          'created_at': '2026-11-05T11:00:00Z'
+        },
+      ];
+      expect(
+          sortReports(rows).map((r) => r['id']), ['r3', 'r2', 'r1']);
+    });
+  });
+
+  group('calls signalling helpers', () {
+    const offer = {
+      'type': 'offer',
+      'from': 'caller-id',
+      'to': 'callee-id',
+      'callId': 'call-1',
+      'callType': 'video',
+      'payload': {'sdp': 'v=0...', 'type': 'offer'},
+    };
+
+    test('parseCallSignal parses a valid offer', () {
+      final signal = parseCallSignal(offer);
+      expect(signal, isNotNull);
+      expect(signal!.type, CallSignalType.offer);
+      expect(signal.from, 'caller-id');
+      expect(signal.to, 'callee-id');
+      expect(signal.callId, 'call-1');
+      expect(signal.callType, 'video');
+      expect(signal.sdp, 'v=0...');
+      expect(signal.sdpType, 'offer');
+    });
+
+    test('parseCallSignal parses answer, ice, hangup and decline', () {
+      final answer = parseCallSignal({
+        'type': 'answer',
+        'from': 'callee-id',
+        'to': 'caller-id',
+        'callId': 'call-1',
+        'callType': 'voice',
+        'payload': {'sdp': 'v=0...', 'type': 'answer'},
+      });
+      expect(answer?.type, CallSignalType.answer);
+      expect(answer?.sdpType, 'answer');
+
+      final ice = parseCallSignal({
+        'type': 'ice',
+        'from': 'caller-id',
+        'to': 'callee-id',
+        'callId': 'call-1',
+        'callType': 'voice',
+        'payload': {
+          'candidate': {
+            'candidate': 'candidate:1',
+            'sdpMid': '0',
+            'sdpMLineIndex': 0
+          }
+        },
+      });
+      expect(ice?.type, CallSignalType.ice);
+      expect(ice?.candidate?['candidate'], 'candidate:1');
+      expect(ice?.candidate?['sdpMLineIndex'], 0);
+
+      final hangup = parseCallSignal({
+        'type': 'hangup',
+        'from': 'caller-id',
+        'to': 'callee-id',
+        'callId': 'call-1',
+        'callType': 'voice',
+      });
+      expect(hangup?.type, CallSignalType.hangup);
+      expect(hangup?.payload, isEmpty);
+
+      final decline = parseCallSignal({
+        'type': 'decline',
+        'from': 'callee-id',
+        'to': 'caller-id',
+        'callId': 'call-1',
+        'callType': 'video',
+      });
+      expect(decline?.type, CallSignalType.decline);
+    });
+
+    test('parseCallSignal unwraps the Realtime broadcast envelope', () {
+      final signal = parseCallSignal({
+        'event': 'offer',
+        'payload': offer,
+      });
+      expect(signal, isNotNull);
+      expect(signal!.type, CallSignalType.offer);
+      expect(signal.from, 'caller-id');
+      expect(signal.sdp, 'v=0...');
+    });
+
+    test('parseCallSignal rejects unknown types', () {
+      expect(
+          parseCallSignal({
+            'type': 'ring',
+            'from': 'a',
+            'to': 'b',
+            'callId': 'c',
+            'callType': 'voice',
+          }),
+          isNull);
+      expect(parseCallSignal({'from': 'a', 'to': 'b', 'callId': 'c'}),
+          isNull);
+    });
+
+    test('parseCallSignal rejects missing from/to/callId', () {
+      expect(
+          parseCallSignal({
+            'type': 'offer',
+            'to': 'b',
+            'callId': 'c',
+            'callType': 'voice',
+          }),
+          isNull);
+      expect(
+          parseCallSignal({
+            'type': 'offer',
+            'from': 'a',
+            'callId': 'c',
+            'callType': 'voice',
+          }),
+          isNull);
+      expect(
+          parseCallSignal({
+            'type': 'offer',
+            'from': 'a',
+            'to': 'b',
+            'callType': 'voice',
+          }),
+          isNull);
+      expect(
+          parseCallSignal({
+            'type': 'offer',
+            'from': '',
+            'to': 'b',
+            'callId': 'c',
+            'callType': 'voice',
+          }),
+          isNull);
+    });
+
+    test('parseCallSignal rejects offer/answer without a valid callType',
+        () {
+      expect(
+          parseCallSignal({
+            'type': 'offer',
+            'from': 'a',
+            'to': 'b',
+            'callId': 'c',
+            'callType': 'smoke-signal',
+          }),
+          isNull);
+      expect(
+          parseCallSignal({
+            'type': 'offer',
+            'from': 'a',
+            'to': 'b',
+            'callId': 'c',
+          }),
+          isNull);
+    });
+
+    test('encodeCallSignal round-trips through parseCallSignal', () {
+      final original = parseCallSignal(offer)!;
+      final reparsed = parseCallSignal(encodeCallSignal(original));
+      expect(reparsed, isNotNull);
+      expect(reparsed!.type, original.type);
+      expect(reparsed.from, original.from);
+      expect(reparsed.to, original.to);
+      expect(reparsed.callId, original.callId);
+      expect(reparsed.callType, original.callType);
+      expect(reparsed.sdp, original.sdp);
+    });
+
+    test('canCall is true only for direct chats', () {
+      expect(canCall('direct'), isTrue);
+      expect(canCall('group'), isFalse);
+      expect(canCall('channel'), isFalse);
+      expect(canCall(null), isFalse);
+      expect(canCall('unknown'), isFalse);
+    });
+
+    test('callStatusLabel returns non-empty Arabic for every status', () {
+      for (final status in [
+        'ringing',
+        'ongoing',
+        'completed',
+        'missed',
+        'declined',
+        'cancelled',
+        'something-else',
+        null,
+      ]) {
+        final label = callStatusLabel(status);
+        expect(label, isNotEmpty);
+        expect(label, isNot('ringing'));
+        expect(label, isNot('ongoing'));
+      }
+      expect(callStatusLabel('ringing'), 'يرن…');
+      expect(callStatusLabel('ongoing'), 'جارية');
+      expect(callStatusLabel('completed'), 'مكتملة');
+      expect(callStatusLabel('missed'), 'فائتة');
+      expect(callStatusLabel('declined'), 'مرفوضة');
+      expect(callStatusLabel('cancelled'), 'ملغاة');
+    });
+
+    test('formatCallDuration renders mm:ss', () {
+      expect(formatCallDuration(Duration.zero), '00:00');
+      expect(formatCallDuration(const Duration(seconds: 65)), '01:05');
+      expect(
+          formatCallDuration(const Duration(minutes: 12, seconds: 3)),
+          '12:03');
+    });
+  });
+
+  group('e2e helpers', () {
+    Future<SimpleKeyPair> newPair() => X25519().newKeyPair();
+    Future<String> pubOf(SimpleKeyPair pair) async =>
+        base64Encode((await pair.extractPublicKey()).bytes);
+    Future<List<int>> privOf(SimpleKeyPair pair) =>
+        pair.extractPrivateKeyBytes();
+
+    test('encrypt/decrypt round-trip with a random key', () async {
+      final key = generateConversationKey();
+      expect(key, hasLength(32));
+      final enc = await encryptText('مرحباً بالعالم 👋', key);
+      expect(enc.ciphertext, isNotEmpty);
+      expect(enc.nonce, isNotEmpty);
+      // Stored format: ciphertext = base64(cipherText || 16-byte tag),
+      // nonce = base64(12 random bytes).
+      expect(base64Decode(enc.nonce), hasLength(12));
+      expect(await decryptText(enc.ciphertext, enc.nonce, key),
+          'مرحباً بالعالم 👋');
+    });
+
+    test('encrypting twice gives different ciphertext and nonce', () async {
+      final key = generateConversationKey();
+      final first = await encryptText('same text', key);
+      final second = await encryptText('same text', key);
+      expect(first.ciphertext, isNot(second.ciphertext));
+      expect(first.nonce, isNot(second.nonce));
+    });
+
+    test('decrypt with a different key fails', () async {
+      final enc = await encryptText('secret', generateConversationKey());
+      await expectLater(
+        decryptText(enc.ciphertext, enc.nonce, generateConversationKey()),
+        throwsA(isA<SecretBoxAuthenticationError>()),
+      );
+    });
+
+    test('wrong nonce fails', () async {
+      final key = generateConversationKey();
+      final enc = await encryptText('secret', key);
+      final wrongNonce = base64Encode(List<int>.filled(12, 0));
+      await expectLater(
+        decryptText(enc.ciphertext, wrongNonce, key),
+        throwsA(isA<SecretBoxAuthenticationError>()),
+      );
+    });
+
+    test('tampered ciphertext fails', () async {
+      final key = generateConversationKey();
+      final enc = await encryptText('secret', key);
+      final bytes = base64Decode(enc.ciphertext);
+      bytes[0] ^= 0xFF;
+      await expectLater(
+        decryptText(base64Encode(bytes), enc.nonce, key),
+        throwsA(isA<SecretBoxAuthenticationError>()),
+      );
+    });
+
+    test('X25519 shared-secret symmetry', () async {
+      final alice = await newPair();
+      final bob = await newPair();
+      final aliceSecret = await deriveSharedSecret(
+          await privOf(alice), await pubOf(bob));
+      final bobSecret = await deriveSharedSecret(
+          await privOf(bob), await pubOf(alice));
+      expect(aliceSecret, hasLength(32));
+      expect(aliceSecret, bobSecret);
+    });
+
+    test('wrap/unwrap round-trip', () async {
+      final alice = await newPair();
+      final bob = await newPair();
+      final convKey = generateConversationKey();
+      final wrapped = await wrapConversationKey(
+          convKey, await privOf(alice), await pubOf(bob));
+      final unwrapped = await unwrapConversationKey(
+          wrapped, await privOf(bob), await pubOf(alice));
+      expect(unwrapped, convKey);
+    });
+
+    test('wrap for the wrong recipient fails', () async {
+      final alice = await newPair();
+      final bob = await newPair();
+      final carol = await newPair();
+      final wrapped = await wrapConversationKey(
+          generateConversationKey(), await privOf(alice), await pubOf(bob));
+      // Carol tries to unwrap a key wrapped for Bob, using Alice's
+      // public key: the shared secret differs, so authentication fails.
+      await expectLater(
+        unwrapConversationKey(
+            wrapped, await privOf(carol), await pubOf(alice)),
+        throwsA(isA<SecretBoxAuthenticationError>()),
+      );
+    });
+
+    test('isEncryptedMessage / canEncryptFor matrix', () {
+      expect(isEncryptedMessage({'is_encrypted': true}), isTrue);
+      expect(
+          isEncryptedMessage(
+              {'is_encrypted': false, 'ciphertext': 'abc123'}),
+          isTrue);
+      expect(
+          isEncryptedMessage(
+              {'is_encrypted': false, 'body': 'plain text'}),
+          isFalse);
+      expect(isEncryptedMessage({}), isFalse);
+      expect(isEncryptedMessage({'ciphertext': ''}), isFalse);
+
+      expect(canEncryptFor({'a': 'key-a', 'b': 'key-b'}), isTrue);
+      expect(canEncryptFor({'a': 'key-a', 'b': null}), isFalse);
+      expect(canEncryptFor({'a': 'key-a', 'b': ''}), isFalse);
+      expect(canEncryptFor({'a': 'key-a', 'b': '   '}), isFalse);
+      expect(canEncryptFor({}), isFalse);
     });
   });
 
