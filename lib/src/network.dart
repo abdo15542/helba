@@ -250,6 +250,35 @@ Future<io.Socket> openSocketForUrl(Uri url) async {
   );
 }
 
+/// Open a socket for [url] and, for https/wss, upgrade it to TLS with SNI
+/// and certificate checks for the URL host. This must be done here:
+/// HttpClient does NOT upgrade the socket a custom connectionFactory
+/// returns — it uses it exactly as-is (dart:io _ConnectionTarget only
+/// calls SecureSocket.startConnect in the default path). Sending the raw
+/// socket for an https URL means plain HTTP bytes reach the server's
+/// HTTPS port, which answers with an HTML '400 The plain HTTP request
+/// was sent to HTTPS port' page — the exact failure the signup probe
+/// showed on the device.
+Future<io.Socket> _connectSecurely(Uri url) async {
+  final socket = await openSocketForUrl(url);
+  if (url.scheme != 'https' && url.scheme != 'wss') return socket;
+  try {
+    // No onBadCertificate callback: the platform's trusted roots decide,
+    // and an invalid certificate must fail rather than be accepted.
+    return await io.SecureSocket.secure(
+      socket,
+      host: url.host,
+    ).timeout(const Duration(seconds: 15));
+  } catch (e) {
+    // A failed handshake leaves a half-open socket behind; close it so a
+    // retry starts clean.
+    try {
+      socket.destroy();
+    } catch (_) {}
+    rethrow;
+  }
+}
+
 class HelbaHttpOverrides extends io.HttpOverrides {
   @override
   io.HttpClient createHttpClient(io.SecurityContext? context) {
@@ -268,9 +297,9 @@ class HelbaHttpOverrides extends io.HttpOverrides {
         (Uri url, String? proxyHost, int? proxyPort) async {
       if (proxyHost != null) {
         // A proxy is configured (e.g. a sandbox or corporate network):
-        // dial the proxy and let HttpClient perform the CONNECT tunnel as
-        // usual. The proxy resolves the host, so the DoH fallback below
-        // does not apply.
+        // dial the proxy and let HttpClient perform the CONNECT tunnel and
+        // the TLS upgrade itself, as usual. The proxy resolves the host,
+        // so the DoH fallback below does not apply.
         try {
           return io.ConnectionTask.fromSocket(
               io.Socket.connect(proxyHost, proxyPort ?? 8080)
@@ -281,9 +310,9 @@ class HelbaHttpOverrides extends io.HttpOverrides {
               'Could not reach proxy $proxyHost:${proxyPort ?? 8080}: $e');
         }
       }
-      // No proxy: HttpClient upgrades the returned socket to TLS with
-      // SNI/certificate checks for url.host.
-      return io.ConnectionTask.fromSocket(openSocketForUrl(url), () {});
+      // No proxy: connect directly and upgrade to TLS ourselves (see
+      // _connectSecurely — HttpClient will not do it for us).
+      return io.ConnectionTask.fromSocket(_connectSecurely(url), () {});
     };
     return client;
   }

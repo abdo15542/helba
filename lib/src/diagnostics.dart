@@ -190,13 +190,21 @@ class _NetworkDiagnosticsPageState extends State<NetworkDiagnosticsPage> {
           .timeout(const Duration(seconds: 15));
       final response =
           await request.close().timeout(const Duration(seconds: 15));
-      await response.drain<void>();
+      final body = await response
+          .transform(utf8.decoder)
+          .join()
+          .timeout(const Duration(seconds: 10));
       final status = response.statusCode;
-      final passed = status == 400 || status == 401;
+      // Status alone is not enough: a plain-HTTP request to the HTTPS
+      // port also answers 400 (nginx's HTML error page). The body must
+      // be Supabase's JSON for the check to mean anything.
+      final passed =
+          (status == 400 || status == 401) && isJsonResponseBody(body);
       return DiagnosticResult(
         title: _titles[4],
         status: passed ? CheckStatus.passed : CheckStatus.failed,
-        detail: 'رمز الحالة: $status',
+        detail:
+            'رمز الحالة: $status\n${body.length > 200 ? '${body.substring(0, 200)}…' : body}',
       );
     } catch (e) {
       return DiagnosticResult(
