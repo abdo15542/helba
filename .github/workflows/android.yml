@@ -217,12 +217,22 @@ jobs:
                   count = 0
                   for line in lines:
                       stripped = line.strip()
-                      if stripped.startswith("compileSdk") and ("flutter.compileSdkVersion" in stripped or "34" in stripped):
+                      # Rewrite EVERY compileSdk declaration to 36, whatever
+                      # value it carries (34, 35, 37, flutter.compileSdkVersion
+                      # or a literal). The old rule only matched "34" and
+                      # flutter.compileSdkVersion, so it missed
+                      # permission_handler_android 14.x, which declares
+                      # compileSdk = 37 with AGP 9 — and the build then
+                      # failed with "cannot find symbol" for API-36
+                      # symbols (ACCESS_LOCAL_NETWORK, CINNAMON_BUN).
+                      if stripped.startswith("compileSdk"):
                           indent = line[:len(line) - len(line.lstrip())]
                           if stripped.startswith("compileSdk ="):
                               line = indent + "compileSdk = 36"
                           elif stripped.startswith("compileSdkVersion"):
                               line = indent + "compileSdkVersion 36"
+                          elif stripped.startswith("compileSdk "):
+                              line = indent + "compileSdk 36"
                           count += 1
                       updated.append(line)
                   if count:
