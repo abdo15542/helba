@@ -12,17 +12,19 @@ import 'deeplink.dart';
 // ---------------------------------------------------------------------------
 // Push notifications (Feature 5).
 //
-// BUILD FACT — READ FIRST: there is no google-services.json and no Firebase
-// project yet, so Firebase cannot initialise at runtime. That is expected
-// and handled: setupPushNotifications() wraps Firebase.initializeApp() and
-// every FirebaseMessaging access in try/catch, and if initialisation fails
-// the push feature silently stays disabled — the app never crashes, and
-// analyze / tests / the CI release build are unaffected (the plugins
-// compile from Maven artifacts; google-services.json is a runtime config,
-// not a build input). Until the parent creates the Firebase project, adds
-// google-services.json to the build and deploys the send-message-push Edge
-// Function (see supabase/functions/send-message-push/README.md), no push
-// will arrive. Nothing here invents Firebase config.
+// BUILD FACT — READ FIRST: the Firebase project "Helba" (helba-379fd,
+// created 2026-11-05) is wired in here with explicit FirebaseOptions, so
+// the app needs neither a google-services.json file nor the google-services
+// Gradle plugin. The four option values are public client identifiers
+// (the same kind as the Supabase publishable key already in the codebase),
+// not secrets. setupPushNotifications() still wraps Firebase.initializeApp()
+// and every FirebaseMessaging access in try/catch: if initialisation fails
+// for any reason the push feature silently stays disabled — the app never
+// crashes, and analyze / tests / the CI release build are unaffected (the
+// plugins compile from Maven artifacts). Push still needs the
+// send-message-push Edge Function deployed with its secrets (see
+// supabase/functions/send-message-push/README.md) before any notification
+// actually arrives.
 //
 // DEVICE ADDRESS: firebase_messaging 17 replaced FCM registration tokens
 // with the Firebase Installation ID (FID) as the direct-send target
@@ -105,10 +107,20 @@ Future<void> setupPushNotifications() async {
   if (_pushSetupDone) return;
   _pushSetupDone = true;
   try {
-    // Throws when no Firebase project is configured for this app
-    // (no google-services.json). That is the expected state until the
-    // parent wires Firebase up; push stays disabled, nothing else breaks.
-    await Firebase.initializeApp();
+    // Firebase project "Helba" (helba-379fd), created 2026-11-05. The app
+    // passes its client config explicitly, so it needs neither a
+    // google-services.json file nor the google-services Gradle plugin.
+    // These four values are public client identifiers, not secrets. If
+    // initialisation still fails for any reason, push stays disabled and
+    // nothing else breaks.
+    await Firebase.initializeApp(
+      options: const FirebaseOptions(
+        apiKey: 'AIzaSyBsJf8p3BHjQCJHU9PkFmPy87DFScWJr3k',
+        appId: '1:1097242039750:android:d9b1cfae293fad3a3e0ec7',
+        messagingSenderId: '1097242039750',
+        projectId: 'helba-379fd',
+      ),
+    );
   } catch (_) {
     return;
   }
