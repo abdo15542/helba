@@ -16,6 +16,28 @@ const authCallbackUrl = 'helba://auth/callback';
 /// links (if any are ever added) out of the auth flow.
 bool isAuthCallback(Uri uri) => uri.scheme == 'helba' && uri.host == 'auth';
 
+/// True when [uri] is a chat deep link: `helba://chat/<conversation_id>`
+/// with exactly one non-empty path segment. Anything else (auth links,
+/// other schemes/hosts, an empty id, extra segments) is not a chat link.
+bool isChatDeepLink(Uri uri) {
+  if (uri.scheme != 'helba' || uri.host != 'chat') return false;
+  final segments = uri.pathSegments;
+  return segments.length == 1 && segments.first.isNotEmpty;
+}
+
+/// The conversation id of a chat deep link, or null when [uri] is not
+/// one (see [isChatDeepLink]).
+String? chatIdFromDeepLink(Uri uri) =>
+    isChatDeepLink(uri) ? uri.pathSegments.first : null;
+
+/// A chat id waiting to be opened: set when a `helba://chat/<id>` link
+/// arrives, or when a push notification is tapped (see push.dart).
+/// AuthGate observes this and navigates to the chat once the user is
+/// signed in and confirmed, then clears it. Same pattern as
+/// [deepLinkError]: a ValueNotifier so either entry point can set it
+/// without a BuildContext.
+final ValueNotifier<String?> pendingChatId = ValueNotifier(null);
+
 /// The latest error from handling an auth-callback link, if any.
 /// The confirmation screen listens to this so a failed link (e.g. an
 /// expired one) is explained instead of silently doing nothing.
@@ -23,22 +45,29 @@ final ValueNotifier<String?> deepLinkError = ValueNotifier(null);
 
 bool _listening = false;
 
-/// Listen for the app's auth-callback links (cold start + while running)
-/// and exchange them for a session. Idempotent: safe to call on every
-/// app start/retry. Once the session is stored, the auth-state stream
-/// moves the user into the app, so the caller needs no navigation here.
+/// Listen for the app's deep links (cold start + while running): the
+/// auth-callback link (exchanged for a session) and the chat link
+/// `helba://chat/<id>` (queued in [pendingChatId] for AuthGate to open).
+/// Idempotent: safe to call on every app start/retry. Once the session
+/// is stored, the auth-state stream moves the user into the app, so the
+/// caller needs no navigation here.
 Future<void> setupDeepLinks() async {
   if (_listening) return;
   _listening = true;
   final links = AppLinks();
 
   Future<void> handle(Uri? uri) async {
-    if (uri == null || !isAuthCallback(uri)) return;
-    try {
-      await Supabase.instance.client.auth.getSessionFromUrl(uri);
-    } catch (e) {
-      deepLinkError.value = _deepLinkErrorMessage(e);
+    if (uri == null) return;
+    if (isAuthCallback(uri)) {
+      try {
+        await Supabase.instance.client.auth.getSessionFromUrl(uri);
+      } catch (e) {
+        deepLinkError.value = _deepLinkErrorMessage(e);
+      }
+      return;
     }
+    final chatId = chatIdFromDeepLink(uri);
+    if (chatId != null) pendingChatId.value = chatId;
   }
 
   try {

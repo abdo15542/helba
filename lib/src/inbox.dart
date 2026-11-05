@@ -1,11 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'admin_panel.dart';
 import 'chat.dart';
+import 'channels.dart';
 import 'config.dart';
+import 'stories.dart';
 
 class InboxPage extends StatefulWidget {
-  const InboxPage({super.key});
+  final bool isAdmin;
+  const InboxPage({super.key, this.isAdmin = false});
   @override
   State<InboxPage> createState() => _InboxPageState();
 }
@@ -16,6 +20,8 @@ class _InboxPageState extends State<InboxPage> {
   // The chats future must live in state: creating it inside build() refetched
   // from Supabase on every rebuild, including every keystroke in search.
   late Future<List<Map<String, dynamic>>> _chatsFuture;
+  // Bumped on pull-to-refresh so the story rings reload too.
+  final _storiesTick = ValueNotifier<int>(0);
 
   @override
   void initState() {
@@ -25,6 +31,7 @@ class _InboxPageState extends State<InboxPage> {
 
   Future<void> _refresh() async {
     final future = loadChats();
+    _storiesTick.value++;
     if (mounted) setState(() => _chatsFuture = future);
     // Swallow here: the FutureBuilder above already surfaces the error.
     try {
@@ -35,6 +42,7 @@ class _InboxPageState extends State<InboxPage> {
   @override
   void dispose() {
     search.dispose();
+    _storiesTick.dispose();
     super.dispose();
   }
 
@@ -44,7 +52,7 @@ class _InboxPageState extends State<InboxPage> {
     final rows = await Supabase.instance.client
         .from('conversation_members')
         .select(
-            'conversation_id, conversations(id,kind,title,updated_at,conversation_members(user_id,profiles(display_name,username)))')
+            'conversation_id, conversations(id,kind,title,is_public,updated_at,conversation_members(user_id,role,profiles(display_name,username)))')
         .eq('user_id', uid);
     final chats = rows.cast<Map<String, dynamic>>();
     // Newest conversation first; the query itself returns no ordering.
@@ -69,6 +77,21 @@ class _InboxPageState extends State<InboxPage> {
               style: TextStyle(
                   fontSize: 27, fontWeight: FontWeight.w900, color: green)),
           actions: [
+            if (widget.isAdmin)
+              IconButton(
+                  tooltip: 'لوحة الإدارة',
+                  onPressed: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                          builder: (_) => const AdminPanelPage())),
+                  icon: const Icon(Icons.admin_panel_settings_outlined)),
+            IconButton(
+                tooltip: 'القنوات العامة',
+                onPressed: () => showModalBottomSheet(
+                    context: context,
+                    isScrollControlled: true,
+                    builder: (_) => const ChannelDirectorySheet()),
+                icon: const Icon(Icons.campaign_outlined)),
             IconButton(
                 onPressed: () => Supabase.instance.client.auth.signOut(),
                 icon: const Icon(Icons.logout))
@@ -85,6 +108,7 @@ class _InboxPageState extends State<InboxPage> {
           label: const Text('محادثة جديدة'),
         ),
         body: Column(children: [
+          StoryRingsRow(refreshTick: _storiesTick),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
             child: TextField(
@@ -180,27 +204,48 @@ class _InboxPageState extends State<InboxPage> {
                                               true
                                           ? '@${profile!['username']}'
                                           : 'محادثة'));
+                          final kind = c['kind']?.toString() ?? 'direct';
+                          final isAdmin =
+                              roleInConversation(c, currentUserId) == 'admin';
                           return ListTile(
                             leading: CircleAvatar(
                               backgroundColor: const Color(0xFFE1F1E8),
                               child: Icon(
-                                  c['kind'] == 'group'
-                                      ? Icons.groups_rounded
-                                      : Icons.person,
+                                  kind == 'channel'
+                                      ? Icons.campaign_rounded
+                                      : kind == 'group'
+                                          ? Icons.groups_rounded
+                                          : Icons.person,
                                   color: green),
                             ),
-                            title: Text(displayTitle,
-                                style: const TextStyle(
-                                    fontWeight: FontWeight.bold)),
-                            subtitle: Text(c['kind'] == 'group'
-                                ? 'مجموعة'
-                                : 'محادثة فردية'),
+                            title: Row(children: [
+                              Expanded(
+                                  child: Text(displayTitle,
+                                      style: const TextStyle(
+                                          fontWeight: FontWeight.bold))),
+                              if (kind == 'channel')
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 8, vertical: 2),
+                                  decoration: BoxDecoration(
+                                      color: const Color(0xFFE1F1E8),
+                                      borderRadius: BorderRadius.circular(10)),
+                                  child: const Text('قناة',
+                                      style: TextStyle(
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.bold,
+                                          color: green)),
+                                ),
+                            ]),
+                            subtitle: Text(channelSubtitle(kind)),
                             onTap: () => Navigator.push(
                                 context,
                                 MaterialPageRoute(
                                     builder: (_) => ChatPage(
                                         conversationId: c['id'].toString(),
-                                        title: displayTitle))).then(
+                                        title: displayTitle,
+                                        kind: kind,
+                                        isAdmin: isAdmin))).then(
                                 (_) => _refresh()),
                           );
                         },
@@ -239,7 +284,11 @@ class _NewChatSheetState extends State<NewChatSheet> {
   final Set<String> selectedIds = {};
   final groupTitle = TextEditingController();
   bool busy = false;
-  bool creatingGroup = false;
+  // 'direct' | 'group' | 'channel'
+  String mode = 'direct';
+  bool get creatingGroup => mode == 'group';
+  bool get creatingChannel => mode == 'channel';
+  bool get creatingGroupOrChannel => creatingGroup || creatingChannel;
   String? error;
 
   int _searchRequest = 0;
@@ -311,12 +360,51 @@ class _NewChatSheetState extends State<NewChatSheet> {
       Navigator.push(
           context,
           MaterialPageRoute(
-              builder: (_) =>
-                  ChatPage(conversationId: result.toString(), title: title)));
+              builder: (_) => ChatPage(
+                  conversationId: result.toString(),
+                  title: title,
+                  kind: 'group')));
     } catch (_) {
       if (mounted) {
         setState(() =>
             error = 'تعذر إنشاء المجموعة. تأكد من تطبيق ترحيل قاعدة البيانات رقم 002.');
+      }
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> createChannel() async {
+    if (groupTitle.text.trim().length < 2 || selectedIds.isEmpty) {
+      setState(() => error = 'اكتب اسم القناة واختر عضواً واحداً على الأقل.');
+      return;
+    }
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      final result = await Supabase.instance.client.rpc(
+        'create_channel',
+        params: {
+          'channel_title': groupTitle.text.trim(),
+          'member_ids': selectedIds.toList()
+        },
+      );
+      if (!mounted) return;
+      final title = groupTitle.text.trim();
+      Navigator.pop(context);
+      Navigator.push(
+          context,
+          MaterialPageRoute(
+              builder: (_) => ChatPage(
+                  conversationId: result.toString(),
+                  title: title,
+                  kind: 'channel')));
+    } catch (_) {
+      if (mounted) {
+        setState(() =>
+            error = 'تعذر إنشاء القناة. تأكد من تطبيق ترحيل قاعدة البيانات رقم 008.');
       }
     } finally {
       if (mounted) setState(() => busy = false);
@@ -360,28 +448,46 @@ class _NewChatSheetState extends State<NewChatSheet> {
         child: Column(mainAxisSize: MainAxisSize.min, children: [
           Row(children: [
             Expanded(
-                child: Text(creatingGroup ? 'إنشاء مجموعة' : 'محادثة جديدة',
+                child: Text(
+                    creatingChannel
+                        ? 'إنشاء قناة'
+                        : creatingGroup
+                            ? 'إنشاء مجموعة'
+                            : 'محادثة جديدة',
                     style: const TextStyle(
                         fontSize: 21, fontWeight: FontWeight.bold))),
-            TextButton.icon(
-              onPressed: () => setState(() {
-                creatingGroup = !creatingGroup;
-                selectedIds.clear();
-                error = null;
-              }),
-              icon: Icon(creatingGroup
-                  ? Icons.person_outline
-                  : Icons.groups_outlined),
-              label: Text(creatingGroup ? 'محادثة فردية' : 'مجموعة'),
-            ),
           ]),
-          if (creatingGroup) ...[
+          const SizedBox(height: 10),
+          SegmentedButton<String>(
+            segments: const [
+              ButtonSegment(
+                  value: 'direct',
+                  icon: Icon(Icons.person_outline),
+                  label: Text('محادثة فردية')),
+              ButtonSegment(
+                  value: 'group',
+                  icon: Icon(Icons.groups_outlined),
+                  label: Text('مجموعة')),
+              ButtonSegment(
+                  value: 'channel',
+                  icon: Icon(Icons.campaign_outlined),
+                  label: Text('قناة')),
+            ],
+            selected: {mode},
+            onSelectionChanged: (selected) => setState(() {
+              mode = selected.first;
+              selectedIds.clear();
+              error = null;
+            }),
+          ),
+          if (creatingGroupOrChannel) ...[
             const SizedBox(height: 10),
             TextField(
                 controller: groupTitle,
-                decoration: const InputDecoration(
-                    labelText: 'اسم المجموعة',
-                    border: OutlineInputBorder())),
+                decoration: InputDecoration(
+                    labelText:
+                        creatingChannel ? 'اسم القناة' : 'اسم المجموعة',
+                    border: const OutlineInputBorder())),
             const SizedBox(height: 10),
           ],
           const SizedBox(height: 8),
@@ -406,7 +512,7 @@ class _NewChatSheetState extends State<NewChatSheet> {
                                 const CircleAvatar(child: Icon(Icons.person)),
                             title: Text(u['display_name']?.toString() ?? ''),
                             subtitle: Text('@${u['username'] ?? ''}'),
-                            trailing: creatingGroup
+                            trailing: creatingGroupOrChannel
                                 ? Checkbox(
                                     value: selectedIds
                                         .contains(u['id'].toString()),
@@ -421,7 +527,7 @@ class _NewChatSheetState extends State<NewChatSheet> {
                                   )
                                 : null,
                             onTap: () {
-                              if (creatingGroup) {
+                              if (creatingGroupOrChannel) {
                                 setState(() {
                                   final id = u['id'].toString();
                                   if (!selectedIds.add(id)) {
@@ -434,15 +540,23 @@ class _NewChatSheetState extends State<NewChatSheet> {
                             },
                           ))
                       .toList())),
-          if (creatingGroup)
+          if (creatingGroupOrChannel)
             Padding(
               padding: const EdgeInsets.only(top: 10),
               child: SizedBox(
                   width: double.infinity,
                   child: FilledButton.icon(
-                    onPressed: busy ? null : createGroup,
-                    icon: const Icon(Icons.group_add_outlined),
-                    label: Text('إنشاء المجموعة (${selectedIds.length})'),
+                    onPressed: busy
+                        ? null
+                        : creatingChannel
+                            ? createChannel
+                            : createGroup,
+                    icon: Icon(creatingChannel
+                        ? Icons.campaign_outlined
+                        : Icons.group_add_outlined),
+                    label: Text(creatingChannel
+                        ? 'إنشاء القناة (${selectedIds.length})'
+                        : 'إنشاء المجموعة (${selectedIds.length})'),
                   )),
             ),
         ]),

@@ -1,12 +1,18 @@
+import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'config.dart';
+import 'admin.dart';
+import 'calls.dart';
+import 'channels.dart';
+import 'chat.dart';
 import 'deeplink.dart';
 import 'diagnostics.dart';
 import 'inbox.dart';
+import 'push.dart';
 import 'utils.dart';
 
 /// Validate the configuration and initialize Supabase. Returns an Arabic
@@ -80,6 +86,9 @@ class _HelbaAppState extends State<HelbaApp> {
   Widget build(BuildContext context) => MaterialApp(
         title: 'هلبة',
         debugShowCheckedModeBanner: false,
+        // The calls service shows the incoming-call overlay through this
+        // key, so a call rings from anywhere in the app (inbox or chat).
+        navigatorKey: helbaNavigatorKey,
         theme: ThemeData(
           useMaterial3: true,
           colorScheme: ColorScheme.fromSeed(seedColor: green),
@@ -107,11 +116,110 @@ class _AuthGateState extends State<AuthGate> {
   String? boundEmail;
   bool loading = true;
   bool _binding = false;
+  // The signed-in user's profile (admin / banned flags). Loaded once per
+  // user id, following the _bind / addPostFrameCallback pattern so the
+  // fetch never runs inside build() and never loops on rebuilds.
+  Map<String, dynamic>? _myProfile;
+  String? _profileUserId;
+  bool _loadingProfile = false;
+  bool _clearingProfile = false;
+  // Guards the pending-chat navigation so one link / notification tap
+  // opens exactly one ChatPage even if build() runs repeatedly.
+  bool _openingChat = false;
 
   @override
   void initState() {
     super.initState();
     _load();
+    // A chat deep link or a notification tap sets pendingChatId; when it
+    // fires while the user is already signed in, open the chat now. A
+    // link that arrived before sign-in is picked up from build() below.
+    pendingChatId.addListener(_onPendingChat);
+  }
+
+  @override
+  void dispose() {
+    pendingChatId.removeListener(_onPendingChat);
+    super.dispose();
+  }
+
+  void _onPendingChat() {
+    if (pendingChatId.value == null) return;
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user == null || user.emailConfirmedAt == null) return;
+    unawaited(_openPendingChat());
+  }
+
+  /// Opens the chat queued in [pendingChatId] (deep link `helba://chat/<id>`
+  /// or a tapped push notification) and clears it first, so a rebuild or
+  /// a second listener firing can never open it twice. Resolves the title
+  /// like the inbox does (conversation title, or the other participant's
+  /// display name for direct chats); any lookup failure falls back to
+  /// 'محادثة' instead of blocking the navigation.
+  Future<void> _openPendingChat() async {
+    final conversationId = pendingChatId.value;
+    if (conversationId == null || _openingChat) return;
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user == null || user.emailConfirmedAt == null) return;
+    _openingChat = true;
+    pendingChatId.value = null;
+    try {
+      final resolved = await _resolveChat(conversationId, user.id);
+      helbaNavigatorKey.currentState?.push(MaterialPageRoute(
+          builder: (_) => ChatPage(
+              conversationId: conversationId,
+              title: resolved.title,
+              kind: resolved.kind,
+              isAdmin: resolved.isAdmin)));
+    } finally {
+      _openingChat = false;
+    }
+  }
+
+  Future<({String title, String kind, bool isAdmin})> _resolveChat(
+      String conversationId, String myId) async {
+    const fallback = (title: 'محادثة', kind: 'direct', isAdmin: false);
+    try {
+      final rows = await Supabase.instance.client
+          .from('conversation_members')
+          .select(
+              'user_id,role,profiles(display_name,username),conversations(id,title,kind)')
+          .eq('conversation_id', conversationId);
+      final members = (rows as List).cast<Map<String, dynamic>>();
+      if (members.isEmpty) return fallback;
+      final conversation =
+          members.first['conversations'] as Map<String, dynamic>?;
+      final kind = conversation?['kind']?.toString() ?? 'direct';
+      var title = conversation?['title']?.toString().trim() ?? '';
+      if (title.isEmpty && kind == 'direct') {
+        for (final member in members) {
+          if (member['user_id']?.toString() == myId) continue;
+          final profile = member['profiles'] as Map<String, dynamic>?;
+          final name =
+              profile?['display_name']?.toString().trim().isNotEmpty == true
+                  ? profile!['display_name'].toString()
+                  : (profile?['username']?.toString().isNotEmpty == true
+                      ? '@${profile!['username']}'
+                      : '');
+          if (name.isNotEmpty) {
+            title = name;
+            break;
+          }
+        }
+      }
+      if (title.isEmpty) title = 'محادثة';
+      final isAdmin = roleInConversation(
+              {
+                'conversation_members': members
+                    .map((m) => {'user_id': m['user_id'], 'role': m['role']})
+                    .toList()
+              },
+              myId) ==
+          'admin';
+      return (title: title, kind: kind, isAdmin: isAdmin);
+    } catch (_) {
+      return fallback;
+    }
   }
 
   Future<void> _load() async {
@@ -134,6 +242,18 @@ class _AuthGateState extends State<AuthGate> {
     if (mounted) setState(() => boundEmail = normalized);
   }
 
+  Future<void> _loadMyProfile() async {
+    try {
+      final profile = await loadMyProfile();
+      if (mounted) setState(() => _myProfile = profile);
+    } catch (_) {
+      // A missing or unloadable profile is treated as not-admin /
+      // not-banned; the inbox still works, the admin panel stays hidden.
+    } finally {
+      if (mounted) setState(() => _loadingProfile = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     if (loading) {
@@ -144,6 +264,21 @@ class _AuthGateState extends State<AuthGate> {
       builder: (context, _) {
         final user = Supabase.instance.client.auth.currentUser;
         if (user == null) {
+          if (_profileUserId != null && !_clearingProfile) {
+            _clearingProfile = true;
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) {
+                setState(() {
+                  _myProfile = null;
+                  _profileUserId = null;
+                  _loadingProfile = false;
+                  _clearingProfile = false;
+                });
+              }
+            });
+          }
+          // Signed out: stop listening for incoming calls.
+          unawaited(CallService.instance.stopListening());
           return LoginPage(boundEmail: boundEmail, onSignedIn: _bind);
         }
         final email = normalizeEmail(user.email ?? '');
@@ -175,10 +310,59 @@ class _AuthGateState extends State<AuthGate> {
           _binding = true;
           WidgetsBinding.instance.addPostFrameCallback((_) => _bind(email));
         }
-        return const InboxPage();
+        // Load the profile (admin / banned flags) when a different user
+        // is seen; a missing row means not-admin / not-banned.
+        if (_profileUserId != user.id && !_loadingProfile) {
+          _loadingProfile = true;
+          _profileUserId = user.id;
+          WidgetsBinding.instance
+              .addPostFrameCallback((_) => _loadMyProfile());
+        }
+        if (isBannedProfile(_myProfile)) {
+          return const BannedAccountPage();
+        }
+        // Signed in and confirmed: listen for incoming calls. Idempotent
+        // (the service subscribes once per user id); this only touches
+        // the call service, never widget state, so it is safe in build().
+        unawaited(CallService.instance.startListening());
+        // Same pattern for push: register the FCM token and listen for
+        // messages. Inert until Firebase is configured (see push.dart).
+        unawaited(setupPushNotifications());
+        // A chat link / notification tap may have arrived before sign-in
+        // (or before this listener existed): pick it up now.
+        if (pendingChatId.value != null) {
+          WidgetsBinding.instance
+              .addPostFrameCallback((_) => unawaited(_openPendingChat()));
+        }
+        return InboxPage(isAdmin: isAdminProfile(_myProfile));
       },
     );
   }
+}
+
+/// Shown instead of the inbox when the signed-in account is banned.
+class BannedAccountPage extends StatelessWidget {
+  const BannedAccountPage({super.key});
+  @override
+  Widget build(BuildContext context) => Scaffold(
+          body: Center(
+              child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.block_outlined, size: 48, color: Colors.red),
+          const SizedBox(height: 12),
+          const Text('تم حظر هذا الحساب',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 12),
+          const Text(
+              'تم حظر حسابك من قبل الإدارة. تواصل مع الإدارة إذا كنت تعتقد أن هذا خطأ.',
+              textAlign: TextAlign.center),
+          const SizedBox(height: 16),
+          FilledButton(
+              onPressed: () => Supabase.instance.client.auth.signOut(),
+              child: const Text('تسجيل الخروج')),
+        ]),
+      )));
 }
 
 class UnconfirmedEmailPage extends StatefulWidget {
