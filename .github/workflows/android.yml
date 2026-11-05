@@ -147,6 +147,9 @@ jobs:
           # back to the defaults compiled into lib/main.dart. Previously the
           # build silently ignored the secrets entirely.
           args=(--release --verbose)
+          # Bake the commit SHA into the app so the login screen can show
+          # which build is installed.
+          args+=(--dart-define=HELBA_COMMIT=${{ github.sha }})
           if [ -n "${{ secrets.SUPABASE_URL }}" ]; then
             args+=(--dart-define=SUPABASE_URL=${{ secrets.SUPABASE_URL }})
           fi
