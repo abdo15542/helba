@@ -120,8 +120,26 @@ jobs:
       - name: Run tests
         run: flutter test
 
+      - name: Force compile SDK 36 for every Android module
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/force-compile-sdk.gradle" <<'EOF'
+          allprojects {
+              afterEvaluate {
+                  def androidExtension = extensions.findByName("android")
+                  if (androidExtension != null) {
+                      androidExtension.compileSdkVersion(36)
+                      println("HELBA: forced compileSdk 36 for " + project.path)
+                  }
+              }
+          }
+          EOF
+
       - name: Build release APK
-        run: flutter build apk --release
+        shell: bash
+        run: |
+          export GRADLE_OPTS="${GRADLE_OPTS:-} -I $RUNNER_TEMP/force-compile-sdk.gradle"
+          flutter build apk --release --verbose
 
       - name: Verify APK exists
         run: test -s build/app/outputs/flutter-apk/app-release.apk
