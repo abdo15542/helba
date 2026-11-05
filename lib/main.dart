@@ -219,7 +219,7 @@ class _InboxPageState extends State<InboxPage> {
   Future<List<Map<String, dynamic>>> loadChats() async {
     final uid = Supabase.instance.client.auth.currentUser!.id;
     final rows = await Supabase.instance.client.from('conversation_members')
-      .select('conversation_id, conversations(id,kind,title,updated_at)')
+      .select('conversation_id, conversations(id,kind,title,updated_at,conversation_members(user_id,profiles(display_name,username)))')
       .eq('user_id', uid);
     return rows.cast<Map<String, dynamic>>();
   }
@@ -245,20 +245,42 @@ class _InboxPageState extends State<InboxPage> {
         builder: (context, snap) {
           if (snap.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
           if (snap.hasError) return Center(child: Text('تعذر تحميل المحادثات: ${snap.error}'));
+          final currentUserId = Supabase.instance.client.auth.currentUser!.id;
           final chats = (snap.data ?? []).where((r) {
             final c = r['conversations'] as Map<String, dynamic>?;
-            return (c?['title']?.toString().toLowerCase() ?? '').contains(query.toLowerCase());
+            final members = (c?['conversation_members'] as List<dynamic>? ?? []);
+            final other = members.cast<Map<String, dynamic>?>().where((m) => m?['user_id']?.toString() != currentUserId).firstOrNull;
+            final profile = other?['profiles'] as Map<String, dynamic>?;
+            final searchable = [
+              c?['title']?.toString() ?? '',
+              profile?['display_name']?.toString() ?? '',
+              profile?['username']?.toString() ?? '',
+            ].join(' ').toLowerCase();
+            return searchable.contains(query.trim().toLowerCase());
           }).toList();
           if (chats.isEmpty) return const _EmptyInbox();
           return ListView.separated(
             itemCount: chats.length, separatorBuilder: (_, __) => const Divider(indent: 84, height: 1),
             itemBuilder: (context, i) {
               final c = chats[i]['conversations'] as Map<String, dynamic>;
+              final members = (c['conversation_members'] as List<dynamic>? ?? []);
+              final other = members.cast<Map<String, dynamic>?>().where((m) => m?['user_id']?.toString() != currentUserId).firstOrNull;
+              final profile = other?['profiles'] as Map<String, dynamic>?;
+              final displayTitle = c['title']?.toString().trim().isNotEmpty == true
+                  ? c['title'].toString()
+                  : (profile?['display_name']?.toString().trim().isNotEmpty == true
+                      ? profile!['display_name'].toString()
+                      : (profile?['username']?.toString().isNotEmpty == true
+                          ? '@${profile!['username']}'
+                          : 'محادثة'));
               return ListTile(
-                leading: const CircleAvatar(backgroundColor: Color(0xFFE1F1E8), child: Icon(Icons.person, color: green)),
-                title: Text(c['title']?.toString().isNotEmpty == true ? c['title'] : 'محادثة جديدة', style: const TextStyle(fontWeight: FontWeight.bold)),
-                subtitle: const Text('افتح المحادثة لعرض الرسائل'),
-                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ChatPage(conversationId: c['id'].toString(), title: c['title']?.toString() ?? 'محادثة'))),
+                leading: CircleAvatar(
+                  backgroundColor: const Color(0xFFE1F1E8),
+                  child: Icon(c['kind'] == 'group' ? Icons.groups_rounded : Icons.person, color: green),
+                ),
+                title: Text(displayTitle, style: const TextStyle(fontWeight: FontWeight.bold)),
+                subtitle: Text(c['kind'] == 'group' ? 'مجموعة' : 'محادثة فردية'),
+                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ChatPage(conversationId: c['id'].toString(), title: displayTitle))),
               );
             },
           );
