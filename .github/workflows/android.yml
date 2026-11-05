@@ -82,35 +82,37 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
           roots = [Path("android"), Path.home() / ".pub-cache" / "hosted" / "pub.dev"]
           changed = []
-          pattern = re.compile(
-              r"(?m)^(\\s*compileSdk(?:Version)?\\s*(?:=\\s*)?)(?:flutter\\.compileSdkVersion|[0-9]+)(\\s*(?:\\n|$))"
-          )
           for root in roots:
               if not root.exists():
                   continue
               for path in root.rglob("build.gradle*"):
                   try:
-                      source = path.read_text()
+                      lines = path.read_text().splitlines()
                   except (OSError, UnicodeDecodeError):
                       continue
-                  updated, count = pattern.subn(r"\\g<1>36\\g<2>", source)
+                  updated = []
+                  count = 0
+                  for line in lines:
+                      stripped = line.strip()
+                      if stripped.startswith("compileSdk") and ("flutter.compileSdkVersion" in stripped or "34" in stripped):
+                          indent = line[:len(line) - len(line.lstrip())]
+                          if stripped.startswith("compileSdk ="):
+                              line = indent + "compileSdk = 36"
+                          elif stripped.startswith("compileSdkVersion"):
+                              line = indent + "compileSdkVersion 36"
+                          count += 1
+                      updated.append(line)
                   if count:
-                      path.write_text(updated)
+                      path.write_text("\n".join(updated) + "\n")
                       changed.append(f"{path}: {count}")
           if not changed:
-              raise SystemExit("No Android compileSdk declarations found to verify")
+              raise SystemExit("No Android compileSdk declarations needed adjustment")
           print("Aligned Android compileSdk declarations to 36:")
-          print("\\n".join(changed))
+          print("\n".join(changed))
           PY
-
-      - name: Verify Android compile SDK configuration
-        run: |
-          grep -R -n -E 'compileSdk(Version)?[[:space:]]*(=[[:space:]]*)?(34|flutter\\.compileSdkVersion)' android "$HOME/.pub-cache/hosted/pub.dev" --include='build.gradle' --include='build.gradle.kts' || true
-          grep -R -n -E 'compileSdk(Version)?[[:space:]]*(=[[:space:]]*)?36' android/app "$HOME/.pub-cache/hosted/pub.dev/file_picker-"*"/android" --include='build.gradle' --include='build.gradle.kts' || true
 
       - name: Analyze Dart code
         run: flutter analyze
