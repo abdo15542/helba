@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'dart:async';
+import 'dart:convert';
 import 'dart:ui' as ui;
 import 'dart:io' as io;
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -32,8 +34,140 @@ String? networkErrorMessage(Object e) {
   return null;
 }
 
+// --- DNS-over-HTTPS fallback ---------------------------------------------
+// Some networks (notably some mobile ISPs) fail to resolve *.supabase.co
+// with the system resolver, while the same phone's browser — which uses
+// DNS-over-HTTPS — reaches the server fine. To keep the app working on
+// those networks, Supabase connections fall back to resolving the host
+// over HTTPS (Google, then Cloudflare) and dialling the returned IP.
+// TLS still verifies the original hostname, so nothing about security
+// changes: the IP is only a dial address, never a trust anchor.
+
+/// Hosts that get the DNS-over-HTTPS fallback when the system resolver fails.
+bool needsDohFallback(String host) => host.endsWith('.supabase.co');
+
+/// DoH endpoints are dialled by their well-known IP so the query itself
+/// never depends on the system resolver; TLS still verifies the hostname.
+const Map<String, List<String>> _dohBootstrapIps = {
+  'dns.google': ['8.8.8.8', '8.8.4.4'],
+  'cloudflare-dns.com': ['1.1.1.1', '1.0.0.1'],
+};
+
+/// Pull the IPv4 answers out of a DNS-over-HTTPS JSON response.
+List<String> parseDohAnswers(Map<String, dynamic> json) {
+  final answers = json['Answer'];
+  if (answers is! List) return const [];
+  final ips = <String>[];
+  for (final a in answers) {
+    if (a is Map && a['type'] == 1 && a['data'] is String) {
+      ips.add(a['data'] as String);
+    }
+  }
+  return ips;
+}
+
+Future<io.Socket> connectToFirstIp(List<String> ips, int port) async {
+  Object? lastError;
+  for (final ip in ips) {
+    try {
+      return await io.Socket.connect(ip, port)
+          .timeout(const Duration(seconds: 8));
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError ?? io.SocketException('Could not connect to $ips');
+}
+
+final Map<String, ({List<String> ips, DateTime at})> _dohCache = {};
+io.HttpClient? _dohClient;
+
+/// Resolve [host] via DNS-over-HTTPS (Google first, Cloudflare second).
+/// Results are cached for 5 minutes.
+Future<List<String>> resolveViaDoh(String host) async {
+  final cached = _dohCache[host];
+  if (cached != null &&
+      DateTime.now().difference(cached.at) < const Duration(minutes: 5)) {
+    return cached.ips;
+  }
+  final client = _dohClient ??= io.HttpClient();
+  for (final base in [
+    'https://dns.google/resolve',
+    'https://cloudflare-dns.com/dns-query',
+  ]) {
+    try {
+      final uri = Uri.parse('$base?name=$host&type=A');
+      final request = await client
+          .getUrl(uri)
+          .timeout(const Duration(seconds: 6));
+      request.headers.set('accept', 'application/dns-json');
+      final response =
+          await request.close().timeout(const Duration(seconds: 6));
+      final body = await response
+          .transform(utf8.decoder)
+          .join()
+          .timeout(const Duration(seconds: 6));
+      final ips = parseDohAnswers(jsonDecode(body) as Map<String, dynamic>);
+      if (ips.isNotEmpty) {
+        _dohCache[host] = (ips: ips, at: DateTime.now());
+        return ips;
+      }
+    } catch (_) {
+      // Try the next DoH provider.
+    }
+  }
+  throw io.SocketException('DNS-over-HTTPS resolution failed for $host');
+}
+
+Future<io.Socket> openSocketForUrl(Uri url) async {
+  final host = url.host;
+  final port = url.hasPort ? url.port : (url.scheme == 'https' ? 443 : 80);
+  final bootstrap = _dohBootstrapIps[host];
+  if (bootstrap != null) {
+    return connectToFirstIp(bootstrap, port);
+  }
+  if (needsDohFallback(host)) {
+    try {
+      return await io.Socket.connect(host, port)
+          .timeout(const Duration(seconds: 8));
+    } on io.SocketException {
+      final ips = await resolveViaDoh(host);
+      return connectToFirstIp(ips, port);
+    } on TimeoutException {
+      final ips = await resolveViaDoh(host);
+      return connectToFirstIp(ips, port);
+    }
+  }
+  return io.Socket.connect(host, port);
+}
+
+class HelbaHttpOverrides extends io.HttpOverrides {
+  @override
+  io.HttpClient createHttpClient(io.SecurityContext? context) {
+    final client = super.createHttpClient(context);
+    client.connectionFactory =
+        (Uri url, String? proxyHost, int? proxyPort) async {
+      if (proxyHost != null) {
+        // A proxy is configured (e.g. a sandbox or corporate network):
+        // dial the proxy and let HttpClient perform the CONNECT tunnel as
+        // usual. The proxy resolves the host, so the DoH fallback below
+        // does not apply.
+        return io.ConnectionTask.fromSocket(
+            io.Socket.connect(proxyHost, proxyPort ?? 8080), () {});
+      }
+      // No proxy: HttpClient upgrades the returned socket to TLS with
+      // SNI/certificate checks for url.host.
+      return io.ConnectionTask.fromSocket(openSocketForUrl(url), () {});
+    };
+    return client;
+  }
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Route Supabase traffic through the DNS-over-HTTPS fallback so the app
+  // keeps working on networks whose system DNS cannot resolve Supabase.
+  io.HttpOverrides.global = HelbaHttpOverrides();
   const configuredUrl = String.fromEnvironment('SUPABASE_URL', defaultValue: 'https://mpgnybncdiaaohjaqejq.supabase.co');
   const key = String.fromEnvironment('SUPABASE_PUBLISHABLE_KEY', defaultValue: 'sb_publishable_IZ-P_b8LjdDfjATffyqqDg_yJOu9-Og');
   // Remove accidental spaces/newlines from build-time configuration before parsing the host.
