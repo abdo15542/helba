@@ -60,8 +60,10 @@ void main() {
       final request = await client.getUrl(Uri.parse(
           'https://mpgnybncdiaaohjaqejq.supabase.co/auth/v1/health'));
       final response = await request.close();
-      // 401 without an API key proves we reached the live Auth service.
-      expect(response.statusCode, 401);
+      // Without an API key the live Auth service answers 401 (some edges
+      // answer 400); either proves we reached it instead of failing in
+      // the network layer.
+      expect(response.statusCode, isIn([400, 401]));
       await response.drain<void>();
     } finally {
       client.close();
