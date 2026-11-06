@@ -221,7 +221,11 @@ void main() {
           isAuthCallback(Uri.parse(
               'helba://auth/callback?code=abc&state=xyz')),
           isTrue);
-      expect(isAuthCallback(Uri.parse('helba://auth/reset')), isTrue);
+      expect(isAuthCallback(Uri.parse('helba://auth/reset')), isFalse);
+      expect(
+          isAuthCallback(
+              Uri.parse('helba://auth/reset?code=abc')),
+          isTrue);
       expect(isAuthCallback(Uri.parse('helba://other/callback')), isFalse);
       expect(
           isAuthCallback(Uri.parse('https://example.com/auth/callback')),
@@ -245,9 +249,15 @@ void main() {
 
     test('isChatDeepLink / chatIdFromDeepLink agree with parseChatDeepLink',
         () {
-      final chat = Uri.parse('helba://chat/abc-123');
+      const uuid = '123e4567-e89b-12d3-a456-426614174000';
+      final chat = Uri.parse('helba://chat/$uuid');
       expect(isChatDeepLink(chat), isTrue);
-      expect(chatIdFromDeepLink(chat), 'abc-123');
+      expect(chatIdFromDeepLink(chat), uuid);
+      // A non-UUID id is not a chat link (B-2): it would make PostgREST
+      // answer 400, so it is rejected before it is queued.
+      final bad = Uri.parse('helba://chat/abc-123');
+      expect(isChatDeepLink(bad), isFalse);
+      expect(chatIdFromDeepLink(bad), isNull);
       final auth = Uri.parse('helba://auth/callback');
       expect(isChatDeepLink(auth), isFalse);
       expect(chatIdFromDeepLink(auth), isNull);
@@ -462,7 +472,7 @@ void main() {
       const uuid = '123e4567-e89b-12d3-a456-426614174000';
       expect(isValidReportTarget('message', uuid), isTrue);
       expect(isValidReportTarget('user', uuid), isTrue);
-      expect(isValidReportTarget('post', uuid), isTrue);
+      expect(isValidReportTarget('post', uuid), isFalse);
       expect(isValidReportTarget('comment', uuid), isFalse);
       expect(isValidReportTarget(null, uuid), isFalse);
       expect(isValidReportTarget('message', ''), isFalse);
@@ -808,10 +818,32 @@ void main() {
       expect(isEncryptedMessage({}), isFalse);
       expect(isEncryptedMessage({'ciphertext': ''}), isFalse);
 
-      expect(canEncryptFor({'a': 'key-a', 'b': 'key-b'}), isTrue);
-      expect(canEncryptFor({'a': 'key-a', 'b': null}), isFalse);
-      expect(canEncryptFor({'a': 'key-a', 'b': ''}), isFalse);
-      expect(canEncryptFor({'a': 'key-a', 'b': '   '}), isFalse);
+      // canEncryptFor now requires real 32-byte base64 X25519 keys: the
+      // two constants below are 32 zero bytes and bytes 0..31.
+      expect(
+          canEncryptFor({
+            'a': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+            'b': 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=',
+          }),
+          isTrue);
+      expect(
+          canEncryptFor({
+            'a': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+            'b': null,
+          }),
+          isFalse);
+      expect(
+          canEncryptFor({
+            'a': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+            'b': '',
+          }),
+          isFalse);
+      expect(
+          canEncryptFor({
+            'a': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+            'b': '   ',
+          }),
+          isFalse);
       expect(canEncryptFor({}), isFalse);
     });
   });
