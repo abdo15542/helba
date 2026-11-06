@@ -250,11 +250,17 @@ Future<String> wrapConversationKey(
 /// documented — it is what makes the KEK change non-breaking for
 /// existing encrypted conversations. Without [conversationId] only the
 /// legacy KEK is tried (pre-binding behaviour).
+///
+/// Pass [legacyFallback] false to try ONLY the bound KEK: callers that
+/// need to know which KEK worked (see [unwrapWrappedKeyWithFallback])
+/// disable the silent fallback here and attempt the legacy KEK
+/// explicitly as a second, separately reported step.
 Future<List<int>> unwrapConversationKey(
   String wrappedBase64,
   List<int> myPrivateKeyBytes,
   String wrapperPublicKeyBase64, {
   String? conversationId,
+  bool legacyFallback = true,
 }) async {
   final wrapped = decodeBase64(wrappedBase64);
   if (wrapped.length <= _aesGcmNonceLength + _gcmTagLength) {
@@ -283,8 +289,49 @@ Future<List<int>> unwrapConversationKey(
     return await tryUnwrap(convId: conversationId);
   } catch (_) {
     // Bound KEK failed: this row may predate conversation binding.
-    // One legacy attempt; its error (if any) is the one reported.
+    // One legacy attempt; its error (if any) is the one reported —
+    // unless the caller disabled the silent fallback so it can report
+    // the legacy origin itself (see unwrapWrappedKeyWithFallback).
+    if (!legacyFallback) rethrow;
     return tryUnwrap();
+  }
+}
+
+/// Unwraps a wrapped conversation key, trying the conversation-bound KEK
+/// first and the legacy unbound KEK second, and reports which one
+/// worked. Pure (no Supabase): unit-tested.
+///
+/// The bound attempt is made with the silent fallback disabled, so a
+/// legacy success is observable: [fromLegacy] is true exactly when the
+/// row was wrapped before conversation binding (finding #26). Callers
+/// use that to heal the row (re-wrap it with the bound KEK) instead of
+/// leaving a pre-binding row in place forever. Throws
+/// (including [SecretBoxAuthenticationError]) when neither KEK unwraps
+/// — i.e. the row is corrupt, or was wrapped for a different key.
+Future<({List<int> key, bool fromLegacy})> unwrapWrappedKeyWithFallback(
+  String wrappedBase64,
+  List<int> myPrivateKeyBytes,
+  String wrapperPublicKeyBase64,
+  String conversationId,
+) async {
+  try {
+    final key = await unwrapConversationKey(
+      wrappedBase64,
+      myPrivateKeyBytes,
+      wrapperPublicKeyBase64,
+      conversationId: conversationId,
+      legacyFallback: false,
+    );
+    return (key: key, fromLegacy: false);
+  } catch (_) {
+    // Bound KEK failed: one explicit legacy attempt (no conversation
+    // id => unbound KEK). Its error, if any, is the one reported.
+    final key = await unwrapConversationKey(
+      wrappedBase64,
+      myPrivateKeyBytes,
+      wrapperPublicKeyBase64,
+    );
+    return (key: key, fromLegacy: true);
   }
 }
 
@@ -579,25 +626,35 @@ enum _MyKeyOutcome {
 /// Loads my wrapped conversation-key row and unwraps it (conversation-
 /// bound KEK, legacy fallback). Throws on a Supabase/network error so
 /// the caller can distinguish "no row" from "could not check".
-Future<({_MyKeyOutcome outcome, List<int>? key})> _loadMyWrappedKey(
+///
+/// [fromLegacy] is true exactly when the row was wrapped before
+/// conversation binding (finding #26) — the caller heals such rows by
+/// re-wrapping them with the bound KEK. It is false for bound rows and
+/// for every non-loaded outcome.
+Future<({_MyKeyOutcome outcome, List<int>? key, bool fromLegacy})>
+    _loadMyWrappedKey(
   String conversationId,
   List<int> myPrivate,
 ) async {
   final client = Supabase.instance.client;
   final myId = client.auth.currentUser?.id;
-  if (myId == null) return (outcome: _MyKeyOutcome.blocked, key: null);
+  if (myId == null) {
+    return (outcome: _MyKeyOutcome.blocked, key: null, fromLegacy: false);
+  }
   final rows = await client
       .from('conversation_keys')
       .select('wrapped_key, wrapped_by')
       .eq('conversation_id', conversationId)
       .eq('user_id', myId)
       .limit(1);
-  if (rows.isEmpty) return (outcome: _MyKeyOutcome.noRow, key: null);
+  if (rows.isEmpty) {
+    return (outcome: _MyKeyOutcome.noRow, key: null, fromLegacy: false);
+  }
   final row = rows.first;
   final wrappedBy = row['wrapped_by']?.toString() ?? '';
   final wrapped = row['wrapped_key']?.toString() ?? '';
   if (wrappedBy.isEmpty || wrapped.isEmpty) {
-    return (outcome: _MyKeyOutcome.blocked, key: null);
+    return (outcome: _MyKeyOutcome.blocked, key: null, fromLegacy: false);
   }
   final profile = await client
       .from('profiles')
@@ -606,21 +663,25 @@ Future<({_MyKeyOutcome outcome, List<int>? key})> _loadMyWrappedKey(
       .maybeSingle();
   final wrapperPublic = profile?['public_key']?.toString() ?? '';
   if (wrapperPublic.trim().isEmpty) {
-    return (outcome: _MyKeyOutcome.blocked, key: null);
+    return (outcome: _MyKeyOutcome.blocked, key: null, fromLegacy: false);
   }
   try {
-    final key = await unwrapConversationKey(
+    final loaded = await unwrapWrappedKeyWithFallback(
       wrapped,
       myPrivate,
       wrapperPublic,
-      conversationId: conversationId,
+      conversationId,
     );
-    return (outcome: _MyKeyOutcome.loaded, key: key);
+    return (
+      outcome: _MyKeyOutcome.loaded,
+      key: loaded.key,
+      fromLegacy: loaded.fromLegacy,
+    );
   } catch (_) {
-    // My row exists but does not unwrap (corrupt / wrong key):
-    // do NOT create a fresh key over it — that would orphan the
-    // old messages for everyone. Report "no key".
-    return (outcome: _MyKeyOutcome.blocked, key: null);
+    // My row exists but does not unwrap with either KEK (corrupt /
+    // wrong key): do NOT create a fresh key over it — that would
+    // orphan the old messages for everyone. Report "no key".
+    return (outcome: _MyKeyOutcome.blocked, key: null, fromLegacy: false);
   }
 }
 
@@ -647,37 +708,51 @@ Future<bool> _hasEncryptedMessages(String conversationId) async {
       .limit(1);
   return withCiphertext.isNotEmpty;
 }
+/// Whether a fresh conversation key may be created: normally never
+/// when encrypted messages already exist (a competing key would orphan
+/// them); after an explicit user reset ([afterReset] — the old wrapped
+/// rows were deleted by `reset_conversation_keys`) creation is allowed.
+/// Pure (no Supabase): unit-tested.
+bool shouldCreateKey({
+  required bool hasEncryptedMessages,
+  required bool afterReset,
+}) =>
+    afterReset || !hasEncryptedMessages;
+
 /// Loads this conversation's key, creating it when nobody has one yet.
 ///
-/// Returns null when the key cannot be obtained: no signed-in user, a
-/// network/Supabase error (pre-migration 012 included), or — the important
-/// guard — when the conversation already has encrypted messages but I
-/// have no wrapped row (someone else created the key and nobody wrapped
-/// it for me yet). In that last case creating a fresh key would overwrite
-/// everyone's rows and orphan the old messages, so the caller must fall
-/// back to plaintext for sending and show the decrypt-failure note for
-/// reading instead. A later sender's lazy re-wrap fixes the missing row.
+/// Returns a record: [key] is the conversation key (null when it
+/// cannot be obtained); [blocked] is true ONLY when my wrapped row
+/// exists but cannot be unwrapped with either KEK — a DEFINITIVE
+/// failure (corrupt row / wrapped for a key this device no longer
+/// holds), as opposed to a transient failure (no row yet, network
+/// error) where [blocked] is false and the caller must keep retrying;
+/// [fromLegacy] is true when the key came from a pre-binding (legacy)
+/// wrapped row, so the caller can heal it by re-wrapping.
 ///
-/// Creator election (finding #23, client side only — a server-side RPC
-/// is the atomic fix, owned by another coordinator): the
-/// lexicographically smallest member id creates the key; the others
-/// poll for their wrapped row (bounded: 6 attempts, 500 ms apart) and
-/// never create their own. After creating, the creator re-reads its own
-/// wrapped row and adopts whatever key is actually stored
-/// (last-writer-wins reconciliation) instead of trusting the locally
-/// generated key.
-///
-/// Re-callable (finding #25, e2ee side): this function keeps NO cache —
-/// no null result is ever memoised — so a failed/null load can be
-/// retried by a later call (the chat-side retry loop and clearing of
-/// `_decryptFailed` when a key later loads are the chat agent's job).
-Future<List<int>?> loadOrCreateConversationKey(
+/// Returns null key when the key cannot be obtained: no signed-in user,
+/// a network/Supabase error (pre-migration 012 included), or — the
+/// important guard — when the conversation already has encrypted
+/// messages but I have no wrapped row (someone else created the key
+/// and nobody wrapped it for me yet). In that last case creating a
+/// fresh key would overwrite everyone's rows and orphan the old
+/// messages, so the caller must fall back to plaintext for sending and
+/// show the decrypt-failure note for reading instead. A later sender's
+/// lazy re-wrap fixes the missing row. The guard is skipped when
+/// [afterReset] is true: the caller just deleted every wrapped row via
+/// `reset_conversation_keys`, so there is no old key left to orphan
+/// and the caller acts as the creator of the fresh key.
+Future<({List<int>? key, bool blocked, bool fromLegacy})>
+    loadOrCreateConversationKey(
   String conversationId,
-  Map<String, String?> memberPublicKeys,
-) async {
+  Map<String, String?> memberPublicKeys, {
+  bool afterReset = false,
+}) async {
   final client = Supabase.instance.client;
   final myId = client.auth.currentUser?.id;
-  if (myId == null) return null;
+  if (myId == null) {
+    return (key: null, blocked: false, fromLegacy: false);
+  }
 
   final pair = await ensureKeyPair();
   final myPrivate = await pair.extractPrivateKeyBytes();
@@ -689,9 +764,13 @@ Future<List<int>?> loadOrCreateConversationKey(
   final members = Map<String, String?>.from(memberPublicKeys);
   members[myId] = myPublic;
 
-  // Creator election (finding #23): smallest member id creates.
+  // Creator election (finding #23): smallest member id creates. After
+  // an explicit reset the caller IS the creator: the old rows are
+  // gone, nobody else knows a reset happened, and waiting for the
+  // elected creator would leave the conversation keyless.
   final sortedIds = members.keys.toList()..sort();
-  final iAmCreator = sortedIds.isEmpty || sortedIds.first == myId;
+  final iAmCreator =
+      afterReset || sortedIds.isEmpty || sortedIds.first == myId;
 
   // Poll loop for non-creators; the creator breaks out immediately.
   // 6 attempts x 500 ms ≈ 2.5 s of waiting for the creator's row.
@@ -700,21 +779,36 @@ Future<List<int>?> loadOrCreateConversationKey(
     // 1. My wrapped row, if one exists.
     try {
       final mine = await _loadMyWrappedKey(conversationId, myPrivate);
-      if (mine.outcome == _MyKeyOutcome.loaded) return mine.key;
-      if (mine.outcome == _MyKeyOutcome.blocked) return null;
+      if (mine.outcome == _MyKeyOutcome.loaded) {
+        return (
+          key: mine.key,
+          blocked: false,
+          fromLegacy: mine.fromLegacy,
+        );
+      }
+      if (mine.outcome == _MyKeyOutcome.blocked) {
+        return (key: null, blocked: true, fromLegacy: false);
+      }
     } catch (_) {
       // conversation_keys missing (pre-migration) or network error: no
       // key, caller falls back to plaintext.
-      return null;
+      return (key: null, blocked: false, fromLegacy: false);
     }
 
     // 2. No row for me. If the conversation already has encrypted
     // messages, a key exists that I do not have — do not create a
-    // competing one.
+    // competing one (unless this load follows an explicit reset, where
+    // the old rows were deleted and there is nothing to orphan).
     try {
-      if (await _hasEncryptedMessages(conversationId)) return null;
+      final hasEncrypted = await _hasEncryptedMessages(conversationId);
+      if (!shouldCreateKey(
+        hasEncryptedMessages: hasEncrypted,
+        afterReset: afterReset,
+      )) {
+        return (key: null, blocked: false, fromLegacy: false);
+      }
     } catch (_) {
-      return null;
+      return (key: null, blocked: false, fromLegacy: false);
     }
 
     // 3. Fresh conversation (or none encrypted yet): the elected
@@ -725,7 +819,7 @@ Future<List<int>?> loadOrCreateConversationKey(
         'Helba E2E: no conversation key appeared after polling; not '
         'creating one (not the elected creator)',
       );
-      return null;
+      return (key: null, blocked: false, fromLegacy: false);
     }
     await Future.delayed(const Duration(milliseconds: 500));
   }
@@ -742,10 +836,14 @@ Future<List<int>?> loadOrCreateConversationKey(
   try {
     final stored = await _loadMyWrappedKey(conversationId, myPrivate);
     if (stored.outcome == _MyKeyOutcome.loaded && stored.key != null) {
-      return stored.key;
+      return (
+        key: stored.key,
+        blocked: false,
+        fromLegacy: stored.fromLegacy,
+      );
     }
   } catch (_) {
     // Re-read failed (network blip): keep the locally generated key.
   }
-  return convKey;
+  return (key: convKey, blocked: false, fromLegacy: false);
 }

@@ -42,6 +42,18 @@ bool isMalformedEncryptedRow(Map<String, dynamic> row) {
   return ciphertext.isEmpty || nonce.isEmpty;
 }
 
+/// The plaintext-banner message for a conversation whose messages are
+/// currently going out unencrypted. The banner is shown whenever there
+/// is no conversation key OR a member lacks a public key — but the two
+/// causes must not be confused: when every member HAS a valid key, the
+/// key itself failed to load (e.g. a wrapped row that unwraps with
+/// neither KEK), and blaming a missing member key sends the user
+/// chasing a member who already has one. Pure (unit-tested).
+String plaintextBannerMessage(Map<String, String?> memberPublicKeys) =>
+    canEncryptFor(memberPublicKeys)
+        ? '🔓 غير مشفّرة — تعذّر تحميل مفتاح التشفير'
+        : '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح';
+
 class ChatPage extends StatefulWidget {
   final String conversationId, title;
   final String kind;
@@ -100,6 +112,14 @@ class _ChatPageState extends State<ChatPage> {
   // must not set this, otherwise the key load never retries.
   bool _conversationKeyLoaded = false;
   bool _keyLoading = false;
+  // True when the last key load DEFINITIVELY failed: my wrapped row
+  // exists but cannot be unwrapped with either KEK (corrupt row, or
+  // wrapped for a key this device no longer holds). Unlike a transient
+  // failure (no row yet / network), this will not heal by waiting, so
+  // the decrypt UI shows a failure + retry instead of an eternal
+  // "decrypting…" spinner. Cleared when a key loads, or when the user
+  // taps retry (the load then re-decides it).
+  bool _keyDefinitivelyBlocked = false;
   bool _decryptRunning = false;
   // Bounded key-load retry: at most one retry per ~10s, triggered by new
   // stream data — never a hot loop.
@@ -268,7 +288,7 @@ class _ChatPageState extends State<ChatPage> {
   /// so a transient failure retries instead of being remembered forever.
   /// When the key does arrive late, previously failed decryptions are
   /// cleared and re-attempted against the rows last seen.
-  Future<void> _ensureConversationKey() async {
+  Future<void> _ensureConversationKey({bool afterReset = false}) async {
     if (_conversationKey != null) {
       if (!_conversationKeyLoaded && mounted) {
         setState(() => _conversationKeyLoaded = true);
@@ -284,17 +304,57 @@ class _ChatPageState extends State<ChatPage> {
       } catch (_) {
         // Publishing must never block the chat (e.g. pre-migration 012).
       }
-      final key = await loadOrCreateConversationKey(
-          widget.conversationId, _memberPublicKeys);
-      if (key != null && mounted) {
+      final loaded = await loadOrCreateConversationKey(
+        widget.conversationId,
+        _memberPublicKeys,
+        afterReset: afterReset,
+      );
+      final key = loaded.key;
+      if (mounted) {
         setState(() {
-          _conversationKey = key;
-          _conversationKeyLoaded = true;
-          // The key is here now: rows marked failed only because there
-          // was no key get another chance.
-          _decryptFailed.clear();
+          // Whether the last load definitively failed (a wrapped row
+          // exists but unwraps with neither KEK). Transient outcomes
+          // (no row yet / network) report blocked: false, so pending
+          // rows stay in "decrypting" and keep their bounded retry.
+          _keyDefinitivelyBlocked = loaded.blocked;
+          if (key != null) {
+            _conversationKey = key;
+            _conversationKeyLoaded = true;
+            // The key is here now: rows marked failed only because
+            // there was no key get another chance.
+            _decryptFailed.clear();
+          }
         });
-        if (_lastRows.isNotEmpty) _decryptPendingRows(_lastRows);
+      }
+      if (key != null) {
+        if (loaded.fromLegacy) {
+          // Heal: the key came from a pre-binding (legacy) wrapped
+          // row — re-wrap it for all members with the bound KEK, so
+          // the row is readable by the current code path and future
+          // loads no longer depend on the fallback. Best-effort: the
+          // key itself already loaded, a heal failure must not break
+          // the chat. My own entry is overwritten with the current
+          // local public key (finding #21) — a stale profile key
+          // must never be wrapped for.
+          try {
+            final myId = client.auth.currentUser?.id;
+            final myPublic = await myPublicKeyBase64(pair);
+            final members =
+                Map<String, String?>.from(_memberPublicKeys);
+            if (myId != null) members[myId] = myPublic;
+            await wrapKeyForMembers(widget.conversationId, key, members);
+          } catch (_) {
+            // Heal is best-effort; the key itself already loaded.
+          }
+        }
+        if (mounted && _lastRows.isNotEmpty) {
+          _decryptPendingRows(_lastRows);
+        }
+      } else if (loaded.blocked && mounted && _lastRows.isNotEmpty) {
+        // Definitive key failure: re-run decryption so the pending
+        // encrypted rows are marked failed (they show a retry
+        // affordance) instead of spinning on "decrypting…" forever.
+        _decryptPendingRows(_lastRows);
       }
     } catch (_) {
       // Deliberately do NOT set _conversationKeyLoaded: a transient
@@ -322,7 +382,11 @@ class _ChatPageState extends State<ChatPage> {
   /// in a loop, never re-decrypt a cached row) and only one run at a time.
   /// Malformed rows (missing ciphertext/nonce) are skipped, never marked
   /// failed. Rows that cannot be decrypted only because the key is null
-  /// are NOT marked failed either — they are retried when the key loads.
+  /// are NOT marked failed either — they are retried when the key loads
+  /// — EXCEPT when the key load definitively failed (a wrapped row
+  /// exists but unwraps with neither KEK): those rows are marked failed
+  /// so the UI shows "تعذّر فك التشفير" with a tap-to-retry instead of
+  /// an eternal "جارٍ فك التشفير…".
   Future<void> _decryptPendingRows(List<Map<String, dynamic>> rows) async {
     if (_decryptRunning) return;
     final malformed = <String>[];
@@ -343,16 +407,29 @@ class _ChatPageState extends State<ChatPage> {
     }
     if (pending.isEmpty) return;
     if (!_conversationKeyLoaded) {
-      await _ensureConversationKey();
-      if (!mounted) return;
-      // Key load triggers a rebuild, which re-schedules this step.
-      return;
+      // No key yet. If the load already failed definitively, fall
+      // through and mark the pending rows failed below — waiting
+      // would never heal them. Otherwise trigger a (bounded) load
+      // and wait for it.
+      if (!_keyDefinitivelyBlocked) {
+        await _ensureConversationKey();
+        if (!mounted) return;
+        // Key load triggers a rebuild, which re-schedules this step.
+        return;
+      }
     }
     final key = _conversationKey;
     if (key == null) {
-      // No key yet: do NOT permanently mark these rows failed. The
-      // builder re-schedules decryption (bounded) when new data arrives
-      // or the key loads.
+      // No key yet. A definitive load failure marks these rows failed
+      // (retry affordance in the UI). A transient failure (no row yet
+      // / network) leaves them pending: the builder re-schedules
+      // decryption (bounded) when new data arrives or the key loads.
+      if (_keyDefinitivelyBlocked && mounted) {
+        setState(() {
+          _decryptFailed
+              .addAll(pending.map((row) => row['id'].toString()));
+        });
+      }
       return;
     }
     _decryptRunning = true;
@@ -377,6 +454,20 @@ class _ChatPageState extends State<ChatPage> {
     }
     _decryptRunning = false;
     if (changed && mounted) setState(() {});
+  }
+
+  /// Tap-to-retry for rows that definitively failed to decrypt: clears
+  /// the failed set and the blocked flag, then re-runs the key load
+  /// (which re-runs decryption when the key arrives). If the key is
+  /// still blocked, the rows fail again — the retry is honest, never a
+  /// silent spin back to "جارٍ فك التشفير…".
+  void _retryDecryption() {
+    if (!mounted) return;
+    setState(() {
+      _decryptFailed.clear();
+      _keyDefinitivelyBlocked = false;
+    });
+    _ensureConversationKey();
   }
 
   void _scrollToBottom() {
@@ -496,6 +587,11 @@ class _ChatPageState extends State<ChatPage> {
   bool get _showPlaintextBanner =>
       _membersLoaded &&
       (_conversationKey == null || !canEncryptFor(_memberPublicKeys));
+
+  /// The banner text: names the real cause (missing member key vs.
+  /// key-load failure) instead of always blaming a member key.
+  String get _plaintextBannerMessage =>
+      plaintextBannerMessage(_memberPublicKeys);
 
   void _showReadOnlyNote() {
     if (!mounted) return;
@@ -771,6 +867,69 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
+  /// Confirm dialog for resetting this conversation's encryption, then
+  /// the reset itself. The reset is the recovery when the conversation
+  /// key is truly lost (a wrapped row that unwraps with neither KEK):
+  /// the server deletes every wrapped row for this conversation and
+  /// this device creates a fresh key. Old encrypted messages in this
+  /// conversation stay unreadable FOREVER — the dialog says so
+  /// plainly — and new messages use the fresh key. Best-effort
+  /// errors show a snackbar, never a crash.
+  Future<void> _showResetEncryptionDialog() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('إعادة تعيين التشفير'),
+        content: const Text(
+            'سيتم حذف مفاتيح التشفير الحالية لهذه المحادثة وإنشاء مفتاح '
+            'جديد. الرسائل المشفّرة القديمة في هذه المحادثة ستبقى غير '
+            'قابلة للقراءة للأبد، وستُشفَّر الرسائل الجديدة بالمفتاح '
+            'الجديد. هل تريد المتابعة؟'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('إلغاء')),
+          FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('إعادة تعيين')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await _resetEncryption();
+  }
+
+  Future<void> _resetEncryption() async {
+    try {
+      await client.rpc('reset_conversation_keys', params: {
+        'p_conversation_id': widget.conversationId,
+      }).timeout(const Duration(seconds: 20));
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+              content: Text(
+                  'تعذّرت إعادة تعيين التشفير. ${networkErrorMessage(e) ?? e.toString()}')),
+        );
+      }
+      return;
+    }
+    if (!mounted) return;
+    // The old key is gone: drop every cached decrypt product of it
+    // (showing them would display text the new key cannot produce)
+    // and reload with afterReset so a fresh key is created even though
+    // encrypted messages exist. Malformed rows are NOT cleared: they
+    // are about the row format, not the key.
+    setState(() {
+      _conversationKey = null;
+      _conversationKeyLoaded = false;
+      _keyDefinitivelyBlocked = false;
+      _decrypted.clear();
+      _decryptFailed.clear();
+    });
+    _ensureConversationKey(afterReset: true);
+  }
+
   /// Long-press on a message bubble: offer to report that message.
   void _showMessageActions(Map<String, dynamic> row) {
     final messageId = row['id']?.toString() ?? '';
@@ -963,7 +1122,23 @@ class _ChatPageState extends State<ChatPage> {
         return const Text('رسالة تالفة');
       }
       if (_decryptFailed.contains(id)) {
-        return const Text('تعذّر فك تشفير هذه الرسالة');
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('تعذّر فك تشفير هذه الرسالة'),
+            const SizedBox(height: 2),
+            GestureDetector(
+              onTap: _retryDecryption,
+              child: const Text(
+                'إعادة المحاولة',
+                style: TextStyle(
+                    fontSize: 10,
+                    color: Colors.blue,
+                    decoration: TextDecoration.underline),
+              ),
+            ),
+          ],
+        );
       }
       return const Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1032,8 +1207,9 @@ class _ChatPageState extends State<ChatPage> {
           // Publishing must never block sending.
         }
         await _loadMembers(silent: true);
-        convKey = await loadOrCreateConversationKey(
+        final loadedKey = await loadOrCreateConversationKey(
             widget.conversationId, _memberPublicKeys);
+        convKey = loadedKey.key;
         if (convKey != null) {
           try {
             await wrapKeyForMembers(
@@ -1275,6 +1451,8 @@ class _ChatPageState extends State<ChatPage> {
                   _showMembersSheet();
                 } else if (value == 'leave') {
                   _leaveConversation();
+                } else if (value == 'reset_e2ee') {
+                  _showResetEncryptionDialog();
                 }
               },
               itemBuilder: (_) {
@@ -1293,6 +1471,9 @@ class _ChatPageState extends State<ChatPage> {
                           ? 'مغادرة القناة'
                           : 'مغادرة المجموعة')));
                 }
+                items.add(const PopupMenuItem(
+                    value: 'reset_e2ee',
+                    child: Text('إعادة تعيين التشفير')));
                 return items;
               },
             ),
@@ -1385,9 +1566,9 @@ class _ChatPageState extends State<ChatPage> {
             padding:
                 const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
             color: const Color(0xFFFFF3CD),
-            child: const Text(
-                '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح',
-                style: TextStyle(fontSize: 12),
+            child: Text(
+                _plaintextBannerMessage,
+                style: const TextStyle(fontSize: 12),
                 textAlign: TextAlign.center),
           ),
         SafeArea(
