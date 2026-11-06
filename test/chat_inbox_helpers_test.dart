@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:helba/src/chat.dart';
+import 'package:helba/src/e2ee.dart';
 import 'package:helba/src/inbox.dart';
 import 'package:helba/src/utils.dart';
 
@@ -42,16 +43,28 @@ void main() {
 
     test('plaintextBannerMessage names the real cause', () {
       // A 32-byte base64 key is valid; anything else means "no key".
+      // Members map to their device keys (deviceId null = legacy entry).
       final validKey = base64Encode(List<int>.filled(32, 7));
       // Every member has a key but the conversation key failed to
       // load: blame the key load, not a member key.
       expect(
-          plaintextBannerMessage({'a': validKey, 'b': validKey}),
+          plaintextBannerMessage({
+            'a': [(deviceId: 'd1', publicKey: validKey)],
+            'b': [(deviceId: 'd2', publicKey: validKey)],
+          }),
           '🔓 غير مشفّرة — تعذّر تحميل مفتاح التشفير');
       // A member without a key: blame the missing member key.
-      expect(plaintextBannerMessage({'a': validKey, 'b': null}),
+      expect(
+          plaintextBannerMessage({
+            'a': [(deviceId: 'd1', publicKey: validKey)],
+            'b': <DeviceKey>[],
+          }),
           '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح');
-      expect(plaintextBannerMessage({'a': validKey, 'b': 'key-a'}),
+      expect(
+          plaintextBannerMessage({
+            'a': [(deviceId: 'd1', publicKey: validKey)],
+            'b': [(deviceId: null, publicKey: 'key-a')],
+          }),
           '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح');
       expect(plaintextBannerMessage({}),
           '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح');

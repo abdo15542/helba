@@ -819,29 +819,55 @@ void main() {
       expect(isEncryptedMessage({'ciphertext': ''}), isFalse);
 
       // canEncryptFor now requires real 32-byte base64 X25519 keys: the
-      // two constants below are 32 zero bytes and bytes 0..31.
+      // two constants below are 32 zero bytes and bytes 0..31. Each
+      // member maps to their device keys (deviceId null = legacy entry).
       expect(
           canEncryptFor({
-            'a': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-            'b': 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=',
+            'a': [
+              (
+                deviceId: 'd1',
+                publicKey: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+              ),
+            ],
+            'b': [
+              (
+                deviceId: 'd2',
+                publicKey: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8='
+              ),
+            ],
           }),
           isTrue);
       expect(
           canEncryptFor({
-            'a': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-            'b': null,
+            'a': [
+              (
+                deviceId: 'd1',
+                publicKey: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+              ),
+            ],
+            'b': <DeviceKey>[],
           }),
           isFalse);
       expect(
           canEncryptFor({
-            'a': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-            'b': '',
+            'a': [
+              (
+                deviceId: 'd1',
+                publicKey: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+              ),
+            ],
+            'b': [(deviceId: null, publicKey: '')],
           }),
           isFalse);
       expect(
           canEncryptFor({
-            'a': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-            'b': '   ',
+            'a': [
+              (
+                deviceId: 'd1',
+                publicKey: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+              ),
+            ],
+            'b': [(deviceId: null, publicKey: '   ')],
           }),
           isFalse);
       expect(canEncryptFor({}), isFalse);

@@ -52,11 +52,51 @@ void main() {
           isFalse);
     });
 
-    test('canEncryptFor requires a valid key for every member', () {
-      expect(canEncryptFor({'a': validKey, 'b': otherValidKey}), isTrue);
-      expect(canEncryptFor({'a': validKey, 'b': 'key-a'}), isFalse);
-      expect(canEncryptFor({'a': validKey, 'b': null}), isFalse);
-      expect(canEncryptFor({'a': validKey, 'b': ''}), isFalse);
+    test('canEncryptFor requires a valid key on some device per member',
+        () {
+      // Device shape: each member maps to their device keys; a member
+      // needs >= 1 valid device key (the legacy per-user entry has
+      // deviceId null).
+      expect(
+          canEncryptFor({
+            'a': [(deviceId: 'd1', publicKey: validKey)],
+            'b': [(deviceId: 'd2', publicKey: otherValidKey)],
+          }),
+          isTrue);
+      expect(
+          canEncryptFor({
+            'a': [(deviceId: 'd1', publicKey: validKey)],
+            'b': [(deviceId: null, publicKey: otherValidKey)],
+          }),
+          isTrue);
+      // One valid device is enough even if another device key is bad.
+      expect(
+          canEncryptFor({
+            'a': [
+              (deviceId: 'd1', publicKey: 'key-a'),
+              (deviceId: 'd2', publicKey: validKey),
+            ],
+            'b': [(deviceId: 'd2', publicKey: otherValidKey)],
+          }),
+          isTrue);
+      expect(
+          canEncryptFor({
+            'a': [(deviceId: 'd1', publicKey: validKey)],
+            'b': [(deviceId: 'd2', publicKey: 'key-a')],
+          }),
+          isFalse);
+      expect(
+          canEncryptFor({
+            'a': [(deviceId: 'd1', publicKey: validKey)],
+            'b': <DeviceKey>[],
+          }),
+          isFalse);
+      expect(
+          canEncryptFor({
+            'a': [(deviceId: 'd1', publicKey: validKey)],
+            'b': [(deviceId: null, publicKey: '')],
+          }),
+          isFalse);
       expect(canEncryptFor({}), isFalse);
     });
 
@@ -336,6 +376,103 @@ void main() {
       expect(identical(results[1], results[2]), isTrue);
       final again = await ensureKeyPair();
       expect(identical(again, results[0]), isTrue);
+    });
+  });
+
+  group('per-device keys (migration 023)', () {
+    // Key-aware flutter_secure_storage mock with a backing map, so a
+    // pre-stored device id is really read back. Registered here (after
+    // the ensureKeyPair group above) so it replaces that group's
+    // single-value mock for the rest of the file.
+    final store = <String, String>{};
+    setUpAll(() {
+      const channel =
+          MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        final args = call.arguments;
+        final key = args is Map ? args['key']?.toString() : null;
+        if (call.method == 'read') return key == null ? null : store[key];
+        if (call.method == 'write' && key != null) {
+          store[key] = args['value']?.toString() ?? '';
+        }
+        return null;
+      });
+    });
+
+    test('generateDeviceId makes valid, distinct UUID v4 ids', () {
+      final uuidV4 = RegExp(
+          r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-'
+          r'[0-9a-f]{12}$');
+      final first = generateDeviceId();
+      final second = generateDeviceId();
+      expect(uuidV4.hasMatch(first), isTrue);
+      expect(uuidV4.hasMatch(second), isTrue);
+      expect(first, isNot(second));
+    });
+
+    test('getDeviceId reuses the stored id and is stable across calls',
+        () async {
+      const stored = '11111111-2222-4333-8444-555555555555';
+      store['helba_device_id'] = stored;
+      expect(await getDeviceId(), stored);
+      expect(await getDeviceId(), stored);
+    });
+
+    test('mergeMemberDeviceKeys lists devices plus the legacy entry', () {
+      final merged = mergeMemberDeviceKeys(
+        {'a': validKey, 'b': otherValidKey, 'c': null},
+        [
+          {'user_id': 'a', 'device_id': 'd1', 'public_key': validKey},
+          {'user_id': 'a', 'device_id': 'd2', 'public_key': otherValidKey},
+          {'user_id': 'b', 'device_id': 'd9', 'public_key': validKey},
+          // Rows for non-members and rows with empty fields are ignored.
+          {'user_id': 'zzz', 'device_id': 'd1', 'public_key': validKey},
+          {'user_id': 'b', 'device_id': '', 'public_key': validKey},
+          {'user_id': 'b', 'device_id': 'd8', 'public_key': ''},
+        ],
+      );
+      expect(merged['a'], hasLength(3)); // d1, d2, legacy
+      expect(merged['a']!.first.deviceId, 'd1');
+      expect(merged['a']!.last.deviceId, isNull); // legacy entry last
+      expect(merged['b'], hasLength(2)); // d9, legacy
+      expect(merged['c'], isEmpty); // no devices, no profiles key
+      expect(merged.containsKey('zzz'), isFalse);
+    });
+
+    test('mergeMemberDeviceKeys keeps the legacy-only member working',
+        () {
+      final merged = mergeMemberDeviceKeys(
+        {'a': validKey},
+        <Map<String, dynamic>>[],
+      );
+      expect(merged['a'], hasLength(1));
+      expect(merged['a']!.single.deviceId, isNull);
+      expect(canEncryptFor(merged), isTrue);
+    });
+
+    test('pickMyWrappedRow prefers my device row, then the legacy row',
+        () {
+      const legacy = {
+        'device_id': null,
+        'wrapped_key': 'legacy-wrap',
+        'wrapped_by': 'w',
+      };
+      const mine = {
+        'device_id': 'my-device',
+        'wrapped_key': 'device-wrap',
+        'wrapped_by': 'w',
+      };
+      const otherDevice = {
+        'device_id': 'other-device',
+        'wrapped_key': 'other-wrap',
+        'wrapped_by': 'w',
+      };
+      expect(pickMyWrappedRow([legacy, mine], 'my-device'), mine);
+      expect(pickMyWrappedRow([mine, legacy], 'my-device'), mine);
+      expect(pickMyWrappedRow([legacy, otherDevice], 'my-device'), legacy);
+      expect(pickMyWrappedRow([otherDevice], 'my-device'), isNull);
+      expect(pickMyWrappedRow([], 'my-device'), isNull);
     });
   });
 }
