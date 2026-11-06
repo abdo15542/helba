@@ -1,0 +1,30 @@
+# Helba Edge Function configuration (Supabase).
+#
+# JWT verification is ON by default for every function, and it runs BEFORE
+# the function code: a request without a valid Supabase user JWT in the
+# `Authorization` header is rejected with HTTP 401 by the platform, and
+# the handler never runs. That is correct for functions the app calls
+# with a signed-in user (send-call-push keeps the default), but
+# send-message-push is called by the database trigger
+# (`messages_notify_push`, migration 018) via pg_net, which has no user
+# JWT to send — it authenticates with the shared `x-helba-push-secret`
+# header instead. With verify_jwt left on, EVERY trigger call was
+# rejected 401 at the gateway and no closed-app message push ever
+# arrived, while the function's own secret check never even ran.
+#
+# So: verify_jwt is OFF for send-message-push ONLY. The function's own
+# `x-helba-push-secret` check (fail-closed 401 when PUSH_TRIGGER_SECRET
+# is unset or the header mismatches) is the authentication — anyone who
+# knows the URL can reach the handler, but without the secret they get
+# 401 and no push is sent. Do NOT turn verify_jwt off for
+# send-call-push: the app calls it with the caller's user JWT, and its
+# handler verifies that JWT against the calls row.
+#
+# After adding or changing this file, the affected function MUST be
+# redeployed for the setting to take effect:
+#   supabase functions deploy send-message-push
+# (Deploying without this file — or with `--no-verify-jwt` only on one
+# deploy — silently re-enables the 401s on the next deploy.)
+
+[functions.send-message-push]
+verify_jwt = false
