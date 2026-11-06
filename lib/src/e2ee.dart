@@ -205,6 +205,23 @@ List<DeviceKey> wrapTargetsForMember(List<DeviceKey> devices) {
   return devices.where((d) => d.deviceId != null).toList();
 }
 
+/// The legacy per-user entry (deviceId null) to fall back to when every
+/// per-device wrap failed for a member, or null when there is none (or
+/// it was already among the attempted targets). Pure: unit-tested.
+/// Used by [wrapKeyForMembers] (fix 12): a member whose device wraps
+/// all failed must not be left with no row at all when their
+/// profiles.public_key is valid and current.
+DeviceKey? legacyFallbackTarget(
+  List<DeviceKey> devices,
+  List<DeviceKey> attemptedTargets,
+) {
+  if (attemptedTargets.any((d) => d.deviceId == null)) return null;
+  for (final d in devices) {
+    if (d.deviceId == null && isValidPublicKey(d.publicKey)) return d;
+  }
+  return null;
+}
+
 /// A fresh random 32-byte conversation key.
 List<int> generateConversationKey() {
   final bytes = Uint8List(32);
@@ -862,6 +879,52 @@ Future<Set<String>> wrapKeyForMembers(
   myDevices.removeWhere((d) => d.deviceId == myDeviceId);
   myDevices.add((deviceId: myDeviceId, publicKey: myPublic));
   final uncovered = <String>{};
+  // Attempts one wrap + upsert for [userId]/[device]. Returns true
+  // when a row was written. Never throws: a bad key or a failed
+  // upsert is logged (user id only, never key material) and reported
+  // as false so the caller can try another target.
+  Future<bool> attemptWrap(String userId, DeviceKey device) async {
+    final publicKey = device.publicKey;
+    if (!isValidPublicKey(publicKey)) {
+      // A device with a corrupt key is skipped, not wrapped for;
+      // canEncryptFor() reports the same member as unencryptable
+      // when NO device has a valid key, so the sender falls back to
+      // plaintext with the 🔓 label instead of silently encrypting
+      // for everyone-but-them.
+      debugPrint(
+        'Helba E2E: skipping wrap for member $userId device '
+        '${device.deviceId ?? 'legacy'}: invalid public key',
+      );
+      return false;
+    }
+    try {
+      final wrapped = await wrapConversationKey(
+        convKeyBytes,
+        myPrivate,
+        publicKey,
+        conversationId: conversationId,
+      );
+      await client.from('conversation_keys').upsert(
+        {
+          'conversation_id': conversationId,
+          'user_id': userId,
+          'device_id': device.deviceId,
+          'wrapped_key': wrapped,
+          'wrapped_by': myId,
+          'wrapped_by_device_id': myDeviceId,
+        },
+        onConflict: 'conversation_id,user_id,device_id',
+      );
+      return true;
+    } catch (e) {
+      // One device unwrappable now (bad key, network blip) — the next
+      // send retries via the same lazy re-wrap. Log the user id only,
+      // never key material.
+      debugPrint('Helba E2E: wrap failed for member $userId: $e');
+      return false;
+    }
+  }
+
   for (final entry in members.entries) {
     final userId = entry.key;
     // Fix 2: never write the legacy (device_id NULL) row when the
@@ -869,44 +932,21 @@ Future<Set<String>> wrapKeyForMembers(
     final targets = wrapTargetsForMember(entry.value);
     var wroteOne = false;
     for (final device in targets) {
-      final publicKey = device.publicKey;
-      if (!isValidPublicKey(publicKey)) {
-        // Log the user id only — never key material (finding #24/#28).
-        // A device with a corrupt key is skipped, not wrapped for;
-        // canEncryptFor() reports the same member as unencryptable
-        // when NO device has a valid key, so the sender falls back to
-        // plaintext with the 🔓 label instead of silently encrypting
-        // for everyone-but-them.
-        debugPrint(
-          'Helba E2E: skipping wrap for member $userId device '
-          '${device.deviceId ?? 'legacy'}: invalid public key',
-        );
-        continue;
-      }
-      try {
-        final wrapped = await wrapConversationKey(
-          convKeyBytes,
-          myPrivate,
-          publicKey,
-          conversationId: conversationId,
-        );
-        await client.from('conversation_keys').upsert(
-          {
-            'conversation_id': conversationId,
-            'user_id': userId,
-            'device_id': device.deviceId,
-            'wrapped_key': wrapped,
-            'wrapped_by': myId,
-            'wrapped_by_device_id': myDeviceId,
-          },
-          onConflict: 'conversation_id,user_id,device_id',
-        );
+      if (await attemptWrap(userId, device)) wroteOne = true;
+    }
+    if (!wroteOne) {
+      // Legacy fallback (fix 12): every device-row wrap failed for
+      // this member, so they would be left with no row at all even
+      // though their profiles.public_key is valid and current (the
+      // 22:23 reset covered only the resetter because the other
+      // member's per-device wraps all failed). Fall back to the
+      // legacy per-user row in that case only: it is wrapped for the
+      // profile key, which the member's current device holds when
+      // the profile key is fresh. A stale legacy row is still never
+      // written when a device row succeeded.
+      final legacy = legacyFallbackTarget(entry.value, targets);
+      if (legacy != null && await attemptWrap(userId, legacy)) {
         wroteOne = true;
-      } catch (e) {
-        // One device unwrappable now (bad key, network blip) — the next
-        // send retries via the same lazy re-wrap. Log the user id only,
-        // never key material.
-        debugPrint('Helba E2E: wrap failed for member $userId: $e');
       }
     }
     if (!wroteOne) uncovered.add(userId);
