@@ -28,7 +28,18 @@
 // returns HTTP 401, so a misconfigured caller is visible instead of
 // silently dropping every call push. A call whose row is already
 // terminal (answered / missed / declined / ended) returns
-// {ok:true, sent:0} — no point waking a callee for a dead call.
+// {ok:true, sent:0, reason:"call_not_ringing"} — no point waking a
+// callee for a dead call.
+//
+// OBSERVABILITY (fix 7): every invocation LOGS its outcome
+// (`send-call-push call=<id> sent=N failed=M [reason=...]`) and RETURNS
+// it: `{ok:true, sent, failed, reason?, details:[{fid, ok, status,
+// error}]}`. `reason` is set whenever nothing was sent:
+// `no_tokens` (the callee has no push_tokens row), `call_not_ringing`
+// (the call row is already terminal), `all_failed` (every FCM send
+// failed). The caller (the app) reads `sent`/`reason` and warns the
+// caller when the callee was not woken — a 200 with no indication of
+// whether anything was sent is never returned again.
 //
 // Required secrets (set with `supabase secrets set ...`; all already
 // set for send-message-push — no new secret is needed):
@@ -278,7 +289,11 @@ Deno.serve(async (req: Request) => {
   }
   // Dead call: do not wake the callee for a call that already ended.
   if (!isPushableCallStatus(rowStatus)) {
-    return json({ ok: true, sent: 0, failed: 0 });
+    console.log(
+      `send-call-push call=${callId} sent=0 failed=0 ` +
+        `reason=call_not_ringing (status=${rowStatus})`,
+    );
+    return json({ ok: true, sent: 0, failed: 0, reason: "call_not_ringing" });
   }
   // The row's type wins over the request body's (defence in depth:
   // the app already sends the same value).
@@ -313,19 +328,30 @@ Deno.serve(async (req: Request) => {
     console.error("Failed to load push tokens:", e);
     return json({ ok: false, error: "tokens lookup failed" });
   }
-  if (fids.length === 0) return json({ ok: true, sent: 0, failed: 0 });
+  if (fids.length === 0) {
+    console.log(
+      `send-call-push call=${callId} sent=0 failed=0 reason=no_tokens`,
+    );
+    return json({ ok: true, sent: 0, failed: 0, reason: "no_tokens" });
+  }
 
   let accessToken = await getAccessToken(serviceAccount);
-  if (!accessToken) return json({ ok: false, error: "oauth failed" });
+  if (!accessToken) {
+    console.error(`send-call-push call=${callId}: OAuth token mint failed`);
+    return json({ ok: false, error: "oauth failed" });
+  }
 
   const isVideo = effectiveCallType === "video";
   const notificationBody = isVideo ? "مكالمة فيديو واردة" : "مكالمة صوتية واردة";
 
-  // One FCM send for one FID. Returns true when FCM accepted it.
+  // One FCM send for one FID. Returns the per-FID outcome (fix 7):
+  // the caller needs the counts AND the reason, not just a boolean.
   // On a 401 from FCM the cached token is cleared and the send is
   // retried once with a fresh token. A dead (unregistered) token is
   // pruned from `push_tokens` and still counts as failed.
-  async function sendToFid(fid: string): Promise<boolean> {
+  async function sendToFid(fid: string): Promise<
+    { ok: boolean; status: number | null; error: string | null }
+  > {
     const sendOnce = async (token: string) => {
       const res = await fetch(
         `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`,
@@ -377,7 +403,7 @@ Deno.serve(async (req: Request) => {
           result = await sendOnce(freshToken);
         }
       }
-      if (result.ok) return true;
+      if (result.ok) return { ok: true, status: result.status, error: null };
       if (isUnregisteredError(result.status, result.bodyText)) {
         try {
           await supabase.from("push_tokens").delete().eq("token", fid);
@@ -391,37 +417,68 @@ Deno.serve(async (req: Request) => {
             e,
           );
         }
+        return { ok: false, status: result.status, error: "unregistered" };
       }
       console.error(
         `FCM send failed for FID ${fid.slice(0, 12)}…:`,
         result.status,
         result.bodyText,
       );
-      return false;
+      return { ok: false, status: result.status, error: `fcm_${result.status}` };
     } catch (e) {
       console.error(`FCM send error for FID ${fid.slice(0, 12)}…:`, e);
-      return false;
+      return { ok: false, status: null, error: "send_error" };
     }
   }
 
   let sent = 0;
   let failed = 0;
+  // Per-FID outcomes, returned to the caller (fix 7) so it can tell
+  // which devices were reached. FIDs are truncated to 12 chars, the
+  // same as the existing log lines — never a full token.
+  const details: Array<
+    { fid: string; ok: boolean; status: number | null; error: string | null }
+  > = [];
   // Bounded concurrency: send in chunks of 5 via Promise.allSettled
   // instead of one sequential await per FID. Counting semantics are
   // unchanged (sent/failed per FID); a rejected send counts as failed.
   for (let i = 0; i < fids.length; i += SEND_CONCURRENCY) {
     const chunk = fids.slice(i, i + SEND_CONCURRENCY);
     const results = await Promise.allSettled(chunk.map((fid) => sendToFid(fid)));
-    for (const outcome of results) {
-      if (outcome.status === "fulfilled" && outcome.value) {
-        sent++;
+    for (let j = 0; j < results.length; j++) {
+      const outcome = results[j];
+      const fid = chunk[j];
+      if (outcome.status === "fulfilled") {
+        details.push({ fid: `${fid.slice(0, 12)}…`, ...outcome.value });
+        if (outcome.value.ok) {
+          sent++;
+        } else {
+          failed++;
+        }
       } else {
         failed++;
-        if (outcome.status === "rejected") {
-          console.error("FCM send rejected:", outcome.reason);
-        }
+        console.error("FCM send rejected:", outcome.reason);
+        details.push({
+          fid: `${fid.slice(0, 12)}…`,
+          ok: false,
+          status: null,
+          error: "rejected",
+        });
       }
     }
   }
-  return json({ ok: true, sent, failed });
+  // Fix 7: log AND return the outcome on every invocation, including
+  // sent: 0 with the reason — never a bare 200 with no indication.
+  const reason = sent === 0 ? "all_failed" : undefined;
+  console.log(
+    `send-call-push call=${callId} sent=${sent} failed=${failed}` +
+      (reason ? ` reason=${reason}` : ""),
+  );
+  return json({
+    ok: true,
+    sent,
+    failed,
+    ...(reason ? { reason } : {}),
+    details,
+  });
 });
