@@ -546,5 +546,57 @@ void main() {
       ]);
       expect(targets, hasLength(2));
     });
+
+    test(
+        'legacyFallbackTarget returns the legacy entry when device wraps failed',
+        () {
+      // Fix 12: the member has valid device rows (so wrapTargets
+      // drops the legacy entry) but every device wrap failed. The
+      // fallback is the legacy per-user entry, wrapped for the
+      // profile key.
+      final devices = [
+        (deviceId: 'd1', publicKey: validKey),
+        (deviceId: 'd2', publicKey: otherValidKey),
+        (deviceId: null, publicKey: validKey),
+      ];
+      final attempted = wrapTargetsForMember(devices);
+      expect(attempted, hasLength(2)); // device rows only
+      final fallback = legacyFallbackTarget(devices, attempted);
+      expect(fallback, isNotNull);
+      expect(fallback!.deviceId, isNull);
+      expect(fallback.publicKey, validKey);
+    });
+
+    test(
+        'legacyFallbackTarget returns null when the legacy entry was already tried',
+        () {
+      // No valid device rows: wrapTargets already includes the legacy
+      // entry, so there is nothing left to fall back to.
+      final devices = [
+        (deviceId: null, publicKey: validKey),
+      ];
+      final attempted = wrapTargetsForMember(devices);
+      expect(legacyFallbackTarget(devices, attempted), isNull);
+    });
+
+    test(
+        'legacyFallbackTarget returns null when the legacy key is invalid',
+        () {
+      final devices = [
+        (deviceId: 'd1', publicKey: validKey),
+        (deviceId: null, publicKey: 'key-a'), // invalid legacy key
+      ];
+      final attempted = wrapTargetsForMember(devices);
+      expect(legacyFallbackTarget(devices, attempted), isNull);
+    });
+
+    test('legacyFallbackTarget returns null when there is no legacy entry',
+        () {
+      final devices = [
+        (deviceId: 'd1', publicKey: validKey),
+      ];
+      final attempted = wrapTargetsForMember(devices);
+      expect(legacyFallbackTarget(devices, attempted), isNull);
+    });
   });
 }
