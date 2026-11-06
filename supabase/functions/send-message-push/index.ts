@@ -268,6 +268,9 @@ Deno.serve(async (req: Request) => {
   // also guards). A system message must never ship a plaintext body to
   // FCM, even on a direct call.
   if (messageType === "system") {
+    console.log(
+      `send-message-push conversation=${conversationId} sent=0 failed=0 reason=system_message`,
+    );
     return json({ ok: true, sent: 0, failed: 0 });
   }
 
@@ -303,7 +306,12 @@ Deno.serve(async (req: Request) => {
     console.error("Failed to load conversation members:", e);
     return json({ ok: false, error: "members lookup failed" });
   }
-  if (memberIds.length === 0) return json({ ok: true, sent: 0, failed: 0 });
+  if (memberIds.length === 0) {
+    console.log(
+      `send-message-push conversation=${conversationId} sent=0 failed=0 reason=no_members`,
+    );
+    return json({ ok: true, sent: 0, failed: 0 });
+  }
 
   let fids: string[] = [];
   try {
@@ -317,10 +325,20 @@ Deno.serve(async (req: Request) => {
     console.error("Failed to load push tokens:", e);
     return json({ ok: false, error: "tokens lookup failed" });
   }
-  if (fids.length === 0) return json({ ok: true, sent: 0, failed: 0 });
+  if (fids.length === 0) {
+    console.log(
+      `send-message-push conversation=${conversationId} sent=0 failed=0 reason=no_tokens`,
+    );
+    return json({ ok: true, sent: 0, failed: 0 });
+  }
 
   let accessToken = await getAccessToken(serviceAccount);
-  if (!accessToken) return json({ ok: false, error: "oauth failed" });
+  if (!accessToken) {
+    console.error(
+      `send-message-push conversation=${conversationId}: OAuth token mint failed`,
+    );
+    return json({ ok: false, error: "oauth failed" });
+  }
 
   const notificationBody = preview(body, messageType);
 
@@ -422,5 +440,16 @@ Deno.serve(async (req: Request) => {
       }
     }
   }
+  // Observability (fix 7, same pattern as send-call-push): log the
+  // outcome on every invocation, including sent: 0 with the reason —
+  // a 200 with no indication of whether anything was sent is not
+  // diagnosable. The 20:45 test message returned 200 but the logs
+  // showed no outcome at all, so the missing notification could not
+  // be traced.
+  const reason = sent === 0 ? "all_failed" : undefined;
+  console.log(
+    `send-message-push conversation=${conversationId} sent=${sent} failed=${failed}` +
+      (reason ? ` reason=${reason}` : ""),
+  );
   return json({ ok: true, sent, failed });
 });
