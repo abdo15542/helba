@@ -8,6 +8,24 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 String normalizeEmail(String value) =>
     value.replaceAll(RegExp(r'\s+'), '').toLowerCase();
 
+/// True when [value] is a well-formed UUID (any version). Use before passing
+/// an id from a deep link, a push payload, or an RPC result into a PostgREST
+/// query: a non-UUID string makes PostgREST return 400 `22P02` and the chat
+/// screen shows "تعذر تحميل الرسائل" for a conversation that simply does not
+/// exist under that id.
+bool isValidUuid(String value) => RegExp(
+  r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+).hasMatch(value.trim());
+
+/// The trimmed [value] when it is a valid UUID, otherwise null. Accepts any
+/// dynamic (RPC results may be `null`, which `.toString()` would turn into
+/// the literal string "null").
+String? asUuidOrNull(dynamic value) {
+  if (value == null) return null;
+  final text = value.toString().trim();
+  return isValidUuid(text) ? text : null;
+}
+
 /// Friendly Arabic message for network failures; null for anything else.
 /// Supabase surfaces network failures as an AuthException whose message
 /// contains the underlying 'ClientException with SocketException...' text,

@@ -3,6 +3,7 @@ import 'dart:io' as io;
 
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -32,6 +33,26 @@ import 'deeplink.dart';
 // `push_tokens.token`, and the Edge Function sends to it with the FCM
 // HTTP v1 `message.fid` field (the `token` field is deprecated and also
 // accepts an FID during the transition, but `fid` is the current API).
+//
+// DIRECT-FID-FETCH VERDICT (finding #15, verified in the plugin source,
+// firebase_messaging 17.0.1 + firebase_messaging_platform_interface
+// 4.11.1): there is NO way to fetch the current FID directly with the
+// dependencies already in pubspec.yaml. `FirebaseMessaging.getToken()`
+// is deprecated and returns the legacy FCM registration token
+// (method_channel_messaging.dart invokes 'Messaging#getToken' and
+// returns `data['token']`) — NOT the Installation ID — so it must NOT
+// be misused as an FID. The only FID source is the `onRegistered`
+// broadcast stream, whose controller is a plain broadcast
+// StreamController with no replay: an FID posted before the Dart
+// listener attaches is dropped. A true direct fetch needs the
+// firebase_installations package (`FirebaseInstallations.instance.getId()`),
+// which requires a pubspec.yaml change the coordinator must approve —
+// pubspec.yaml is off-limits to this fix. What this file DOES do instead:
+// (a) `_pushSetupDone` is set only after successful registration and
+// reset on any failure, so setup is safely re-callable; (b) a re-entry
+// with no FID yet re-attaches the listener and re-calls `register()`;
+// (c) every FID upsert is retried with backoff and re-run on the next
+// sign-in via [retryPushTokenUpsert].
 // ---------------------------------------------------------------------------
 
 /// Android notification channel for incoming chat messages.
@@ -86,13 +107,85 @@ String buildNotificationBody(String? body, String? messageType) {
 bool isValidPushToken(String? token) =>
     token != null && token.trim().isNotEmpty;
 
+/// Local copy of the UUID check (finding F7/F8, push side): a
+/// conversation id from an FCM payload or a notification tap is only
+/// trusted for [pendingChatId] when it is a well-formed UUID. This is
+/// deliberately a duplicate of the one-line regex in utils.isValidUuid
+/// (same pattern) rather than an import, so the push and chat agents do
+/// not edit the same shared file.
+bool isValidPushConversationId(String value) => RegExp(
+  r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+).hasMatch(value.trim());
+
+/// Stable notification id for a conversation (finding #17): FNV-1a
+/// 32-bit over the conversation id's code units, masked to a positive
+/// int. Unlike `String.hashCode` it is deterministic across processes
+/// and restarts, so one conversation's banner cannot silently replace
+/// another's after a restart, and two conversations do not collide
+/// merely because their hashCodes happened to match.
+int stableNotificationId(String conversationId) {
+  var hash = 0x811c9dc5;
+  for (final unit in conversationId.codeUnits) {
+    hash ^= unit;
+    hash = (hash * 0x01000193) & 0xffffffff;
+  }
+  return hash & 0x7fffffff;
+}
+
 // ---------------------------------------------------------------------------
 // Setup: Firebase + local notifications + token registration.
 // ---------------------------------------------------------------------------
 
 final _localNotifications = FlutterLocalNotificationsPlugin();
+
+/// True only once [setupPushNotifications] has completed a successful
+/// registration (finding #15). It is deliberately NOT set before
+/// `Firebase.initializeApp()` any more, and it is reset to false in
+/// every catch path, so a failed setup is re-callable instead of a
+/// permanent no-op for the rest of the process. A re-entry while this
+/// is true but no FID has arrived yet re-runs `register()` (see below).
 bool _pushSetupDone = false;
+
+/// True once `Firebase.initializeApp()` has succeeded; initialisation
+/// itself is only attempted once per process.
+bool _firebaseInitialized = false;
+
+/// The FID received from `onRegistered`, kept in memory (finding #18,
+/// app side): [deletePushTokenOnSignOut] needs it to prune the device's
+/// `push_tokens` row, and [retryPushTokenUpsert] needs it to re-run a
+/// failed upsert on the next sign-in.
+String? _currentFid;
+
+/// An FID whose upsert has not succeeded yet (after all retries), kept
+/// so [retryPushTokenUpsert] can re-run it on the next sign-in or
+/// connectivity regain (finding #16).
+String? _pendingFid;
+
+/// The conversation currently open on screen, if any (finding #20).
+/// ChatPage sets `currentOpenConversationId.value = <its id>` when it
+/// opens and `null` when it closes; push.dart only reads it, never
+/// writes it except for this initial null. Until the chat agent wires
+/// it, foreground banners for the open chat are not suppressed — the
+/// own-message suppression below works regardless.
+final ValueNotifier<String?> currentOpenConversationId = ValueNotifier(null);
+
+/// True when the notification permission is permanently denied
+/// (finding #19). The UI layer observes this and shows a one-time
+/// prompt directing the user to app settings (via
+/// [openAppNotificationSettings]); push.dart has no BuildContext, so
+/// it exposes state instead of showing a dialog itself.
+final ValueNotifier<bool> pushNotificationsPermanentlyDenied =
+    ValueNotifier(false);
+
+/// The FID currently registered for this device, if one has arrived.
+/// Exposed for diagnostics and for the sign-out pruning path.
+String? get currentPushToken => _currentFid;
+
+/// Whether push setup has completed a successful registration.
+bool get pushSetupComplete => _pushSetupDone;
+
 StreamSubscription<String>? _registeredSubscription;
+StreamSubscription<String>? _unregisteredSubscription;
 StreamSubscription<RemoteMessage>? _onMessageSubscription;
 StreamSubscription<RemoteMessage>? _onMessageOpenedSubscription;
 
@@ -101,27 +194,52 @@ StreamSubscription<RemoteMessage>? _onMessageOpenedSubscription;
 ///
 /// Called from AuthGate once a confirmed signed-in user is present (same
 /// place CallService.startListening() is called). Never throws: if
-/// Firebase is not configured (no google-services.json yet) the whole
-/// feature silently stays disabled and the app works exactly as before.
+/// Firebase is not configured the whole feature silently stays disabled
+/// and the app works exactly as before.
+///
+/// Re-callable by design (finding #15): a failed setup resets
+/// `_pushSetupDone`, so the next sign-in retries it; a completed setup
+/// whose FID never arrived (the `onRegistered` broadcast was posted
+/// before the Dart listener attached) re-runs `register()` on re-entry
+/// to trigger the event again; a completed setup with a known FID
+/// retries any pending token upsert via [retryPushTokenUpsert].
 Future<void> setupPushNotifications() async {
-  if (_pushSetupDone) return;
-  _pushSetupDone = true;
+  if (_pushSetupDone) {
+    if (_currentFid != null) {
+      // Already registered with a known FID: only a failed upsert may
+      // still be pending — retry it (finding #16).
+      await retryPushTokenUpsert();
+      return;
+    }
+    // Registered, but the FID never arrived via onRegistered (stream
+    // race, finding #15): fall through and re-register to trigger the
+    // event again. There is no direct FID fetch in firebase_messaging
+    // 17 (see the verdict in the file header), so re-registration is
+    // the only available replay mechanism.
+    debugPrint('Helba push: setup done but no FID arrived; re-registering');
+    _pushSetupDone = false;
+  }
   try {
-    // Firebase project "Helba" (helba-379fd), created 2026-11-05. The app
-    // passes its client config explicitly, so it needs neither a
-    // google-services.json file nor the google-services Gradle plugin.
-    // These four values are public client identifiers, not secrets. If
-    // initialisation still fails for any reason, push stays disabled and
-    // nothing else breaks.
-    await Firebase.initializeApp(
-      options: const FirebaseOptions(
-        apiKey: 'AIzaSyBsJf8p3BHjQCJHU9PkFmPy87DFScWJr3k',
-        appId: '1:1097242039750:android:d9b1cfae293fad3a3e0ec7',
-        messagingSenderId: '1097242039750',
-        projectId: 'helba-379fd',
-      ),
-    );
-  } catch (_) {
+    if (!_firebaseInitialized) {
+      // Firebase project "Helba" (helba-379fd), created 2026-11-05. The app
+      // passes its client config explicitly, so it needs neither a
+      // google-services.json file nor the google-services Gradle plugin.
+      // These four values are public client identifiers, not secrets. If
+      // initialisation still fails for any reason, push stays disabled and
+      // nothing else breaks.
+      await Firebase.initializeApp(
+        options: const FirebaseOptions(
+          apiKey: 'AIzaSyBsJf8p3BHjQCJHU9PkFmPy87DFScWJr3k',
+          appId: '1:1097242039750:android:d9b1cfae293fad3a3e0ec7',
+          messagingSenderId: '1097242039750',
+          projectId: 'helba-379fd',
+        ),
+      );
+      _firebaseInitialized = true;
+    }
+  } catch (e) {
+    debugPrint('Helba push: Firebase.initializeApp failed: $e');
+    _pushSetupDone = false;
     return;
   }
   try {
@@ -130,10 +248,27 @@ Future<void> setupPushNotifications() async {
     // Subscribe before registering: register() completes the FID
     // registration and onRegistered then delivers the FID to store.
     final messaging = FirebaseMessaging.instance;
-    _registeredSubscription ??=
-        messaging.onRegistered.listen((fid) {
-      unawaited(_upsertPushToken(fid));
-    });
+    _registeredSubscription ??= messaging.onRegistered.listen(
+      (fid) {
+        _currentFid = fid;
+        unawaited(_upsertPushToken(fid));
+      },
+      onError: (Object e) {
+        debugPrint('Helba push: onRegistered stream error: $e');
+      },
+    );
+    _unregisteredSubscription ??= messaging.onUnregistered.listen(
+      (fid) {
+        // This install is no longer registered: forget the FID so the
+        // next setup re-registers instead of trusting a stale token.
+        if (_currentFid == fid) _currentFid = null;
+        _pushSetupDone = false;
+        debugPrint('Helba push: unregistered (FID $fid no longer active)');
+      },
+      onError: (Object e) {
+        debugPrint('Helba push: onUnregistered stream error: $e');
+      },
+    );
     await messaging.register();
     _onMessageSubscription ??=
         FirebaseMessaging.onMessage.listen(_showForegroundMessage);
@@ -141,10 +276,71 @@ Future<void> setupPushNotifications() async {
         .listen((message) => _openChatFromMessage(message));
     final initial = await messaging.getInitialMessage();
     if (initial != null) _openChatFromMessage(initial);
-  } catch (_) {
+    // Only now — after successful registration — is setup "done".
+    _pushSetupDone = true;
+    // If the FID already arrived synchronously via the stream, make
+    // sure its upsert is (re-)attempted even if the listener's
+    // unawaited call raced with this return.
+    await retryPushTokenUpsert();
+  } catch (e) {
     // Any later failure (permissions, registration, listeners) also just
-    // disables push; the app must never crash over notifications.
+    // disables push; the app must never crash over notifications. Reset
+    // the flag so the next sign-in / app resume retries (finding #15).
+    debugPrint('Helba push: setup failed: $e');
+    _pushSetupDone = false;
     return;
+  }
+}
+
+/// Re-runs the push-token upsert for the FID we already have, if any
+/// (finding #16). Safe to call from the auth layer on every successful
+/// sign-in and on connectivity regain: it is a no-op when there is no
+/// FID, no signed-in user, or nothing pending. Never throws.
+Future<void> retryPushTokenUpsert() async {
+  final fid = _pendingFid ?? _currentFid;
+  if (fid == null || !isValidPushToken(fid)) return;
+  if (Supabase.instance.client.auth.currentUser == null) return;
+  await _upsertPushToken(fid);
+}
+
+/// Deletes this device's `push_tokens` row on sign-out (finding #18,
+/// app side) so a signed-out device stops receiving the previous user's
+/// notifications. Best-effort: never throws, never blocks sign-out.
+/// The AUTH agent must call this BEFORE `auth.signOut()` (auth.dart
+/// owns every sign-out call site; push.dart cannot hook it itself).
+/// NOTE: the delete only succeeds if a `push_tokens` DELETE RLS policy
+/// allows the user to delete their own row — that policy is another
+/// coordinator's job. If it is missing, the delete fails silently here
+/// (logged) and the stale row remains; that is recorded, not faked.
+Future<void> deletePushTokenOnSignOut() async {
+  final fid = _currentFid;
+  if (fid == null || !isValidPushToken(fid)) return;
+  try {
+    await Supabase.instance.client
+        .from('push_tokens')
+        .delete()
+        .eq('token', fid.trim());
+    _currentFid = null;
+    _pendingFid = null;
+  } catch (e) {
+    // Best-effort: keep _currentFid so a later sign-out (or a retry)
+    // can try again. If the DELETE RLS policy is missing this will
+    // fail every time — see the note above.
+    debugPrint('Helba push: failed to delete push token on sign-out: $e');
+  }
+}
+
+/// Opens the OS app-settings screen so the user can re-enable
+/// notifications after a permanent denial (finding #19). Call it from
+/// the UI prompt that observes [pushNotificationsPermanentlyDenied].
+/// Never throws; clears the flag optimistically (the next setup run
+/// re-checks the real permission state).
+Future<void> openAppNotificationSettings() async {
+  try {
+    await openAppSettings();
+    pushNotificationsPermanentlyDenied.value = false;
+  } catch (e) {
+    debugPrint('Helba push: openAppSettings failed: $e');
   }
 }
 
@@ -155,8 +351,13 @@ Future<void> _setupLocalNotifications() async {
     settings: settings,
     onDidReceiveNotificationResponse: (response) {
       final conversationId = response.payload?.trim() ?? '';
-      if (conversationId.isNotEmpty) {
+      if (isValidPushConversationId(conversationId)) {
         pendingChatId.value = conversationId;
+      } else if (conversationId.isNotEmpty) {
+        debugPrint(
+          'Helba push: ignoring notification tap with invalid '
+          'conversation id',
+        );
       }
     },
   );
@@ -173,61 +374,117 @@ Future<void> _setupLocalNotifications() async {
   );
 }
 
+/// Requests notification permission and records the outcome (finding
+/// #19): the old code ignored the result entirely, so a permanently
+/// denied permission left push silently dead with no guidance and no
+/// log. A permanent denial sets [pushNotificationsPermanentlyDenied]
+/// so the UI can show a one-time "enable from settings" prompt.
 Future<void> _requestNotificationPermission() async {
   try {
-    await FirebaseMessaging.instance.requestPermission();
-  } catch (_) {
+    final settings = await FirebaseMessaging.instance.requestPermission();
+    debugPrint(
+      'Helba push: FCM authorizationStatus='
+      '${settings.authorizationStatus}',
+    );
+  } catch (e) {
     // FCM permission is best-effort; the local-notification permission
     // below is what actually gates the banner on Android 13+.
+    debugPrint('Helba push: FCM requestPermission failed: $e');
   }
   if (io.Platform.isAndroid) {
     try {
-      await Permission.notification.request();
-    } catch (_) {
+      final status = await Permission.notification.request();
+      debugPrint('Helba push: notification permission=$status');
+      if (status.isPermanentlyDenied) {
+        pushNotificationsPermanentlyDenied.value = true;
+      } else if (status.isGranted) {
+        pushNotificationsPermanentlyDenied.value = false;
+      }
+    } catch (e) {
       // A denied notification permission just means no banners; the app
       // still works, and the user can enable it later from settings.
+      debugPrint('Helba push: notification permission request failed: $e');
     }
   }
 }
 
 /// Stores [fid] (this install's Firebase Installation ID) for the
-/// current user (insert or refresh updated_at on conflict). Best-effort:
-/// a failed upsert never throws.
+/// current user (insert or refresh updated_at on conflict). Retried
+/// with backoff (finding #16): 3 attempts, ~1s / ~3s / ~8s apart, so a
+/// network blip at sign-in no longer leaves the device unregistered
+/// until the next restart. If all attempts fail, the FID is kept in
+/// [_pendingFid] for [retryPushTokenUpsert] on the next sign-in.
+/// Best-effort: a failed upsert never throws.
 Future<void> _upsertPushToken(String fid) async {
   final userId = Supabase.instance.client.auth.currentUser?.id;
   if (userId == null || !isValidPushToken(fid)) return;
-  try {
-    await Supabase.instance.client.from('push_tokens').upsert(
-      {
-        'user_id': userId,
-        'token': fid.trim(),
-        'platform': 'android',
-        'updated_at': DateTime.now().toUtc().toIso8601String(),
-      },
-      onConflict: 'user_id,token',
-    );
-  } catch (_) {
-    // The token table (migration 011) may not be applied yet; push just
-    // does not register until it is.
+  const delays = [
+    Duration(seconds: 1),
+    Duration(seconds: 3),
+    Duration(seconds: 8),
+  ];
+  for (var attempt = 0; attempt < 3; attempt++) {
+    try {
+      await Supabase.instance.client.from('push_tokens').upsert(
+        {
+          'user_id': userId,
+          'token': fid.trim(),
+          'platform': 'android',
+          'updated_at': DateTime.now().toUtc().toIso8601String(),
+        },
+        onConflict: 'user_id,token',
+      );
+      _currentFid = fid.trim();
+      _pendingFid = null;
+      return;
+    } catch (e) {
+      // The token table (migration 011) may not be applied yet, or the
+      // network blipped; log (no PII — only the attempt number) and
+      // retry, instead of silently giving up (finding #16/#19).
+      debugPrint('Helba push: token upsert attempt ${attempt + 1}/3 failed: $e');
+      if (attempt < 2) {
+        await Future.delayed(delays[attempt]);
+      }
+    }
   }
+  _pendingFid = fid.trim();
+  debugPrint('Helba push: token upsert failed after 3 attempts; will retry '
+      'on next sign-in');
 }
 
 /// Shows a foreground FCM message as a local notification. The Edge
 /// Function already sends title = sender name and body = preview, so the
 /// notification fields are used as-is; the data payload is only trusted
 /// for the conversation id (re-parsed through the chat deep-link rules).
+///
+/// Suppressed (finding #20) when the message is the user's own (same
+/// account on a second device — the server-side sender exclusion only
+/// covers the trigger path) or when that conversation is currently open
+/// on screen ([currentOpenConversationId], set by ChatPage). The
+/// notification id is the stable [stableNotificationId] (finding #17),
+/// not `conversationId.hashCode`.
 Future<void> _showForegroundMessage(RemoteMessage message) async {
   try {
     final data = message.data;
     final conversationId = data['conversation_id']?.toString().trim() ?? '';
-    if (conversationId.isEmpty) return;
+    if (!isValidPushConversationId(conversationId)) return;
+    final senderId = data['sender_id']?.toString().trim() ?? '';
+    final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+    if (senderId.isNotEmpty &&
+        currentUserId != null &&
+        senderId == currentUserId) {
+      return;
+    }
+    if (currentOpenConversationId.value == conversationId) {
+      return;
+    }
     final title = buildNotificationTitle(message.notification?.title);
     final body = buildNotificationBody(
       message.notification?.body ?? data['body']?.toString(),
       data['message_type']?.toString(),
     );
     await _localNotifications.show(
-      id: conversationId.hashCode & 0x7fffffff,
+      id: stableNotificationId(conversationId),
       title: title,
       body: body,
       notificationDetails: const NotificationDetails(
@@ -240,17 +497,25 @@ Future<void> _showForegroundMessage(RemoteMessage message) async {
       ),
       payload: conversationId,
     );
-  } catch (_) {
+  } catch (e) {
     // A failed banner must never crash the app.
+    debugPrint('Helba push: failed to show foreground message: $e');
   }
 }
 
 /// A notification tap (or a cold start from one) opens the chat. This
 /// only sets pendingChatId; AuthGate owns the actual navigation (see
 /// auth.dart), so the tap path and the `helba://chat/<id>` link share one
-/// navigation handler.
+/// navigation handler. The id is only trusted when it is a well-formed
+/// UUID (finding F7/F8).
 void _openChatFromMessage(RemoteMessage message) {
   final conversationId =
       message.data['conversation_id']?.toString().trim() ?? '';
-  if (conversationId.isNotEmpty) pendingChatId.value = conversationId;
+  if (isValidPushConversationId(conversationId)) {
+    pendingChatId.value = conversationId;
+  } else if (conversationId.isNotEmpty) {
+    debugPrint(
+      'Helba push: ignoring notification tap with invalid conversation id',
+    );
+  }
 }

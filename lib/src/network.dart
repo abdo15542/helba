@@ -101,36 +101,76 @@ Future<io.Socket> connectToFirstIp(
 /// Cloudflare anycast IPs are stable for long periods, and every successful
 /// DoH resolution refreshes the secure-storage cache below, so the seeds
 /// only matter on a network where DoH is blocked too.
-const Map<String, List<String>> seedIps = {
+///
+/// NOT const: the key is [supabaseHost], derived at runtime from the
+/// effective Supabase URL (config.dart, B12), so the map is built once
+/// at startup from that single source of truth.
+final Map<String, List<String>> seedIps = {
   supabaseHost: ['104.18.38.10', '172.64.149.246'],
 };
 
-/// Persisted copy of the last IPs DoH resolved for a host, so a later
-/// launch on a network where DoH is blocked can still dial the last
-/// known-good addresses instead of failing outright.
-Future<List<String>?> _readCachedIps(String host) async {
+/// How long a persisted cache entry is trusted: DoH-resolved addresses
+/// for 7 days; seed addresses (never DoH-resolved, see [decodeCachedDohEntry])
+/// for only 6 hours, so a stale seed can never masquerade as a fresh
+/// resolution (M21).
+const Duration _resolvedCacheTtl = Duration(days: 7);
+const Duration _seedCacheTtl = Duration(hours: 6);
+
+/// Decode one persisted DoH cache entry (the JSON written by
+/// [_writeCachedIps]). Returns the IPs plus whether they are seed
+/// addresses, or null when the entry is malformed or expired.
+///
+/// Pure function (takes [now] explicitly) so the TTL rules are
+/// unit-testable. Entries written before the `seed` marker existed
+/// decode as `seed: false` (they were written only by live DoH).
+({List<String> ips, bool seed})? decodeCachedDohEntry(
+  String raw,
+  DateTime now,
+) {
   try {
-    final raw = await secureStore.read(key: 'helba_doh_ips_$host');
-    if (raw == null) return null;
     final decoded = jsonDecode(raw) as Map<String, dynamic>;
     final at = DateTime.tryParse(decoded['at']?.toString() ?? '');
-    if (at == null ||
-        DateTime.now().difference(at) > const Duration(days: 7)) {
-      return null;
-    }
     final ips = decoded['ips'];
-    if (ips is! List || ips.isEmpty) return null;
-    return ips.map((e) => e.toString()).toList();
+    if (at == null || ips is! List || ips.isEmpty) return null;
+    final seed = decoded['seed'] == true;
+    final ttl = seed ? _seedCacheTtl : _resolvedCacheTtl;
+    if (now.difference(at) > ttl) return null;
+    return (ips: ips.map((e) => e.toString()).toList(), seed: seed);
   } catch (_) {
     return null;
   }
 }
 
-Future<void> _writeCachedIps(String host, List<String> ips) async {
+/// Persisted copy of the last IPs DoH resolved for a host, so a later
+/// launch on a network where DoH is blocked can still dial the last
+/// known-good addresses instead of failing outright.
+Future<({List<String> ips, bool seed})?> _readCachedIps(
+  String host,
+) async {
+  try {
+    final raw = await secureStore.read(key: 'helba_doh_ips_$host');
+    if (raw == null) return null;
+    return decodeCachedDohEntry(raw, DateTime.now());
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<void> _writeCachedIps(
+  String host,
+  List<String> ips, {
+  bool seed = false,
+}) async {
   try {
     await secureStore.write(
       key: 'helba_doh_ips_$host',
-      value: jsonEncode({'ips': ips, 'at': DateTime.now().toIso8601String()}),
+      value: jsonEncode({
+        'ips': ips,
+        'at': DateTime.now().toIso8601String(),
+        // Seed addresses are NOT DoH-resolved: mark them so they are
+        // only ever a last resort, with the short TTL above (M21).
+        'seed': seed,
+      }),
     );
   } catch (_) {
     // A failed cache write must never break the connection itself.
@@ -139,6 +179,48 @@ Future<void> _writeCachedIps(String host, List<String> ips) async {
 
 final Map<String, ({List<String> ips, DateTime at})> _dohCache = {};
 io.HttpClient? _dohClient;
+
+/// Close the shared DNS-over-HTTPS [io.HttpClient], releasing its
+/// sockets. Call it when the app detaches (e.g. from the root widget's
+/// [WidgetsBindingObserver.didChangeAppLifecycleState] on `detached`,
+/// or from `main()`'s teardown path) — the client is lazily recreated
+/// by [resolveViaDoh] on the next resolution, so closing it is always
+/// safe. (M29: previously the shared client was never closed.)
+/// NOTE: this lives in network.dart because main.dart owns the call
+/// site; see the coordinator report for the exact wiring.
+void closeDohClient() {
+  _dohClient?.close();
+  _dohClient = null;
+}
+
+/// Validate one decoded DNS-over-HTTPS JSON response. Returns null when
+/// the response is a usable answer (HTTP 200, DoH `Status` 0, at least
+/// one A record), otherwise a human-readable reason the answer must be
+/// rejected. Pure function, so the empty-answer rules are unit-testable.
+///
+/// A DoH provider answers NXDOMAIN/SERVFAIL with HTTP 200 and
+/// `Status: 3` (or 2) and no `Answer` section — without this check an
+/// empty answer looked like success and the caller was left with the
+/// useless "last error: null" (M20).
+String? dohErrorForResponse({
+  required int statusCode,
+  required Map<String, dynamic> json,
+  required String provider,
+  required String host,
+}) {
+  if (statusCode != 200) {
+    return 'DoH $provider returned HTTP $statusCode for $host';
+  }
+  final dohStatus = json['Status'];
+  if (dohStatus is int && dohStatus != 0) {
+    return 'DoH $provider returned Status $dohStatus for $host '
+        '(no usable answer: 2 = SERVFAIL, 3 = NXDOMAIN)';
+  }
+  if (parseDohAnswers(json).isEmpty) {
+    return 'DoH $provider returned no A records for $host';
+  }
+  return null;
+}
 
 /// Resolve [host] via DNS-over-HTTPS (Google first, Cloudflare second).
 /// Results are cached in memory for 5 minutes and persisted for 7 days.
@@ -165,7 +247,22 @@ Future<List<String>> resolveViaDoh(String host) async {
           .transform(utf8.decoder)
           .join()
           .timeout(const Duration(seconds: 4));
-      final ips = parseDohAnswers(jsonDecode(body) as Map<String, dynamic>);
+      final decoded = jsonDecode(body) as Map<String, dynamic>;
+      // M20: a non-200 status, a non-zero DoH Status (NXDOMAIN/SERVFAIL),
+      // or an empty Answer section is a failed resolution, not a success
+      // with zero addresses — record the reason so the caller never ends
+      // up with the useless "last error: null".
+      final answerError = dohErrorForResponse(
+        statusCode: response.statusCode,
+        json: decoded,
+        provider: base,
+        host: host,
+      );
+      if (answerError != null) {
+        lastError = io.SocketException(answerError);
+        continue;
+      }
+      final ips = parseDohAnswers(decoded);
       if (ips.isNotEmpty) {
         _dohCache[host] = (ips: ips, at: DateTime.now());
         await _writeCachedIps(host, ips);
@@ -183,7 +280,60 @@ Future<List<String>> resolveViaDoh(String host) async {
   );
 }
 
+/// Complete with the first [attempts] future that succeeds; if every
+/// attempt fails, complete with the last error. Unlike [Future.any],
+/// a fast failure does NOT cancel the race — the other attempts still
+/// get their chance. A socket that wins after another attempt already
+/// won is destroyed so it cannot leak.
+Future<io.Socket> _firstSuccess(List<Future<io.Socket>> attempts) async {
+  final completer = Completer<io.Socket>();
+  var remaining = attempts.length;
+  Object? lastError;
+  for (final attempt in attempts) {
+    attempt.then(
+      (socket) {
+        if (completer.isCompleted) {
+          socket.destroy();
+        } else {
+          completer.complete(socket);
+        }
+      },
+      onError: (Object e) {
+        lastError = e;
+        remaining--;
+        if (remaining == 0 && !completer.isCompleted) {
+          completer.completeError(lastError!);
+        }
+      },
+    );
+  }
+  return completer.future;
+}
+
+/// Overall budget for the whole Supabase fallback chain in
+/// [openSocketForUrl]: the old chain could burn ~60s+ per request
+/// (system DNS 8s, cached IPs, DoH ~12s per provider, DoH connect,
+/// seeds). The caller (HttpClient) gets a failure after this long
+/// instead of hanging the login spinner indefinitely (B17).
+const Duration openSocketOverallTimeout = Duration(seconds: 20);
+
 Future<io.Socket> openSocketForUrl(Uri url) async {
+  // onTimeout (not a catch on TimeoutException): an inner step's own
+  // timeout must never be mislabelled as the overall budget expiring.
+  // NOTE: the inner attempts keep running briefly in the background
+  // (Dart has no cancellation); a late winner is destroyed by
+  // _firstSuccess, and a late plain connect is left to finish harmlessly.
+  return _openSocketForUrlInner(url).timeout(
+    openSocketOverallTimeout,
+    onTimeout: () => throw io.SocketException(
+      'Timed out after ${openSocketOverallTimeout.inSeconds}s while '
+      'reaching ${url.host} (system DNS, DoH and seed fallbacks did not '
+      'answer in time)',
+    ),
+  );
+}
+
+Future<io.Socket> _openSocketForUrlInner(Uri url) async {
   final host = url.host;
   final port = url.hasPort ? url.port : (url.scheme == 'https' ? 443 : 80);
   final bootstrap = _dohBootstrapIps[host];
@@ -194,7 +344,11 @@ Future<io.Socket> openSocketForUrl(Uri url) async {
         timeout: const Duration(seconds: 3));
   }
   if (!needsDohFallback(host)) {
-    return io.Socket.connect(host, port);
+    // B18: previously this had no timeout at all — only the TLS
+    // handshake in _connectSecurely was bounded, so a blackholed TCP
+    // connect to a non-Supabase host could hang indefinitely.
+    return io.Socket.connect(host, port)
+        .timeout(const Duration(seconds: 10));
   }
   // 1. The system resolver first — it works on most networks.
   Object? firstError;
@@ -204,39 +358,51 @@ Future<io.Socket> openSocketForUrl(Uri url) async {
   } catch (e) {
     firstError = e;
   }
-  // 2. IPs resolved earlier and stored on the device (fast path for a
-  // repeat launch on a network where DNS-over-HTTPS is blocked).
+  // 2. Live DoH and the persisted cache race each other (B17/M21):
+  // live DoH is tried FIRST in effect — a stale 7-day cache entry is
+  // never allowed to delay a fresh resolution. The cache gets only a
+  // 1–2s head start: whichever answers first wins. Seed-marked cache
+  // entries are excluded here; they are a last resort (step 3).
   final cached = await _readCachedIps(host);
-  if (cached != null) {
-    try {
-      return await connectToFirstIp(cached, port,
-          timeout: const Duration(seconds: 4));
-    } catch (_) {
-      // Stale cache entry; keep falling through to live resolution.
-    }
+  final cachedResolved =
+      (cached != null && !cached.seed) ? cached.ips : null;
+  Future<io.Socket> liveDohAttempt() async {
+    final ips = await resolveViaDoh(host);
+    return connectToFirstIp(ips, port);
   }
-  // 3. Resolve over HTTPS (Google, then Cloudflare).
+
+  Future<io.Socket> cachedAttempt() async {
+    if (cachedResolved == null) {
+      throw io.SocketException('No cached IPs for $host');
+    }
+    return connectToFirstIp(cachedResolved, port,
+        timeout: const Duration(seconds: 2));
+  }
+
   Object? dohError;
   try {
-    final ips = await resolveViaDoh(host);
-    return await connectToFirstIp(ips, port);
+    return await _firstSuccess([liveDohAttempt(), cachedAttempt()]);
   } catch (e) {
-    // Both providers failed; the seed addresses are the last resort.
+    // Both live DoH and the cache failed; seeds are the last resort.
     dohError = e;
   }
-  // 4. The host's own Cloudflare edge IPs (see seedIps). The phone's
-  // browser proves these are reachable even where the DNS-server IPs
-  // that DoH bootstraps from are blocked.
-  final seed = seedIps[host];
+  // 3. Seed addresses, in order: persisted seed cache entries first
+  // (short TTL, seed-marked), then the hardcoded [seedIps].
+  // M21: seeds are NEVER written back as if DoH-resolved — they are
+  // persisted with seed: true and the short TTL, so they stay a last
+  // resort and can never outrank a fresh DoH answer.
   Object? seedError;
-  if (seed != null) {
+  final seedAttempts = <List<String>>[];
+  if (cached != null && cached.seed) seedAttempts.add(cached.ips);
+  final seed = seedIps[host];
+  if (seed != null) seedAttempts.add(seed);
+  for (final seedIpsToTry in seedAttempts) {
     try {
-      final socket = await connectToFirstIp(seed, port,
+      final socket = await connectToFirstIp(seedIpsToTry, port,
           timeout: const Duration(seconds: 4));
-      await _writeCachedIps(host, seed);
+      await _writeCachedIps(host, seedIpsToTry, seed: true);
       return socket;
     } catch (e) {
-      // Nothing left to try; report every failure below.
       seedError = e;
     }
   }
@@ -279,6 +445,67 @@ Future<io.Socket> _connectSecurely(Uri url) async {
   }
 }
 
+/// True for loopback destinations (M22): a system proxy must never be
+/// used for them — the proxy cannot reach the device itself, and routing
+/// local traffic out to a proxy breaks on-device servers and tests.
+bool isLoopbackHost(String host) {
+  final h = host.toLowerCase();
+  return h == 'localhost' ||
+      h == '127.0.0.1' ||
+      h == '::1' ||
+      h == '[::1]';
+}
+
+/// True when [e] looks like a DNS failure ("Failed host lookup") rather
+/// than a refused/timed-out TCP connect. Only a DNS-looking failure is
+/// worth retrying via DoH: retrying a refused proxy over DoH would just
+/// dial the same unreachable proxy a second time.
+bool _looksLikeDnsFailure(Object e) =>
+    e.toString().contains('Failed host lookup');
+
+/// Dial a proxy host, falling back to DNS-over-HTTPS when the system
+/// resolver cannot resolve the proxy's hostname (M22). The proxy host
+/// is usually a LAN address (direct connect succeeds), so the DoH path
+/// only runs on a DNS-looking failure, bounded to ~10s.
+Future<io.Socket> _connectToProxy(String proxyHost, int proxyPort) async {
+  Object? directError;
+  try {
+    return await io.Socket.connect(proxyHost, proxyPort)
+        .timeout(const Duration(seconds: 10));
+  } catch (e) {
+    directError = e;
+    if (!_looksLikeDnsFailure(e)) rethrow;
+  }
+  try {
+    final ips = await resolveViaDoh(proxyHost)
+        .timeout(const Duration(seconds: 10));
+    return await connectToFirstIp(ips, proxyPort,
+        timeout: const Duration(seconds: 4));
+  } catch (e) {
+    throw io.SocketException(
+      'Could not reach proxy $proxyHost:$proxyPort: direct ($directError); '
+      'DoH fallback ($e)',
+    );
+  }
+}
+
+/// HTTP overrides routing Supabase traffic through the DoH fallback.
+///
+/// F59 (VERIFIED — see the review report for the full evidence):
+/// `WebSocket.connect` DOES honour these overrides in this Dart SDK
+/// (3.13.7). `dart:_http/websocket_impl.dart:1310` keeps a single
+/// lazily-initialised `static final HttpClient _httpClient = HttpClient();`
+/// and `connect()` (line 1312) uses `(customClient ?? _httpClient)`; the
+/// `HttpClient()` factory (`http.dart:1348-1353`) consults
+/// `HttpOverrides.current` at construction time, and main.dart sets
+/// `HttpOverrides.global` before any Supabase/Realtime use, so the
+/// lazily-created static client is built by [createHttpClient] below.
+/// The chain is: realtime_client `createWebSocketClient`
+/// (`websocket_io.dart`) → `IOWebSocketChannel.connect` (no customClient)
+/// → `WebSocket.connect` → this connectionFactory → [_connectSecurely]
+/// → [openSocketForUrl] (DoH fallback + TLS). No custom Realtime
+/// transport is needed; `RealtimeClientOptions.transport` exists as a
+/// fallback if that ever changes.
 class HelbaHttpOverrides extends io.HttpOverrides {
   @override
   io.HttpClient createHttpClient(io.SecurityContext? context) {
@@ -290,27 +517,35 @@ class HelbaHttpOverrides extends io.HttpOverrides {
     // When the phone has a system proxy (WiFi/APN), route every request
     // through it like the browser does. When there is none, leave the
     // default (environment proxy, if any) untouched.
+    // NOTE (M22, startup part): [_systemProxy] is still loaded once at
+    // startup by loadSystemProxy(); re-reading it on connectivity
+    // changes is a main.dart concern and is NOT done here — this file
+    // must not touch main.dart.
     if (_systemProxy != null) {
       client.findProxy = (_) => 'PROXY $_systemProxy';
     }
     client.connectionFactory =
         (Uri url, String? proxyHost, int? proxyPort) async {
-      if (proxyHost != null) {
+      if (proxyHost != null && !isLoopbackHost(url.host)) {
         // A proxy is configured (e.g. a sandbox or corporate network):
         // dial the proxy and let HttpClient perform the CONNECT tunnel and
-        // the TLS upgrade itself, as usual. The proxy resolves the host,
-        // so the DoH fallback below does not apply.
+        // the TLS upgrade itself, as usual. The proxy resolves the
+        // target host, so the DoH fallback for the target does not apply
+        // — but the PROXY host itself is resolved via DoH when the
+        // system resolver fails for it (see _connectToProxy).
+        // The 8080 default applies only when proxyPort is genuinely
+        // absent (HttpClient passes null then); a configured port is
+        // always honoured.
         try {
           return io.ConnectionTask.fromSocket(
-              io.Socket.connect(proxyHost, proxyPort ?? 8080)
-                  .timeout(const Duration(seconds: 10)),
-              () {});
+              _connectToProxy(proxyHost, proxyPort ?? 8080), () {});
         } catch (e) {
           throw io.SocketException(
               'Could not reach proxy $proxyHost:${proxyPort ?? 8080}: $e');
         }
       }
-      // No proxy: connect directly and upgrade to TLS ourselves (see
+      // No proxy (or a loopback destination, which bypasses the proxy):
+      // connect directly and upgrade to TLS ourselves (see
       // _connectSecurely — HttpClient will not do it for us).
       return io.ConnectionTask.fromSocket(_connectSecurely(url), () {});
     };

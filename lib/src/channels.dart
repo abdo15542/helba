@@ -59,6 +59,27 @@ List<Map<String, dynamic>> joinableChannels(
   }).toList();
 }
 
+/// Server-provided member count for a channel row, when present.
+/// Provided by the get_public_channels() RPC (backend-owned); the plain
+/// conversations select has no such column, so this is a defensive read
+/// that returns null when the field is absent — never a made-up number.
+int? channelMemberCount(Map<String, dynamic> row) {
+  final count = row['member_count'];
+  if (count is num) return count.toInt();
+  return null;
+}
+
+/// Arabic member-count label, or null when the count is unknown.
+/// Callers must omit the count text entirely when this is null: the
+/// embedded conversation_members list is RLS-filtered to empty for
+/// non-members, so its length is NOT a member count (it used to render
+/// a bogus "0 عضو" for every channel).
+String? channelMemberCountLabel(Map<String, dynamic> row) {
+  final count = channelMemberCount(row);
+  if (count == null) return null;
+  return '$count عضو';
+}
+
 // ---------------------------------------------------------------------------
 // Loading.
 // ---------------------------------------------------------------------------
@@ -104,6 +125,11 @@ class _ChannelDirectorySheetState extends State<ChannelDirectorySheet> {
     _channelsFuture = loadPublicChannels();
   }
 
+  void _reloadChannels() {
+    if (!mounted) return;
+    setState(() => _channelsFuture = loadPublicChannels());
+  }
+
   Future<void> _join(Map<String, dynamic> channel) async {
     if (_joining) return;
     setState(() {
@@ -116,12 +142,18 @@ class _ChannelDirectorySheetState extends State<ChannelDirectorySheet> {
       final title = channel['title']?.toString().trim().isNotEmpty == true
           ? channel['title'].toString()
           : 'قناة';
-      Navigator.pop(context);
-      Navigator.push(
-          context,
-          MaterialPageRoute(
-              builder: (_) => ChatPage(
-                  conversationId: id, title: title, kind: 'channel')));
+      // Capture the navigator before popping: the sheet's context is
+      // unmounted by the pop, so it must not be used for the push.
+      final nav = Navigator.of(context);
+      nav.pop();
+      nav.push(MaterialPageRoute(
+          builder: (_) => ChatPage(
+              conversationId: id,
+              title: title,
+              kind: 'channel',
+              // A joiner is a plain member, never an admin: the
+              // ChatPage default is admin, so pass false explicitly.
+              isAdmin: false)));
     } catch (_) {
       if (mounted) {
         setState(() => _error = 'تعذر الانضمام إلى القناة. تحقق من الاتصال.');
@@ -156,9 +188,20 @@ class _ChannelDirectorySheetState extends State<ChannelDirectorySheet> {
                     child: CircularProgressIndicator());
               }
               if (snap.hasError) {
-                return const Padding(
-                    padding: EdgeInsets.all(16),
-                    child: Text('تعذر تحميل القنوات العامة.'));
+                return Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text('تعذر تحميل القنوات العامة.'),
+                      const SizedBox(height: 8),
+                      FilledButton(
+                        onPressed: _reloadChannels,
+                        child: const Text('إعادة المحاولة'),
+                      ),
+                    ],
+                  ),
+                );
               }
               final joinable = joinableChannels(snap.data ?? [], myUserId);
               if (joinable.isEmpty) {
@@ -169,19 +212,20 @@ class _ChannelDirectorySheetState extends State<ChannelDirectorySheet> {
               return ListView(
                   shrinkWrap: true,
                   children: joinable.map((channel) {
-                    final members =
-                        channel['conversation_members'] as List<dynamic>? ??
-                            [];
                     final title =
                         channel['title']?.toString().trim().isNotEmpty == true
                             ? channel['title'].toString()
                             : 'قناة';
+                    // Show a count only when the server provided one;
+                    // otherwise omit it entirely (never "0 عضو").
+                    final countLabel = channelMemberCountLabel(channel);
                     return ListTile(
                       leading: const CircleAvatar(
                           child: Icon(Icons.campaign_rounded)),
                       title: Text(title,
                           style: const TextStyle(fontWeight: FontWeight.bold)),
-                      subtitle: Text('${members.length} عضو'),
+                      subtitle:
+                          countLabel == null ? null : Text(countLabel),
                       trailing: FilledButton(
                         onPressed: _joining ? null : () => _join(channel),
                         child: const Text('انضمام'),

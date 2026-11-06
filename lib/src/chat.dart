@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io' as io;
 
 import 'package:file_picker/file_picker.dart';
@@ -11,6 +12,35 @@ import 'calls.dart';
 import 'channels.dart';
 import 'config.dart';
 import 'e2ee.dart';
+import 'push.dart';
+import 'utils.dart';
+
+// ---------------------------------------------------------------------------
+// Pure helpers (unit-tested in test/chat_inbox_helpers_test.dart).
+// ---------------------------------------------------------------------------
+
+/// Timestamp for a chat message: HH:mm when the message is from today,
+/// otherwise the date plus the time, so yesterday's messages are not
+/// confused with today's.
+String formatChatTime(DateTime time, {DateTime? now}) {
+  final local = time.toLocal();
+  final reference = (now ?? DateTime.now()).toLocal();
+  final sameDay = local.year == reference.year &&
+      local.month == reference.month &&
+      local.day == reference.day;
+  if (sameDay) return DateFormat('HH:mm').format(local);
+  return DateFormat('yyyy-MM-dd HH:mm').format(local);
+}
+
+/// True when an encrypted row is missing the ciphertext or the nonce it
+/// needs to be decrypted at all. Such rows are malformed, not merely
+/// undecryptable, and must never be permanently marked "decrypt failed".
+bool isMalformedEncryptedRow(Map<String, dynamic> row) {
+  if (!isEncryptedMessage(row)) return false;
+  final ciphertext = row['ciphertext']?.toString() ?? '';
+  final nonce = row['nonce']?.toString() ?? '';
+  return ciphertext.isEmpty || nonce.isEmpty;
+}
 
 class ChatPage extends StatefulWidget {
   final String conversationId, title;
@@ -21,7 +51,7 @@ class ChatPage extends StatefulWidget {
       required this.conversationId,
       required this.title,
       this.kind = 'direct',
-      this.isAdmin = true});
+      this.isAdmin = false});
   @override
   State<ChatPage> createState() => _ChatPageState();
 }
@@ -35,11 +65,24 @@ class _ChatPageState extends State<ChatPage> {
 
   // The message stream must live in state: building it inside build() made
   // every rebuild (each send, each parent rebuild) resubscribe and flash
-  // the list with a loading spinner.
-  late final Stream<List<Map<String, dynamic>>> _messagesStream;
+  // the list with a loading spinner. It is nullable so an invalid
+  // conversation id can show a "not found" state instead of a stream
+  // that immediately fails with a PostgREST 400.
+  Stream<List<Map<String, dynamic>>>? _messagesStream;
+  bool _validConversationId = false;
+
+  // One-off plain-select fallback for a Realtime-only stream failure:
+  // the rows are shown with a "live updates disconnected" hint instead
+  // of a full error screen.
+  List<Map<String, dynamic>>? _fallbackRows;
+  bool _fallbackLoading = false;
+
   Map<String, String> _memberNames = {};
   final Set<String> _memberIds = {};
   bool _isGroup = false;
+  bool _membersLoaded = false;
+  bool _membersLoading = true;
+  bool _membersError = false;
 
   // E2E encryption state (see lib/src/e2ee.dart for the honest limits).
   // Members' public keys, keyed by user id; null/empty means "no key yet".
@@ -48,35 +91,121 @@ class _ChatPageState extends State<ChatPage> {
   final Map<String, String> _decrypted = {};
   final Set<String> _decrypting = {};
   final Set<String> _decryptFailed = {};
+  // Encrypted rows that cannot be decrypted because ciphertext/nonce
+  // is missing (malformed), shown as "رسالة تالفة" — never in
+  // _decryptFailed, so a later key load does not mislabel them.
+  final Set<String> _malformedIds = {};
   List<int>? _conversationKey;
+  // True ONLY once a non-null key has actually been loaded. A null key
+  // must not set this, otherwise the key load never retries.
   bool _conversationKeyLoaded = false;
   bool _keyLoading = false;
   bool _decryptRunning = false;
+  // Bounded key-load retry: at most one retry per ~10s, triggered by new
+  // stream data — never a hot loop.
+  DateTime? _lastKeyRetryAt;
+  // Last rows seen, so a key that loads late can re-run decryption.
+  List<Map<String, dynamic>> _lastRows = [];
+  Set<String> _lastEncryptedIds = {};
+
+  // Double-tap guard for _startCall (the service-level guard is in
+  // calls.dart, not here).
+  bool _startingCall = false;
+
+  // Mute state, cached per ChatPage session (F42). Loaded once in
+  // initState; a missing muted_until column (backend migration not yet
+  // applied) is treated as "not muted", never a crash.
+  DateTime? _mutedUntil;
+  bool _mutedLoaded = false;
+
+  // One-time-per-session plaintext-downgrade warning (B-12).
+  bool _plaintextDowngradeWarned = false;
+
+  Stream<List<Map<String, dynamic>>> _buildMessagesStream() =>
+      client.from('messages').stream(primaryKey: ['id']).eq(
+          'conversation_id', widget.conversationId).order('created_at',
+          ascending: true).limit(200);
 
   @override
   void initState() {
     super.initState();
-    _messagesStream = client.from('messages').stream(primaryKey: ['id'])
-      .eq('conversation_id', widget.conversationId).order('created_at');
-    _loadMembers();
-    _ensureConversationKey();
+    // Suppress foreground push banners for this conversation while it is
+    // open (push.dart reads this; cleared in dispose()).
+    currentOpenConversationId.value = widget.conversationId;
+    _validConversationId = isValidUuid(widget.conversationId);
+    if (_validConversationId) {
+      _messagesStream = _buildMessagesStream();
+    }
+    // Members first, THEN the key: the key must be wrapped for the
+    // members we actually know about, not just for the creator.
+    _initChat();
+    _loadMutedUntil();
+  }
+
+  Future<void> _initChat() async {
+    await _loadMembers();
+    if (!mounted) return;
+    await _ensureConversationKey();
+  }
+
+  /// Recreates the message stream after a terminal stream error, and
+  /// clears any plain-select fallback so live updates take over again.
+  void _retryMessages() {
+    if (!_validConversationId) return;
+    setState(() {
+      _messagesStream = _buildMessagesStream();
+      _fallbackRows = null;
+      _fallbackLoading = false;
+    });
+  }
+
+  /// Plain-select fallback: used only when the Realtime stream has
+  /// errored. Shows the messages with a "live updates disconnected"
+  /// hint instead of a full error screen.
+  Future<void> _loadFallbackMessages() async {
+    if (_fallbackLoading || !_validConversationId) return;
+    _fallbackLoading = true;
+    try {
+      final rows = await client
+          .from('messages')
+          .select()
+          .eq('conversation_id', widget.conversationId)
+          .order('created_at', ascending: true)
+          .limit(200)
+          .timeout(const Duration(seconds: 15));
+      if (!mounted) return;
+      setState(() {
+        _fallbackRows = rows.cast<Map<String, dynamic>>();
+      });
+    } catch (_) {
+      // Stay on the error screen; the retry button is still there.
+    } finally {
+      _fallbackLoading = false;
+    }
   }
 
   /// Member display names, so group messages show who wrote them.
   /// Also loads members' E2E public keys. The public_key select fails
   /// when migration 012 has not been applied yet (unknown column), so
   /// fall back to the old select — names must keep working either way.
-  Future<void> _loadMembers() async {
+  /// On failure the error is surfaced (snackbar + retry affordance in
+  /// the AppBar/body) instead of swallowed: with no members, call
+  /// buttons and the report menu would silently disappear and sends
+  /// would go plaintext with no warning.
+  Future<void> _loadMembers({bool silent = false}) async {
+    if (mounted) setState(() => _membersLoading = true);
     try {
       List rows;
       try {
         rows = await client.from('conversation_members')
           .select('user_id,profiles(display_name,username,public_key)')
-          .eq('conversation_id', widget.conversationId);
+          .eq('conversation_id', widget.conversationId)
+          .timeout(const Duration(seconds: 15));
       } catch (_) {
         rows = await client.from('conversation_members')
           .select('user_id,profiles(display_name,username)')
-          .eq('conversation_id', widget.conversationId);
+          .eq('conversation_id', widget.conversationId)
+          .timeout(const Duration(seconds: 15));
       }
       final names = <String, String>{};
       final ids = <String>{};
@@ -102,19 +231,51 @@ class _ChatPageState extends State<ChatPage> {
             ..clear()
             ..addAll(ids);
           _memberPublicKeys = keys;
-          _isGroup = names.length > 2;
+          // Group = more than two member ids, not more than two
+          // non-empty display names (M-1).
+          _isGroup = ids.length > 2;
+          _membersLoaded = true;
+          _membersLoading = false;
+          _membersError = false;
         });
       }
-    } catch (_) {
-      // Names are a nicety; messages still work without them.
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _membersLoading = false;
+          _membersError = true;
+        });
+        if (!silent) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+                content: Text(
+                    'تعذر تحميل بيانات الأعضاء. ${networkErrorMessage(e) ?? 'تحقق من الاتصال وحاول مجدداً.'}')),
+          );
+        }
+      }
     }
+  }
+
+  void _retryMembers() {
+    setState(() => _membersError = false);
+    _loadMembers();
   }
 
   /// Loads (or creates, when the conversation has none yet) this
   /// conversation's E2E key. Best-effort: a null key only means this chat
   /// sends/reads plaintext, it never blocks the chat itself.
+  /// _conversationKeyLoaded is set ONLY when a non-null key is in hand,
+  /// so a transient failure retries instead of being remembered forever.
+  /// When the key does arrive late, previously failed decryptions are
+  /// cleared and re-attempted against the rows last seen.
   Future<void> _ensureConversationKey() async {
-    if (_conversationKeyLoaded || _keyLoading) return;
+    if (_conversationKey != null) {
+      if (!_conversationKeyLoaded && mounted) {
+        setState(() => _conversationKeyLoaded = true);
+      }
+      return;
+    }
+    if (_keyLoading) return;
     _keyLoading = true;
     try {
       final pair = await ensureKeyPair();
@@ -125,32 +286,61 @@ class _ChatPageState extends State<ChatPage> {
       }
       final key = await loadOrCreateConversationKey(
           widget.conversationId, _memberPublicKeys);
-      if (mounted) {
+      if (key != null && mounted) {
         setState(() {
           _conversationKey = key;
           _conversationKeyLoaded = true;
+          // The key is here now: rows marked failed only because there
+          // was no key get another chance.
+          _decryptFailed.clear();
         });
+        if (_lastRows.isNotEmpty) _decryptPendingRows(_lastRows);
       }
     } catch (_) {
-      if (mounted) setState(() => _conversationKeyLoaded = true);
+      // Deliberately do NOT set _conversationKeyLoaded: a transient
+      // failure must be retryable (bounded, see _maybeRetryKeyLoad).
     } finally {
       _keyLoading = false;
     }
   }
 
+  /// Bounded key retry: at most once per ~10s, only when new stream
+  /// data arrives while there is still no key.
+  void _maybeRetryKeyLoad() {
+    if (_conversationKey != null || _keyLoading) return;
+    final now = DateTime.now();
+    if (_lastKeyRetryAt != null &&
+        now.difference(_lastKeyRetryAt!).inSeconds < 10) {
+      return;
+    }
+    _lastKeyRetryAt = now;
+    _ensureConversationKey();
+  }
+
   /// Decrypts encrypted rows that arrived in the stream and are not yet
   /// cached, failed, or in flight. Runs after the frame (never setState
   /// in a loop, never re-decrypt a cached row) and only one run at a time.
+  /// Malformed rows (missing ciphertext/nonce) are skipped, never marked
+  /// failed. Rows that cannot be decrypted only because the key is null
+  /// are NOT marked failed either — they are retried when the key loads.
   Future<void> _decryptPendingRows(List<Map<String, dynamic>> rows) async {
     if (_decryptRunning) return;
+    final malformed = <String>[];
     final pending = rows.where((row) {
       if (!isEncryptedMessage(row)) return false;
       final id = row['id']?.toString() ?? '';
       if (id.isEmpty) return false;
+      if (isMalformedEncryptedRow(row)) {
+        malformed.add(id);
+        return false;
+      }
       return !_decrypted.containsKey(id) &&
           !_decrypting.contains(id) &&
           !_decryptFailed.contains(id);
     }).toList();
+    if (malformed.isNotEmpty && mounted) {
+      setState(() => _malformedIds.addAll(malformed));
+    }
     if (pending.isEmpty) return;
     if (!_conversationKeyLoaded) {
       await _ensureConversationKey();
@@ -160,16 +350,9 @@ class _ChatPageState extends State<ChatPage> {
     }
     final key = _conversationKey;
     if (key == null) {
-      // No key for this conversation (e.g. I joined after the key was
-      // created and nobody re-wrapped for me): every pending encrypted
-      // row is unreadable — show the failure note, not a spinner forever.
-      if (mounted) {
-        setState(() {
-          for (final row in pending) {
-            _decryptFailed.add(row['id'].toString());
-          }
-        });
-      }
+      // No key yet: do NOT permanently mark these rows failed. The
+      // builder re-schedules decryption (bounded) when new data arrives
+      // or the key loads.
       return;
     }
     _decryptRunning = true;
@@ -204,9 +387,64 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   void dispose() {
+    currentOpenConversationId.value = null;
     input.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  // -- Mute (F42, chat side) ---------------------------------------------
+  // muted_until lives on the current user's profile row. The column only
+  // exists once the backend migration is applied; a missing column (or
+  // any other fetch failure) is treated as "not muted", never a crash.
+
+  Future<void> _loadMutedUntil() async {
+    final uid = client.auth.currentUser?.id;
+    if (uid == null) {
+      _mutedLoaded = true;
+      return;
+    }
+    try {
+      final row = await client
+          .from('profiles')
+          .select('muted_until')
+          .eq('id', uid)
+          .maybeSingle()
+          .timeout(const Duration(seconds: 15));
+      final raw = row?['muted_until']?.toString();
+      _mutedUntil =
+          raw == null || raw.isEmpty ? null : DateTime.tryParse(raw);
+    } catch (_) {
+      _mutedUntil = null;
+    } finally {
+      _mutedLoaded = true;
+    }
+  }
+
+  Future<bool> _isMuted() async {
+    if (!_mutedLoaded) await _loadMutedUntil();
+    final until = _mutedUntil;
+    if (until == null) return false;
+    return until.isAfter(DateTime.now());
+  }
+
+  String get _mutedMessage {
+    final until = _mutedUntil;
+    if (until == null) return 'تم كتمك.';
+    return 'تم كتمك حتى ${DateFormat('dd/MM/yyyy HH:mm').format(until.toLocal())}';
+  }
+
+  Future<void> _refreshMutedAfterForbidden() async {
+    _mutedLoaded = false;
+    await _loadMutedUntil();
+  }
+
+  void _showSessionExpired() {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+          content: Text('انتهت الجلسة. سجّل الدخول مجدداً.')),
+    );
   }
 
   String? _mimeFor(String extension) {
@@ -247,9 +485,17 @@ class _ChatPageState extends State<ChatPage> {
 
   /// Only channel admins may post; the RLS policy enforces this
   /// server-side, this guard is UX so a member never opens the picker
-  /// or sends into a rejection.
+  /// or sends into a rejection. The role comes from the caller
+  /// (ChatPage.isAdmin now defaults to false).
   bool get _canPost =>
       canPostInConversation(widget.kind, widget.isAdmin ? 'admin' : 'member');
+
+  /// Persistent plaintext banner (F38): shown whenever this conversation
+  /// is currently sending plaintext — no key, or not every member has a
+  /// public key. Subtle and non-blocking, above the composer.
+  bool get _showPlaintextBanner =>
+      _membersLoaded &&
+      (_conversationKey == null || !canEncryptFor(_memberPublicKeys));
 
   void _showReadOnlyNote() {
     if (!mounted) return;
@@ -274,7 +520,18 @@ class _ChatPageState extends State<ChatPage> {
   /// direct chats (see the AppBar below).
   Future<void> _startCall(String callType) async {
     final otherId = _otherUserId;
-    if (otherId == null) return;
+    if (otherId == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content: Text('تعذّر بدء المكالمة. بيانات الأعضاء غير جاهزة بعد.')),
+        );
+      }
+      return;
+    }
+    if (_startingCall) return;
+    _startingCall = true;
+    if (mounted) setState(() {});
     final otherName = _memberNames[otherId] ?? widget.title;
     try {
       final callId = await CallService.instance.startCall(
@@ -306,7 +563,136 @@ class _ChatPageState extends State<ChatPage> {
               content: Text('تعذّر بدء المكالمة. تحقق من الاتصال وحاول مجدداً.')),
         );
       }
+    } finally {
+      _startingCall = false;
+      if (mounted) setState(() {});
     }
+  }
+
+  /// Leaves this group/channel. Calls the `leave_conversation` RPC
+  /// (params: {'p_conversation_id': a UUID}) — that RPC is being added
+  /// by the backend coordinator; if it is not deployed yet the error is
+  /// shown in a snackbar instead of crashing. On success, pops the page.
+  Future<void> _leaveConversation() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(widget.kind == 'channel'
+            ? 'مغادرة القناة؟'
+            : 'مغادرة المجموعة؟'),
+        content: Text(widget.kind == 'channel'
+            ? 'ستغادر هذه القناة ولن تصلك رسائلها بعد الآن.'
+            : 'ستغادر هذه المجموعة ولن تصلك رسائلها بعد الآن.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('إلغاء')),
+          FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('مغادرة')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await client
+          .rpc('leave_conversation',
+              params: {'p_conversation_id': widget.conversationId})
+          .timeout(const Duration(seconds: 20));
+      if (mounted) Navigator.pop(context);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+              content: Text(
+                  'تعذر مغادرة ${widget.kind == 'channel' ? 'القناة' : 'المجموعة'}. ${networkErrorMessage(e) ?? e.toString()}')),
+        );
+      }
+    }
+  }
+
+  /// Members sheet for groups/channels, from the already-loaded member
+  /// data. Admins see a remove button for other members (never for
+  /// themselves); removal calls the `remove_member` RPC (params:
+  /// {'p_conversation_id': a UUID, 'p_target_user': a UUID}).
+  Future<void> _showMembersSheet() async {
+    final myId = client.auth.currentUser?.id;
+    await showModalBottomSheet(
+      context: context,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (sheetContext, setSheetState) {
+          final ids = _memberIds.toList();
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(18, 18, 18, 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(children: [
+                    const Icon(Icons.group_outlined),
+                    const SizedBox(width: 8),
+                    Text('الأعضاء (${ids.length})',
+                        style: const TextStyle(
+                            fontSize: 19, fontWeight: FontWeight.bold)),
+                  ]),
+                  const SizedBox(height: 10),
+                  Flexible(
+                    child: ListView(
+                      shrinkWrap: true,
+                      children: ids.map((id) {
+                        final name = _memberNames[id] ?? 'مستخدم';
+                        final isMe = id == myId;
+                        return ListTile(
+                          leading: const CircleAvatar(
+                              child: Icon(Icons.person)),
+                          title: Text(name),
+                          subtitle: isMe ? const Text('أنت') : null,
+                          trailing: widget.isAdmin && !isMe
+                              ? TextButton(
+                                  onPressed: () async {
+                                    try {
+                                      await client.rpc('remove_member',
+                                          params: {
+                                            'p_conversation_id':
+                                                widget.conversationId,
+                                            'p_target_user': id,
+                                          }).timeout(
+                                          const Duration(seconds: 20));
+                                      await _loadMembers(silent: true);
+                                      setSheetState(() {});
+                                      if (mounted) {
+                                        ScaffoldMessenger.of(context)
+                                            .showSnackBar(
+                                          const SnackBar(
+                                              content: Text(
+                                                  'تمت إزالة العضو.')),
+                                        );
+                                      }
+                                    } catch (e) {
+                                      if (mounted) {
+                                        ScaffoldMessenger.of(context)
+                                            .showSnackBar(
+                                          SnackBar(
+                                              content: Text(
+                                                  'تعذرت إزالة العضو. ${networkErrorMessage(e) ?? e.toString()}')),
+                                        );
+                                      }
+                                    }
+                                  },
+                                  child: const Text('إزالة'),
+                                )
+                              : null,
+                        );
+                      }).toList(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
   }
 
   /// One shared report dialog for messages and users: preset reason chips
@@ -407,12 +793,53 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
+  /// One-time-per-session confirmation before a plaintext downgrade:
+  /// only shown when this conversation already has encrypted messages
+  /// (so the user is losing encryption they had) and no key is in hand.
+  Future<bool> _confirmPlaintextSend() async {
+    if (_plaintextDowngradeWarned) return true;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('إرسال غير مشفّر؟'),
+        content: const Text(
+            'لا يوجد مفتاح تشفير لهذه المحادثة بعد، وستُرسل هذه الرسالة غير مشفّرة ويمكن قراءتها.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('إلغاء')),
+          FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('إرسال غير مشفّرة')),
+        ],
+      ),
+    );
+    if (ok == true) {
+      _plaintextDowngradeWarned = true;
+      return true;
+    }
+    return false;
+  }
+
   Future<void> sendAttachment() async {
     if (!_canPost) {
       _showReadOnlyNote();
       return;
     }
     if (sending) return;
+    final uid = client.auth.currentUser?.id;
+    if (uid == null) {
+      _showSessionExpired();
+      return;
+    }
+    if (await _isMuted()) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(_mutedMessage)),
+        );
+      }
+      return;
+    }
     String? uploadedPath;
     try {
       final result = await FilePicker.platform.pickFiles(
@@ -455,7 +882,6 @@ class _ChatPageState extends State<ChatPage> {
       setState(() => sending = true);
       // Upload the file itself instead of reading up to 50 MB into memory
       // first; the old code held the whole file in RAM as bytes.
-      final uid = client.auth.currentUser!.id;
       final safeName = file.name.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
       final path =
           '${widget.conversationId}/$uid/${DateTime.now().microsecondsSinceEpoch}_$safeName';
@@ -480,7 +906,8 @@ class _ChatPageState extends State<ChatPage> {
         'attachment_path': path,
       });
       uploadedPath = null;
-    } catch (_) {
+    } catch (e) {
+      if (e.toString().contains('403')) await _refreshMutedAfterForbidden();
       if (uploadedPath != null) {
         try {
           await client.storage
@@ -532,8 +959,10 @@ class _ChatPageState extends State<ChatPage> {
           ],
         );
       }
-      if (_decryptFailed.contains(id) ||
-          (_conversationKeyLoaded && _conversationKey == null)) {
+      if (_malformedIds.contains(id)) {
+        return const Text('رسالة تالفة');
+      }
+      if (_decryptFailed.contains(id)) {
         return const Text('تعذّر فك تشفير هذه الرسالة');
       }
       return const Column(
@@ -565,11 +994,23 @@ class _ChatPageState extends State<ChatPage> {
     }
     final body = input.text.trim();
     final uid = client.auth.currentUser?.id;
-    if (body.isEmpty || sending || uid == null) return;
+    if (uid == null) {
+      _showSessionExpired();
+      return;
+    }
+    if (body.isEmpty || sending) return;
     if (body.length > 4000) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('الحد الأقصى للرسالة 4000 حرف.')),
       );
+      return;
+    }
+    if (await _isMuted()) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(_mutedMessage)),
+        );
+      }
       return;
     }
     setState(() => sending = true);
@@ -590,7 +1031,7 @@ class _ChatPageState extends State<ChatPage> {
         } catch (_) {
           // Publishing must never block sending.
         }
-        await _loadMembers();
+        await _loadMembers(silent: true);
         convKey = await loadOrCreateConversationKey(
             widget.conversationId, _memberPublicKeys);
         if (convKey != null) {
@@ -605,6 +1046,7 @@ class _ChatPageState extends State<ChatPage> {
             setState(() {
               _conversationKey = convKey;
               _conversationKeyLoaded = true;
+              _decryptFailed.clear();
             });
           }
         }
@@ -623,6 +1065,12 @@ class _ChatPageState extends State<ChatPage> {
           'nonce': encrypted.nonce,
         });
       } else {
+        // Plaintext downgrade: if this conversation already has
+        // encrypted messages, warn once per session first instead of
+        // silently sending plaintext.
+        final hadEncrypted =
+            _lastRows.any((row) => isEncryptedMessage(row));
+        if (hadEncrypted && !await _confirmPlaintextSend()) return;
         await client.from('messages').insert({
           'conversation_id': widget.conversationId,
           'sender_id': uid,
@@ -631,7 +1079,18 @@ class _ChatPageState extends State<ChatPage> {
         });
       }
       input.clear();
-    } catch (_) {
+    } catch (e) {
+      if (e.toString().contains('403')) {
+        await _refreshMutedAfterForbidden();
+        if (await _isMuted()) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text(_mutedMessage)),
+            );
+          }
+          return;
+        }
+      }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('تعذر إرسال الرسالة.')));
@@ -641,42 +1100,202 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
+  /// The message list for a set of rows, with the decrypt/scroll
+  /// post-frame work scheduled ONLY when the row count or the set of
+  /// encrypted ids actually changed (M-9: not on every build).
+  Widget _buildMessageList(List<Map<String, dynamic>> rows,
+      {bool showLiveHint = false}) {
+    _lastRows = rows;
+    final encryptedIds = rows
+        .where((row) => isEncryptedMessage(row))
+        .map((row) => row['id']?.toString() ?? '')
+        .where((id) => id.isNotEmpty)
+        .toSet();
+    final changed = rows.length != _lastMessageCount ||
+        encryptedIds.length != _lastEncryptedIds.length ||
+        !encryptedIds.containsAll(_lastEncryptedIds);
+    if (changed) {
+      _lastMessageCount = rows.length;
+      _lastEncryptedIds = encryptedIds;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _scrollToBottom();
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _maybeRetryKeyLoad();
+          _decryptPendingRows(rows);
+        }
+      });
+    }
+    final list = ListView.builder(
+      controller: _scroll,
+      padding: const EdgeInsets.all(14),
+      itemCount: rows.length,
+      itemBuilder: (context, i) {
+        final row = rows[i];
+        final myId = client.auth.currentUser?.id;
+        final mine = myId != null && row['sender_id'] == myId;
+        final senderName = _memberNames[row['sender_id']?.toString()];
+        final time =
+            DateTime.tryParse(row['created_at']?.toString() ?? '');
+        return GestureDetector(
+          onLongPress: () => _showMessageActions(row),
+          child: Align(
+            alignment: mine ? Alignment.centerLeft : Alignment.centerRight,
+            child: Container(
+              constraints: const BoxConstraints(maxWidth: 300),
+              margin: const EdgeInsets.symmetric(vertical: 4),
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                  color: mine ? const Color(0xFFDDF3E6) : Colors.white,
+                  borderRadius: BorderRadius.circular(16)),
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (!mine &&
+                        (_isGroup || isChannelKind(widget.kind)) &&
+                        senderName != null)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 2),
+                        child: Text(senderName,
+                            style: const TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                                color: green)),
+                      ),
+                    if (row['attachment_path'] != null)
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          InkWell(
+                            onTap: () => openAttachment(
+                                row['attachment_path'].toString()),
+                            child: Row(mainAxisSize: MainAxisSize.min, children: [
+                              const Icon(Icons.attach_file,
+                                  size: 18, color: green),
+                              const SizedBox(width: 5),
+                              Flexible(
+                                  child: Text(
+                                      row['body']?.toString() ?? 'مرفق',
+                                      style: const TextStyle(
+                                          decoration:
+                                              TextDecoration.underline))),
+                              const SizedBox(width: 5),
+                              const Icon(Icons.download_rounded,
+                                  size: 17, color: green),
+                            ]),
+                          ),
+                          const Text('🔓 غير مشفّرة',
+                              style: TextStyle(
+                                  fontSize: 10, color: Colors.black54)),
+                        ],
+                      )
+                    else
+                      _messageBody(row),
+                    if (time != null)
+                      Text(formatChatTime(time),
+                          style: const TextStyle(
+                              fontSize: 10, color: Colors.black54)),
+                  ]),
+            ),
+          ),
+        );
+      },
+    );
+    if (!showLiveHint) return list;
+    return Column(children: [
+      Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        color: const Color(0xFFFFF3CD),
+        child: const Text('التحديثات الحية غير متصلة — تُعرض الرسائل المحفوظة.',
+            style: TextStyle(fontSize: 12)),
+      ),
+      Expanded(child: list),
+    ]);
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (!_validConversationId) {
+      return Scaffold(
+        appBar: AppBar(title: Text(widget.title)),
+        body: const Center(
+            child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text('المحادثة غير موجودة أو لا يمكنك الوصول إليها.',
+              textAlign: TextAlign.center),
+        )),
+      );
+    }
+    final isGroupOrChannel =
+        widget.kind == 'group' || widget.kind == 'channel';
     return Scaffold(
       appBar: AppBar(
           actions: [
             // Voice/video calls are 1:1 only: direct chats get the buttons,
-            // groups and channels get none.
-            if (widget.kind == 'direct' && _otherUserId != null) ...[
+            // groups and channels get none. The buttons stay visible but
+            // disabled until members have loaded and the other user is
+            // known, so they are never dead-looking or silently absent.
+            if (widget.kind == 'direct') ...[
               IconButton(
                 tooltip: 'مكالمة صوتية',
-                onPressed: () => _startCall('voice'),
+                onPressed: (_otherUserId == null || _startingCall || _membersLoading)
+                    ? null
+                    : () => _startCall('voice'),
                 icon: const Icon(Icons.call),
               ),
               IconButton(
                 tooltip: 'مكالمة فيديو',
-                onPressed: () => _startCall('video'),
+                onPressed: (_otherUserId == null || _startingCall || _membersLoading)
+                    ? null
+                    : () => _startCall('video'),
                 icon: const Icon(Icons.videocam),
               ),
             ],
-            if (widget.kind == 'direct' && _otherUserId != null)
-              PopupMenuButton<String>(
-                tooltip: 'خيارات',
-                onSelected: (value) {
-                  if (value == 'report_user') {
-                    _showReportDialog(
-                        targetType: 'user',
-                        targetId: _otherUserId!,
-                        title: 'الإبلاغ عن المستخدم');
-                  }
-                },
-                itemBuilder: (_) => const [
-                  PopupMenuItem(
-                      value: 'report_user',
-                      child: Text('الإبلاغ عن المستخدم')),
-                ],
+            if (_membersError)
+              IconButton(
+                tooltip: 'إعادة تحميل بيانات الأعضاء',
+                onPressed: _retryMembers,
+                icon: const Icon(Icons.refresh),
               ),
+            PopupMenuButton<String>(
+              tooltip: 'خيارات',
+              enabled: widget.kind == 'direct'
+                  ? _otherUserId != null
+                  : true,
+              onSelected: (value) {
+                if (value == 'report_user' && _otherUserId != null) {
+                  _showReportDialog(
+                      targetType: 'user',
+                      targetId: _otherUserId!,
+                      title: 'الإبلاغ عن المستخدم');
+                } else if (value == 'members') {
+                  _showMembersSheet();
+                } else if (value == 'leave') {
+                  _leaveConversation();
+                }
+              },
+              itemBuilder: (_) {
+                final items = <PopupMenuEntry<String>>[];
+                if (widget.kind == 'direct') {
+                  items.add(const PopupMenuItem(
+                      value: 'report_user',
+                      child: Text('الإبلاغ عن المستخدم')));
+                }
+                if (isGroupOrChannel) {
+                  items.add(const PopupMenuItem(
+                      value: 'members', child: Text('الأعضاء')));
+                  items.add(PopupMenuItem(
+                      value: 'leave',
+                      child: Text(widget.kind == 'channel'
+                          ? 'مغادرة القناة'
+                          : 'مغادرة المجموعة')));
+                }
+                return items;
+              },
+            ),
           ],
           title: Row(children: [
         if (isChannelKind(widget.kind))
@@ -684,7 +1303,9 @@ class _ChatPageState extends State<ChatPage> {
             Icon(Icons.campaign_rounded),
             SizedBox(width: 8),
           ]),
-        Expanded(child: Text(widget.title)),
+        Expanded(
+            child: Text(widget.title,
+                overflow: TextOverflow.ellipsis, maxLines: 1)),
         if (isChannelKind(widget.kind))
           Container(
             padding:
@@ -700,104 +1321,75 @@ class _ChatPageState extends State<ChatPage> {
           ),
       ])),
       body: Column(children: [
+        if (_membersError)
+          Container(
+            width: double.infinity,
+            padding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            color: const Color(0xFFFFF3CD),
+            child: Row(children: [
+              const Expanded(
+                  child: Text(
+                      'تعذر تحميل بيانات الأعضاء — المكالمات والإبلاغ غير متاحة مؤقتاً.',
+                      style: TextStyle(fontSize: 12))),
+              TextButton(
+                  onPressed: _retryMembers,
+                  child: const Text('إعادة المحاولة')),
+            ]),
+          ),
         Expanded(
             child: StreamBuilder<List<Map<String, dynamic>>>(
           stream: _messagesStream,
           builder: (context, snap) {
+            // Already-loaded messages win over a later stream error:
+            // a Realtime failure must not wipe messages that arrived.
+            if (snap.hasData) {
+              final rows = snap.data!;
+              if (rows.isEmpty) {
+                return const Center(
+                    child: Text('ابدأ المحادثة برسالة ترحيب 👋'));
+              }
+              return _buildMessageList(rows);
+            }
             if (snap.hasError) {
-              return const Center(child: Text('تعذر تحميل الرسائل'));
+              if (_fallbackRows != null) {
+                return _buildMessageList(_fallbackRows!,
+                    showLiveHint: true);
+              }
+              if (!_fallbackLoading) {
+                WidgetsBinding.instance.addPostFrameCallback(
+                    (_) => _loadFallbackMessages());
+              }
+              final message = networkErrorMessage(snap.error!) ??
+                  'تعذر تحميل الرسائل: ${snap.error}';
+              return Center(
+                  child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(message, textAlign: TextAlign.center),
+                      const SizedBox(height: 12),
+                      FilledButton(
+                          onPressed: _retryMessages,
+                          child: const Text('إعادة المحاولة')),
+                    ]),
+              ));
             }
-            if (!snap.hasData) {
-              return const Center(child: CircularProgressIndicator());
-            }
-            final rows = snap.data!;
-            if (rows.isEmpty) {
-              return const Center(child: Text('ابدأ المحادثة برسالة ترحيب 👋'));
-            }
-            if (rows.length != _lastMessageCount) {
-              _lastMessageCount = rows.length;
-              WidgetsBinding.instance
-                  .addPostFrameCallback((_) => _scrollToBottom());
-            }
-            // Decryption is async but the rows render synchronously:
-            // kick it off after the frame; _decryptPendingRows guards
-            // against re-decrypting cached / in-flight rows.
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (mounted) _decryptPendingRows(rows);
-            });
-            return ListView.builder(
-              controller: _scroll,
-              padding: const EdgeInsets.all(14),
-              itemCount: rows.length,
-              itemBuilder: (context, i) {
-                final row = rows[i];
-                final myId = client.auth.currentUser?.id;
-                final mine = myId != null && row['sender_id'] == myId;
-                final senderName = _memberNames[row['sender_id']?.toString()];
-                final time =
-                    DateTime.tryParse(row['created_at']?.toString() ?? '');
-                return GestureDetector(
-                  onLongPress: () => _showMessageActions(row),
-                  child: Align(
-                  alignment:
-                      mine ? Alignment.centerLeft : Alignment.centerRight,
-                  child: Container(
-                    constraints: const BoxConstraints(maxWidth: 300),
-                    margin: const EdgeInsets.symmetric(vertical: 4),
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 14, vertical: 10),
-                    decoration: BoxDecoration(
-                        color: mine
-                            ? const Color(0xFFDDF3E6)
-                            : Colors.white,
-                        borderRadius: BorderRadius.circular(16)),
-                    child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          if (!mine &&
-                              (_isGroup || isChannelKind(widget.kind)) &&
-                              senderName != null)
-                            Padding(
-                              padding: const EdgeInsets.only(bottom: 2),
-                              child: Text(senderName,
-                                  style: const TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.bold,
-                                      color: green)),
-                            ),
-                          if (row['attachment_path'] != null)
-                            InkWell(
-                              onTap: () =>
-                                  openAttachment(row['attachment_path'].toString()),
-                              child: Row(mainAxisSize: MainAxisSize.min, children: [
-                                const Icon(Icons.attach_file,
-                                    size: 18, color: green),
-                                const SizedBox(width: 5),
-                                Flexible(
-                                    child: Text(
-                                        row['body']?.toString() ?? 'مرفق',
-                                        style: const TextStyle(
-                                            decoration:
-                                                TextDecoration.underline))),
-                                const SizedBox(width: 5),
-                                const Icon(Icons.download_rounded,
-                                    size: 17, color: green),
-                              ]),
-                            )
-                          else
-                            _messageBody(row),
-                          if (time != null)
-                            Text(DateFormat('HH:mm').format(time.toLocal()),
-                                style: const TextStyle(
-                                    fontSize: 10, color: Colors.black54)),
-                        ]),
-                  ),
-                ),
-                );
-              },
-            );
+            return const Center(child: CircularProgressIndicator());
           },
         )),
+        if (_showPlaintextBanner)
+          Container(
+            width: double.infinity,
+            padding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            color: const Color(0xFFFFF3CD),
+            child: const Text(
+                '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح',
+                style: TextStyle(fontSize: 12),
+                textAlign: TextAlign.center),
+          ),
         SafeArea(
             child: Padding(
           padding: const EdgeInsets.fromLTRB(10, 6, 10, 10),

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
 
@@ -15,6 +16,17 @@ String checkStatusLabel(CheckStatus status) => switch (status) {
       CheckStatus.passed => 'ناجح',
       CheckStatus.failed => 'فاشل',
     };
+
+/// User-facing detail for a check failure. A bare `TimeoutException`
+/// string tells the user nothing; label timeouts plainly as
+/// "انتهت المهلة" (M19) so a slow network reads as a slow network,
+/// not as an unknown error.
+String diagnosticErrorDetail(Object e) {
+  if (e is TimeoutException) {
+    return 'انتهت المهلة (تجاوز الفحص الحد الزمني المسموح)';
+  }
+  return e.toString();
+}
 
 /// Human-readable description of the system proxy in use.
 String describeProxy(String? proxy) =>
@@ -74,6 +86,13 @@ class _NetworkDiagnosticsPageState extends State<NetworkDiagnosticsPage> {
     _runChecks();
   }
 
+  // M19: the six checks are independent, so they run concurrently
+  // (Future.wait) under one overall 60s budget instead of serially
+  // (~150s worst case). Each check still has its own 25s cap in
+  // _runOne; the overall budget is a backstop. If it fires, any check
+  // still running is marked "انتهت المهلة"; a late check may still
+  // replace its row with its real result when it finishes (up to its
+  // own 25s cap) — that is honest, not a bug.
   Future<void> _runChecks() async {
     if (_running) return;
     setState(() {
@@ -83,13 +102,32 @@ class _NetworkDiagnosticsPageState extends State<NetworkDiagnosticsPage> {
               title: t, status: CheckStatus.running, detail: ''))
           .toList();
     });
-    await _runOne(0, _checkProxy);
-    await _runOne(1, _checkSystemDns);
-    await _runOne(2, _checkDoh);
-    await _runOne(3, _checkSeedDial);
-    await _runOne(4, _checkAuthHealth);
-    await _runOne(5, _checkSignupProbe);
-    if (mounted) setState(() => _running = false);
+    try {
+      await Future.wait([
+        _runOne(0, _checkProxy),
+        _runOne(1, _checkSystemDns),
+        _runOne(2, _checkDoh),
+        _runOne(3, _checkSeedDial),
+        _runOne(4, _checkAuthHealth),
+        _runOne(5, _checkSignupProbe),
+      ]).timeout(const Duration(seconds: 60));
+    } on TimeoutException {
+      if (mounted) {
+        setState(() {
+          for (var i = 0; i < _results.length; i++) {
+            if (_results[i].status == CheckStatus.running) {
+              _results[i] = DiagnosticResult(
+                title: _titles[i],
+                status: CheckStatus.failed,
+                detail: 'انتهت المهلة (تجاوز الفحص الإجمالي 60 ثانية)',
+              );
+            }
+          }
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _running = false);
+    }
   }
 
   Future<void> _runOne(
@@ -97,11 +135,17 @@ class _NetworkDiagnosticsPageState extends State<NetworkDiagnosticsPage> {
     DiagnosticResult result;
     try {
       result = await check().timeout(const Duration(seconds: 25));
+    } on TimeoutException {
+      result = DiagnosticResult(
+        title: _titles[index],
+        status: CheckStatus.failed,
+        detail: 'انتهت المهلة (تجاوز الفحص 25 ثانية)',
+      );
     } catch (e) {
       result = DiagnosticResult(
         title: _titles[index],
         status: CheckStatus.failed,
-        detail: e.toString(),
+        detail: diagnosticErrorDetail(e),
       );
     }
     if (!mounted) return;
@@ -110,11 +154,72 @@ class _NetworkDiagnosticsPageState extends State<NetworkDiagnosticsPage> {
 
   Future<DiagnosticResult> _checkProxy() async {
     final proxy = await readSystemProxy();
-    return DiagnosticResult(
-      title: _titles[0],
-      status: CheckStatus.passed,
-      detail: describeProxy(proxy),
-    );
+    if (proxy == null) {
+      return DiagnosticResult(
+        title: _titles[0],
+        status: CheckStatus.passed,
+        detail: describeProxy(proxy),
+      );
+    }
+    // B19: previously this check always passed without ever touching
+    // the proxy. Now it really dials the proxy and asks it for a
+    // CONNECT tunnel to the Supabase host — a proxy that refuses (or
+    // is unreachable) must fail this check.
+    final split = proxy.lastIndexOf(':');
+    if (split <= 0) {
+      return DiagnosticResult(
+        title: _titles[0],
+        status: CheckStatus.failed,
+        detail: 'صيغة بروكسي غير صالحة: $proxy',
+      );
+    }
+    final proxyHost = proxy.substring(0, split);
+    final proxyPort = int.tryParse(proxy.substring(split + 1));
+    if (proxyPort == null) {
+      return DiagnosticResult(
+        title: _titles[0],
+        status: CheckStatus.failed,
+        detail: 'منفذ بروكسي غير صالح: $proxy',
+      );
+    }
+    try {
+      final socket = await io.Socket.connect(proxyHost, proxyPort)
+          .timeout(const Duration(seconds: 10));
+      try {
+        socket.write(
+          'CONNECT $supabaseHost:443 HTTP/1.1\r\n'
+          'Host: $supabaseHost:443\r\n\r\n',
+        );
+        final firstChunk = await socket.first.timeout(
+          const Duration(seconds: 10),
+        );
+        final statusLine =
+            utf8.decode(firstChunk, allowMalformed: true).split('\r\n').first;
+        if (RegExp(r'^HTTP/\d(\.\d)? 2\d\d').hasMatch(statusLine)) {
+          return DiagnosticResult(
+            title: _titles[0],
+            status: CheckStatus.passed,
+            detail: 'البروكسي: $proxy\nقبل CONNECT إلى $supabaseHost:443 '
+                '($statusLine)',
+          );
+        }
+        return DiagnosticResult(
+          title: _titles[0],
+          status: CheckStatus.failed,
+          detail: 'البروكسي: $proxy\nرفض CONNECT إلى $supabaseHost:443 '
+              '($statusLine)',
+        );
+      } finally {
+        socket.destroy();
+      }
+    } catch (e) {
+      return DiagnosticResult(
+        title: _titles[0],
+        status: CheckStatus.failed,
+        detail: 'البروكسي: $proxy\nتعذر الاتصال بالبروكسي: '
+            '${diagnosticErrorDetail(e)}',
+      );
+    }
   }
 
   Future<DiagnosticResult> _checkSystemDns() async {
@@ -137,7 +242,7 @@ class _NetworkDiagnosticsPageState extends State<NetworkDiagnosticsPage> {
       return DiagnosticResult(
         title: _titles[1],
         status: CheckStatus.failed,
-        detail: e.toString(),
+        detail: diagnosticErrorDetail(e),
       );
     }
   }
@@ -154,32 +259,60 @@ class _NetworkDiagnosticsPageState extends State<NetworkDiagnosticsPage> {
       return DiagnosticResult(
         title: _titles[2],
         status: CheckStatus.failed,
-        detail: e.toString(),
+        detail: diagnosticErrorDetail(e),
       );
     }
   }
 
   Future<DiagnosticResult> _checkSeedDial() async {
-    const seedIp = '172.64.149.246';
-    try {
-      final socket = await connectToFirstIp(
-        [seedIp],
-        443,
-        timeout: const Duration(seconds: 5),
-      );
-      socket.destroy();
-      return DiagnosticResult(
-        title: _titles[3],
-        status: CheckStatus.passed,
-        detail: 'تم الاتصال بـ $seedIp:443',
-      );
-    } catch (e) {
+    // B19: previously this dialled ONE hardcoded IP ('172.64.149.246')
+    // with TCP only. Now it tries every seed address for the host and
+    // completes a real TLS handshake (SNI + certificate check for the
+    // Supabase host) before passing — a TCP connect alone proves
+    // nothing about reaching Supabase.
+    final seeds = seedIps[supabaseHost] ?? const <String>[];
+    if (seeds.isEmpty) {
       return DiagnosticResult(
         title: _titles[3],
         status: CheckStatus.failed,
-        detail: e.toString(),
+        detail: 'لا توجد عناوين أولية لـ $supabaseHost',
       );
     }
+    Object? lastError;
+    for (final seedIp in seeds) {
+      try {
+        final socket = await connectToFirstIp(
+          [seedIp],
+          443,
+          timeout: const Duration(seconds: 5),
+        );
+        try {
+          final secure = await io.SecureSocket.secure(
+            socket,
+            host: supabaseHost,
+          ).timeout(const Duration(seconds: 15));
+          secure.destroy();
+        } catch (e) {
+          try {
+            socket.destroy();
+          } catch (_) {}
+          rethrow;
+        }
+        return DiagnosticResult(
+          title: _titles[3],
+          status: CheckStatus.passed,
+          detail: 'تم الاتصال بـ $seedIp:443 وإتمام TLS لـ $supabaseHost',
+        );
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    return DiagnosticResult(
+      title: _titles[3],
+      status: CheckStatus.failed,
+      detail: 'فشل الاتصال بكل العناوين الأولية '
+          '(${seeds.join(', ')}): ${diagnosticErrorDetail(lastError!)}',
+    );
   }
 
   Future<DiagnosticResult> _checkAuthHealth() async {
@@ -195,11 +328,14 @@ class _NetworkDiagnosticsPageState extends State<NetworkDiagnosticsPage> {
           .join()
           .timeout(const Duration(seconds: 10));
       final status = response.statusCode;
-      // Status alone is not enough: a plain-HTTP request to the HTTPS
-      // port also answers 400 (nginx's HTML error page). The body must
-      // be Supabase's JSON for the check to mean anything.
+      // B5: GoTrue GET /auth/v1/health returns 200 with JSON when the
+      // server is healthy. The old check (400 || 401) failed on a
+      // healthy server. Status alone is still not enough: a plain-HTTP
+      // request to the HTTPS port also answers 400 (nginx's HTML error
+      // page). The body must be Supabase's JSON for the check to mean
+      // anything.
       final passed =
-          (status == 400 || status == 401) && isJsonResponseBody(body);
+          status >= 200 && status < 300 && isJsonResponseBody(body);
       return DiagnosticResult(
         title: _titles[4],
         status: passed ? CheckStatus.passed : CheckStatus.failed,
@@ -210,7 +346,7 @@ class _NetworkDiagnosticsPageState extends State<NetworkDiagnosticsPage> {
       return DiagnosticResult(
         title: _titles[4],
         status: CheckStatus.failed,
-        detail: e.toString(),
+        detail: diagnosticErrorDetail(e),
       );
     } finally {
       client.close();
@@ -243,18 +379,32 @@ class _NetworkDiagnosticsPageState extends State<NetworkDiagnosticsPage> {
           .timeout(const Duration(seconds: 10));
       final snippet =
           body.length > 200 ? '${body.substring(0, 200)}…' : body;
+      final status = response.statusCode;
+      // M24: previously ANY JSON body passed — a 429 (rate-limited) or
+      // 500 JSON error counted as "ناجح". Only the expected 400
+      // validation error ('Unable to validate email address') proves the
+      // signup path works; a 429 is surfaced distinctly so the user
+      // knows to wait instead of retrying into the limit.
+      if (status == 429) {
+        return DiagnosticResult(
+          title: _titles[5],
+          status: CheckStatus.failed,
+          detail: 'رمز الحالة: 429 (تم تقييد الطلبات — أعد المحاولة لاحقاً)\n'
+              '$snippet',
+        );
+      }
       return DiagnosticResult(
         title: _titles[5],
-        status: isJsonResponseBody(body)
+        status: (status == 400 && isJsonResponseBody(body))
             ? CheckStatus.passed
             : CheckStatus.failed,
-        detail: 'رمز الحالة: ${response.statusCode}\n$snippet',
+        detail: 'رمز الحالة: $status\n$snippet',
       );
     } catch (e) {
       return DiagnosticResult(
         title: _titles[5],
         status: CheckStatus.failed,
-        detail: e.toString(),
+        detail: diagnosticErrorDetail(e),
       );
     } finally {
       client.close();

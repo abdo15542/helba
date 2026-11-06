@@ -70,6 +70,14 @@ Map<String, List<Map<String, dynamic>>> groupStoriesByUser(
   return groups;
 }
 
+/// Maximum accepted story video length. Videos longer than this are
+/// rejected at pick time (the 50 MB size cap alone does not bound length).
+const maxStoryVideoDuration = Duration(seconds: 60);
+
+/// True when a video of [duration] is too long to post as a story.
+bool isStoryVideoTooLong(Duration duration) =>
+    duration > maxStoryVideoDuration;
+
 /// Display name for a story author: the embedded profile's display_name,
 /// falling back to @username, then to a generic label.
 String storyAuthorName(Map<String, dynamic> storyRow) {
@@ -168,10 +176,32 @@ class StoryRingsRowState extends State<StoryRingsRow> {
         _showMessage('تعذر الوصول إلى الملف المحدد.');
         return;
       }
+      // Reject videos longer than ~60s at pick time. The duration is read
+      // with the video_player already in use by the viewer; if it cannot
+      // be read, the upload proceeds (fail open) and the server/storage
+      // size cap still applies.
+      if (mime.startsWith('video/')) {
+        final probe = VideoPlayerController.file(io.File(filePath));
+        try {
+          await probe.initialize();
+          if (isStoryVideoTooLong(probe.value.duration)) {
+            _showMessage('مدة الفيديو طويلة. اختر فيديو لا يتجاوز 60 ثانية.');
+            return;
+          }
+        } catch (_) {
+          // Duration unreadable: proceed; a corrupt file fails at upload.
+        } finally {
+          await probe.dispose();
+        }
+      }
+      final client = Supabase.instance.client;
+      final uid = client.auth.currentUser?.id;
+      if (uid == null) {
+        _showMessage('انتهت الجلسة. سجّل الدخول مجدداً.');
+        return;
+      }
       if (!mounted) return;
       setState(() => _uploading = true);
-      final client = Supabase.instance.client;
-      final uid = client.auth.currentUser!.id;
       final safeName = file.name.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
       final path =
           '$uid/${DateTime.now().microsecondsSinceEpoch}_$safeName';
@@ -214,42 +244,86 @@ class StoryRingsRowState extends State<StoryRingsRow> {
       child: FutureBuilder<List<Map<String, dynamic>>>(
         future: _storiesFuture,
         builder: (context, snap) {
+          // The "add story" tile is always available, even while stories
+          // are loading or failed to load.
+          final addTile = _RingTile(
+            label: 'أضف حالة',
+            onTap: _uploading ? null : _uploadStory,
+            child: Stack(
+              alignment: Alignment.bottomLeft,
+              children: [
+                const CircleAvatar(
+                  radius: 30,
+                  backgroundColor: Color(0xFFE1F1E8),
+                  child: Icon(Icons.person, size: 32, color: green),
+                ),
+                if (_uploading)
+                  const SizedBox(
+                    width: 60,
+                    height: 60,
+                    child: CircularProgressIndicator(strokeWidth: 3),
+                  )
+                else
+                  Container(
+                    decoration: const BoxDecoration(
+                      color: green,
+                      shape: BoxShape.circle,
+                    ),
+                    padding: const EdgeInsets.all(2),
+                    child: const Icon(Icons.add,
+                        size: 18, color: Colors.white),
+                  ),
+              ],
+            ),
+          );
+          if (snap.connectionState == ConnectionState.waiting) {
+            return ListView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              children: [
+                addTile,
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 12, vertical: 24),
+                  child: SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: CircularProgressIndicator(strokeWidth: 3),
+                  ),
+                ),
+              ],
+            );
+          }
+          if (snap.hasError) {
+            return ListView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              children: [
+                addTile,
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const SizedBox(height: 8),
+                      const Text('تعذر تحميل الحالات.',
+                          style: TextStyle(fontSize: 12)),
+                      TextButton(
+                        onPressed: _reload,
+                        child: const Text('إعادة المحاولة'),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            );
+          }
           final stories = snap.data ?? const <Map<String, dynamic>>[];
           final groups = groupStoriesByUser(stories);
           return ListView(
             scrollDirection: Axis.horizontal,
             padding: const EdgeInsets.symmetric(horizontal: 12),
             children: [
-              _RingTile(
-                label: 'أضف حالة',
-                onTap: _uploading ? null : _uploadStory,
-                child: Stack(
-                  alignment: Alignment.bottomLeft,
-                  children: [
-                    const CircleAvatar(
-                      radius: 30,
-                      backgroundColor: Color(0xFFE1F1E8),
-                      child: Icon(Icons.person, size: 32, color: green),
-                    ),
-                    if (_uploading)
-                      const SizedBox(
-                        width: 60,
-                        height: 60,
-                        child: CircularProgressIndicator(strokeWidth: 3),
-                      )
-                    else
-                      Container(
-                        decoration: const BoxDecoration(
-                          color: green,
-                          shape: BoxShape.circle,
-                        ),
-                        padding: const EdgeInsets.all(2),
-                        child: const Icon(Icons.add,
-                            size: 18, color: Colors.white),
-                      ),
-                  ],
-                ),
-              ),
+              addTile,
               for (final entry in groups.entries)
                 _RingTile(
                   label: storyAuthorName(entry.value.first),
@@ -362,6 +436,7 @@ class _StoryViewerPageState extends State<StoryViewerPage>
   VideoPlayerController? _video;
   String? _signedUrl;
   bool _loadingMedia = true;
+  bool _mediaFailed = false;
   bool _muted = false;
   bool _deleting = false;
   int _loadGeneration = 0;
@@ -393,9 +468,21 @@ class _StoryViewerPageState extends State<StoryViewerPage>
     _progress.reset();
     await _video?.dispose();
     _video = null;
+    // Never index an empty (or out-of-range) list: the build shows the
+    // empty state with a close button instead.
+    if (_stories.isEmpty || _index < 0 || _index >= _stories.length) {
+      if (!mounted) return;
+      setState(() {
+        _loadingMedia = false;
+        _mediaFailed = false;
+        _signedUrl = null;
+      });
+      return;
+    }
     if (!mounted) return;
     setState(() {
       _loadingMedia = true;
+      _mediaFailed = false;
       _signedUrl = null;
     });
     final story = _stories[_index];
@@ -432,11 +519,11 @@ class _StoryViewerPageState extends State<StoryViewerPage>
       }
     } catch (_) {
       if (!mounted || generation != _loadGeneration) return;
-      setState(() => _loadingMedia = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('تعذر تحميل الحالة.')),
-      );
-      _next();
+      // Do NOT auto-skip: stay on this story and explain, with retry/skip.
+      setState(() {
+        _loadingMedia = false;
+        _mediaFailed = true;
+      });
     }
   }
 
@@ -480,14 +567,35 @@ class _StoryViewerPageState extends State<StoryViewerPage>
 
   Future<void> _deleteCurrent() async {
     if (_deleting) return;
+    if (_stories.isEmpty || _index < 0 || _index >= _stories.length) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('حذف الحالة؟'),
+        content: const Text('سيتم حذف هذه الحالة نهائياً.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('إلغاء')),
+          FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('حذف')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
     setState(() => _deleting = true);
     final story = _stories[_index];
     try {
       final client = Supabase.instance.client;
-      await client.from('stories').delete().eq('id', story['id'].toString());
+      // Delete the storage file FIRST, then the DB row: if storage
+      // removal fails, the row is still intact and the user is told the
+      // delete failed (no orphan file, no false "failed" after the row
+      // is already gone).
       await client.storage
           .from('helba-stories')
           .remove([story['media_url'].toString()]);
+      await client.from('stories').delete().eq('id', story['id'].toString());
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('تم حذف الحالة.')),
@@ -513,6 +621,29 @@ class _StoryViewerPageState extends State<StoryViewerPage>
 
   @override
   Widget build(BuildContext context) {
+    // Guard: an empty story list must never be indexed. Show an empty
+    // state with a close button instead of crashing.
+    if (_stories.isEmpty) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: SafeArea(
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text('لا توجد حالات لعرضها.',
+                    style: TextStyle(color: Colors.white)),
+                const SizedBox(height: 16),
+                FilledButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('إغلاق'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
     final story = _stories[_index];
     final isVideo = story['media_type'] == 'video';
     final video = _video;
@@ -526,6 +657,32 @@ class _StoryViewerPageState extends State<StoryViewerPage>
             if (_loadingMedia)
               const Center(
                   child: CircularProgressIndicator(color: Colors.white))
+            else if (_mediaFailed)
+              Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text('تعذّر عرض هذه الحالة.',
+                        style: TextStyle(color: Colors.white)),
+                    const SizedBox(height: 16),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        FilledButton(
+                          onPressed: _loadCurrent,
+                          child: const Text('إعادة المحاولة'),
+                        ),
+                        const SizedBox(width: 12),
+                        OutlinedButton(
+                          onPressed: _next,
+                          child: const Text('تخطَّ',
+                              style: TextStyle(color: Colors.white)),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              )
             else if (isVideo && video != null && video.value.isInitialized)
               Center(
                 child: AspectRatio(
@@ -535,7 +692,35 @@ class _StoryViewerPageState extends State<StoryViewerPage>
               )
             else if (!isVideo && _signedUrl != null)
               Center(
-                child: Image.network(_signedUrl!, fit: BoxFit.contain),
+                child: Image.network(
+                  _signedUrl!,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, __, ___) => Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Text('تعذّر عرض هذه الحالة.',
+                            style: TextStyle(color: Colors.white)),
+                        const SizedBox(height: 16),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            FilledButton(
+                              onPressed: _loadCurrent,
+                              child: const Text('إعادة المحاولة'),
+                            ),
+                            const SizedBox(width: 12),
+                            OutlinedButton(
+                              onPressed: _next,
+                              child: const Text('تخطَّ',
+                                  style: TextStyle(color: Colors.white)),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
               )
             else
               const Center(

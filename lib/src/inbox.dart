@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -5,7 +7,58 @@ import 'admin_panel.dart';
 import 'chat.dart';
 import 'channels.dart';
 import 'config.dart';
+import 'push.dart';
 import 'stories.dart';
+import 'utils.dart';
+
+// ---------------------------------------------------------------------------
+// Pure helpers (unit-tested in test/chat_inbox_helpers_test.dart).
+// ---------------------------------------------------------------------------
+
+/// Normalises Arabic text for search: أ/إ/آ → ا، ة → ه، ي → ى، and
+/// strips diacritics. Applied to both the query and the searchable text.
+String normalizeArabicForSearch(String value) {
+  var text = value;
+  text = text.replaceAll(RegExp(r'[أإآ]'), 'ا');
+  text = text.replaceAll('ة', 'ه');
+  text = text.replaceAll('ي', 'ى');
+  text = text.replaceAll(RegExp(r'[\u064B-\u0652\u0670]'), '');
+  return text;
+}
+
+/// Friendly Arabic message for inbox failures. networkErrorMessage does
+/// not cover TimeoutException (utils.dart is not ours to edit here), so
+/// that case is mapped locally.
+String inboxErrorMessage(Object e) {
+  if (e is TimeoutException) {
+    return 'انتهت المهلة. تحقق من اتصالك بالإنترنت وحاول مجدداً.';
+  }
+  return networkErrorMessage(e) ??
+      'تعذر تحميل المحادثات. تحقق من الاتصال وحاول مجدداً.';
+}
+
+/// Display name for a user row: display_name, else @username, else
+/// the generic fallback — never a blank tile.
+String displayNameForUser(Map<String, dynamic> user) {
+  final display = user['display_name']?.toString().trim();
+  if (display != null && display.isNotEmpty) return display;
+  final username = user['username']?.toString().trim();
+  if (username != null && username.isNotEmpty) return '@$username';
+  return 'مستخدم';
+}
+
+/// Latest message per conversation, from rows ordered newest-first
+/// (first row per conversation wins).
+Map<String, Map<String, dynamic>> latestMessageByConversation(
+    List<Map<String, dynamic>> rows) {
+  final latest = <String, Map<String, dynamic>>{};
+  for (final row in rows) {
+    final id = row['conversation_id']?.toString() ?? '';
+    if (id.isEmpty) continue;
+    latest.putIfAbsent(id, () => row);
+  }
+  return latest;
+}
 
 class InboxPage extends StatefulWidget {
   final bool isAdmin;
@@ -17,30 +70,109 @@ class InboxPage extends StatefulWidget {
 class _InboxPageState extends State<InboxPage> {
   final search = TextEditingController();
   String query = '';
+  Timer? _searchDebounce;
   // The chats future must live in state: creating it inside build() refetched
   // from Supabase on every rebuild, including every keystroke in search.
   late Future<List<Map<String, dynamic>>> _chatsFuture;
+  // Latest message per conversation id (loaded alongside the chats).
+  Map<String, Map<String, dynamic>> _lastMessages = {};
   // Bumped on pull-to-refresh so the story rings reload too.
   final _storiesTick = ValueNotifier<int>(0);
+  bool _refreshing = false;
+  RealtimeChannel? _realtimeChannel;
+  Timer? _realtimeDebounce;
+  bool _pushDeniedPromptShown = false;
 
   @override
   void initState() {
     super.initState();
     _chatsFuture = loadChats();
+    _subscribeInboxRealtime();
+    pushNotificationsPermanentlyDenied.addListener(_onPushDeniedChanged);
   }
 
+  /// One-time prompt when system notifications are permanently denied:
+  /// without them, no alerts arrive while the app is closed. Offers a
+  /// shortcut to the app's notification settings.
+  void _onPushDeniedChanged() {
+    if (!pushNotificationsPermanentlyDenied.value ||
+        _pushDeniedPromptShown ||
+        !mounted) {
+      return;
+    }
+    _pushDeniedPromptShown = true;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Text(
+            'الإشعارات معطّلة من إعدادات النظام — لن تصلك التنبيهات عند إغلاق التطبيق.'),
+        action: SnackBarAction(
+          label: 'الإعدادات',
+          onPressed: () => unawaited(openAppNotificationSettings()),
+        ),
+      ),
+    );
+  }
+
+  /// Live inbox updates: a new message, or a conversation's updated_at
+  /// changing, schedules a debounced refresh (~500ms). One channel for
+  /// both tables; unsubscribed in dispose().
+  void _subscribeInboxRealtime() {
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    if (uid == null) return;
+    final channel = Supabase.instance.client.channel('inbox:$uid');
+    channel.onPostgresChanges(
+        event: PostgresChangeEvent.insert,
+        schema: 'public',
+        table: 'messages',
+        callback: (_) => _scheduleRealtimeRefresh());
+    channel.onPostgresChanges(
+        event: PostgresChangeEvent.update,
+        schema: 'public',
+        table: 'conversations',
+        callback: (_) => _scheduleRealtimeRefresh());
+    channel.subscribe();
+    _realtimeChannel = channel;
+  }
+
+  void _scheduleRealtimeRefresh() {
+    _realtimeDebounce?.cancel();
+    _realtimeDebounce = Timer(const Duration(milliseconds: 500), () {
+      if (mounted) _refresh();
+    });
+  }
+
+  /// Refreshes the inbox but keeps the old (good) data when the refresh
+  /// fails, and never runs two refreshes concurrently.
   Future<void> _refresh() async {
-    final future = loadChats();
-    _storiesTick.value++;
-    if (mounted) setState(() => _chatsFuture = future);
-    // Swallow here: the FutureBuilder above already surfaces the error.
+    if (_refreshing) return;
+    _refreshing = true;
     try {
+      final future = loadChats();
       await future;
-    } catch (_) {}
+      if (mounted) {
+        setState(() => _chatsFuture = future);
+        _storiesTick.value++;
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(inboxErrorMessage(e))),
+        );
+      }
+    } finally {
+      _refreshing = false;
+    }
   }
 
   @override
   void dispose() {
+    pushNotificationsPermanentlyDenied.removeListener(_onPushDeniedChanged);
+    _searchDebounce?.cancel();
+    _realtimeDebounce?.cancel();
+    final channel = _realtimeChannel;
+    if (channel != null) {
+      Supabase.instance.client.removeChannel(channel);
+    }
     search.dispose();
     _storiesTick.dispose();
     super.dispose();
@@ -53,21 +185,111 @@ class _InboxPageState extends State<InboxPage> {
         .from('conversation_members')
         .select(
             'conversation_id, conversations(id,kind,title,is_public,updated_at,conversation_members(user_id,role,profiles(display_name,username)))')
-        .eq('user_id', uid);
-    final chats = rows.cast<Map<String, dynamic>>();
-    // Newest conversation first; the query itself returns no ordering.
-    chats.sort((a, b) {
-      final aUpdated =
-          (a['conversations'] as Map<String, dynamic>?)?['updated_at']
-                  ?.toString() ??
-              '';
-      final bUpdated =
-          (b['conversations'] as Map<String, dynamic>?)?['updated_at']
-                  ?.toString() ??
-              '';
-      return bUpdated.compareTo(aUpdated);
-    });
+        .eq('user_id', uid)
+        .order('updated_at', ascending: false, referencedTable: 'conversations')
+        .limit(100)
+        .timeout(const Duration(seconds: 15));
+    // Drop rows whose embedded conversation is null (orphaned
+    // membership): the builder must never receive one (C1).
+    final chats = rows
+        .cast<Map<String, dynamic>>()
+        .where((r) => r['conversations'] is Map<String, dynamic>)
+        .toList();
+    // Sort by parsed DateTime, not by string comparison (M18).
+    DateTime updatedAtOf(Map<String, dynamic> r) {
+      final raw =
+          (r['conversations'] as Map<String, dynamic>?)?['updated_at']
+              ?.toString();
+      return DateTime.tryParse(raw ?? '') ??
+          DateTime.fromMillisecondsSinceEpoch(0);
+    }
+
+    chats.sort((a, b) => updatedAtOf(b).compareTo(updatedAtOf(a)));
+    // Latest message per conversation, in one query: messages for the
+    // loaded ids, newest first, then pick the first per conversation
+    // client-side. Best-effort: a failure here must not fail the inbox.
+    try {
+      final ids = chats
+          .map((r) =>
+              (r['conversations'] as Map<String, dynamic>)['id']?.toString() ??
+              '')
+          .where((id) => id.isNotEmpty)
+          .toList();
+      if (ids.isNotEmpty) {
+        final messages = await Supabase.instance.client
+            .from('messages')
+            .select('id,conversation_id,sender_id,body,is_encrypted,message_type,created_at')
+            .inFilter('conversation_id', ids)
+            .order('created_at', ascending: false)
+            .limit(100)
+            .timeout(const Duration(seconds: 15));
+        _lastMessages = latestMessageByConversation(
+            messages.cast<Map<String, dynamic>>());
+      }
+    } catch (_) {
+      // Keep whatever last messages we already had (possibly none).
+    }
     return chats;
+  }
+
+  Future<void> _confirmSignOut() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('تسجيل الخروج؟'),
+        content: const Text('هل تريد تسجيل الخروج من هلبة؟'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('إلغاء')),
+          FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('تسجيل الخروج')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    // Await/error/busy handling of the sign-out itself lives in auth.dart;
+    // this dialog is the inbox-side confirmation (M25).
+    await Supabase.instance.client.auth.signOut();
+  }
+
+  String _searchableText(Map<String, dynamic>? c, String? currentUserId) {
+    final members = (c?['conversation_members'] as List<dynamic>? ?? []);
+    final parts = <String>[c?['title']?.toString() ?? ''];
+    for (final m in members) {
+      if (m is! Map) continue;
+      if (m['user_id']?.toString() == currentUserId) continue;
+      final profile = m['profiles'] as Map<String, dynamic>?;
+      parts.add(profile?['display_name']?.toString() ?? '');
+      parts.add(profile?['username']?.toString() ?? '');
+    }
+    return normalizeArabicForSearch(parts.join(' ').toLowerCase());
+  }
+
+  Widget _chatSubtitle(
+      Map<String, dynamic> c, String kind, String? currentUserId) {
+    final last = _lastMessages[c['id']?.toString()];
+    if (last == null) return Text(channelSubtitle(kind));
+    final isEncrypted = last['is_encrypted'] == true;
+    final body = isEncrypted
+        ? '🔒 رسالة مشفّرة'
+        : (last['body']?.toString() ?? '');
+    final fromOther = last['sender_id']?.toString() != currentUserId;
+    final time = DateTime.tryParse(last['created_at']?.toString() ?? '');
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(body,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+                fontWeight: fromOther ? FontWeight.bold : FontWeight.normal)),
+        if (time != null)
+          Text(formatChatTime(time),
+              style: const TextStyle(fontSize: 11, color: Colors.black54)),
+      ],
+    );
   }
 
   @override
@@ -93,7 +315,8 @@ class _InboxPageState extends State<InboxPage> {
                     builder: (_) => const ChannelDirectorySheet()),
                 icon: const Icon(Icons.campaign_outlined)),
             IconButton(
-                onPressed: () => Supabase.instance.client.auth.signOut(),
+                tooltip: 'تسجيل الخروج',
+                onPressed: _confirmSignOut,
                 icon: const Icon(Icons.logout))
           ],
         ),
@@ -113,7 +336,15 @@ class _InboxPageState extends State<InboxPage> {
             padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
             child: TextField(
               controller: search,
-              onChanged: (v) => setState(() => query = v),
+              onChanged: (v) {
+                // Debounce the setState so per-keystroke typing does not
+                // rebuild the whole screen (M26).
+                _searchDebounce?.cancel();
+                _searchDebounce =
+                    Timer(const Duration(milliseconds: 150), () {
+                  if (mounted) setState(() => query = v);
+                });
+              },
               decoration: InputDecoration(
                   hintText: 'ابحث في محادثاتك',
                   prefixIcon: const Icon(Icons.search),
@@ -134,48 +365,66 @@ class _InboxPageState extends State<InboxPage> {
                         return const Center(child: CircularProgressIndicator());
                       }
                       if (snap.hasError) {
-                        return Center(
-                            child:
-                                Text('تعذر تحميل المحادثات: ${snap.error}'));
+                        // Scrollable so pull-to-refresh still fires, with
+                        // a retry button and a mapped Arabic error (B6).
+                        return ListView(
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          children: [
+                            Padding(
+                              padding: const EdgeInsets.all(32),
+                              child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(inboxErrorMessage(snap.error!),
+                                        textAlign: TextAlign.center),
+                                    const SizedBox(height: 16),
+                                    FilledButton(
+                                        onPressed: _refresh,
+                                        child:
+                                            const Text('إعادة المحاولة')),
+                                  ]),
+                            ),
+                          ],
+                        );
                       }
                       final currentUserId =
                           Supabase.instance.client.auth.currentUser?.id;
+                      final normalizedQuery = normalizeArabicForSearch(
+                          query.trim().toLowerCase());
                       final chats = (snap.data ?? []).where((r) {
                         final c = r['conversations'] as Map<String, dynamic>?;
-                        final members =
-                            (c?['conversation_members'] as List<dynamic>? ??
-                                []);
-                        final others = members
-                            .where((m) =>
-                                m is Map &&
-                                m['user_id']?.toString() != currentUserId)
-                            .toList();
-                        final other = others.isEmpty
-                            ? null
-                            : Map<String, dynamic>.from(others.first as Map);
-                        final profile =
-                            other?['profiles'] as Map<String, dynamic>?;
-                        final searchable = [
-                          c?['title']?.toString() ?? '',
-                          profile?['display_name']?.toString() ?? '',
-                          profile?['username']?.toString() ?? '',
-                        ].join(' ').toLowerCase();
-                        return searchable
-                            .contains(query.trim().toLowerCase());
+                        if (c == null) return false;
+                        return _searchableText(c, currentUserId)
+                            .contains(normalizedQuery);
                       }).toList();
                       if (chats.isEmpty) {
-                        return query.trim().isEmpty
-                            ? const _EmptyInbox()
-                            : const Center(
-                                child: Text('لا توجد نتائج مطابقة لبحثك.'));
+                        return ListView(
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          children: [
+                            query.trim().isEmpty
+                                ? const _EmptyInbox()
+                                : const Padding(
+                                    padding: EdgeInsets.all(32),
+                                    child: Text(
+                                        'لا توجد نتائج مطابقة لبحثك.',
+                                        textAlign: TextAlign.center)),
+                          ],
+                        );
                       }
                       return ListView.separated(
+                        physics: const AlwaysScrollableScrollPhysics(),
                         itemCount: chats.length,
                         separatorBuilder: (_, __) =>
                             const Divider(indent: 84, height: 1),
                         itemBuilder: (context, i) {
-                          final c =
-                              chats[i]['conversations'] as Map<String, dynamic>;
+                          // Nullable cast with a fallback tile (C1):
+                          // a null conversation never crashes the inbox.
+                          final c = chats[i]['conversations']
+                              as Map<String, dynamic>?;
+                          if (c == null) {
+                            return const ListTile(
+                                title: Text('محادثة غير متوفرة'));
+                          }
                           final members =
                               (c['conversation_members'] as List<dynamic>? ??
                                   []);
@@ -237,7 +486,8 @@ class _InboxPageState extends State<InboxPage> {
                                           color: green)),
                                 ),
                             ]),
-                            subtitle: Text(channelSubtitle(kind)),
+                            subtitle:
+                                _chatSubtitle(c, kind, currentUserId),
                             onTap: () => Navigator.push(
                                 context,
                                 MaterialPageRoute(
@@ -290,10 +540,21 @@ class _NewChatSheetState extends State<NewChatSheet> {
   bool get creatingChannel => mode == 'channel';
   bool get creatingGroupOrChannel => creatingGroup || creatingChannel;
   String? error;
+  bool _searchHint = false;
 
   int _searchRequest = 0;
+  Timer? _findUsersTimer;
 
-  Future<void> findUsers(String value) async {
+  /// Debounced user search (300ms): the actual query runs in
+  /// _doFindUsers, not on every keystroke (M14).
+  void findUsers(String value) {
+    _findUsersTimer?.cancel();
+    _findUsersTimer = Timer(const Duration(milliseconds: 300), () {
+      _doFindUsers(value);
+    });
+  }
+
+  Future<void> _doFindUsers(String value) async {
     final term = value.trim().replaceAll(RegExp(r'[,(){}]'), ' ');
     final request = ++_searchRequest;
     if (term.length < 2) {
@@ -302,6 +563,8 @@ class _NewChatSheetState extends State<NewChatSheet> {
           users = [];
           busy = false;
           error = null;
+          // Hint for short terms instead of silently clearing (M14).
+          _searchHint = term.isNotEmpty;
         });
       }
       return;
@@ -310,22 +573,45 @@ class _NewChatSheetState extends State<NewChatSheet> {
       setState(() {
         busy = true;
         error = null;
+        _searchHint = false;
       });
     }
     try {
-      final me = Supabase.instance.client.auth.currentUser!.id;
+      final me = Supabase.instance.client.auth.currentUser?.id;
+      if (me == null) {
+        if (mounted && request == _searchRequest) {
+          setState(() => error = 'انتهت الجلسة. سجّل الدخول مجدداً.');
+        }
+        return;
+      }
       final safeTerm = term.replaceAll('%', '').replaceAll('_', '');
+      // A term of only %/_ would become an empty pattern matching ALL
+      // users: skip the query instead (M14).
+      if (safeTerm.trim().isEmpty) {
+        if (mounted && request == _searchRequest) {
+          setState(() {
+            users = [];
+            error = null;
+          });
+        }
+        return;
+      }
       final result = await Supabase.instance.client
           .from('profiles')
           .select('id,display_name,username')
           .neq('id', me)
           .or('username.ilike.%$safeTerm%,display_name.ilike.%$safeTerm%')
-          .limit(20);
+          .limit(20)
+          .timeout(const Duration(seconds: 15));
       if (!mounted || request != _searchRequest) return;
       setState(() {
         users = result.cast<Map<String, dynamic>>();
         error = null;
       });
+    } on TimeoutException {
+      if (mounted && request == _searchRequest) {
+        setState(() => error = 'انتهت المهلة. تحقق من الاتصال وحاول مجدداً.');
+      }
     } catch (_) {
       if (mounted && request == _searchRequest) {
         setState(() => error = 'تعذر البحث عن المستخدمين.');
@@ -347,23 +633,40 @@ class _NewChatSheetState extends State<NewChatSheet> {
       error = null;
     });
     try {
-      final result = await Supabase.instance.client.rpc(
-        'create_group_conversation',
-        params: {
-          'group_title': groupTitle.text.trim(),
-          'member_ids': selectedIds.toList()
-        },
-      );
+      final result = await Supabase.instance.client
+          .rpc(
+            'create_group_conversation',
+            params: {
+              'group_title': groupTitle.text.trim(),
+              'member_ids': selectedIds.toList()
+            },
+          )
+          .timeout(const Duration(seconds: 20));
       if (!mounted) return;
+      // Validate the RPC result as a UUID before navigating: a null
+      // result .toString()s to the literal string "null" (M16).
+      final conversationId = asUuidOrNull(result);
+      if (conversationId == null) {
+        setState(() =>
+            error = 'تعذر إنشاء المجموعة. تحقق من إعداد قاعدة البيانات.');
+        return;
+      }
       final title = groupTitle.text.trim();
-      Navigator.pop(context);
-      Navigator.push(
-          context,
-          MaterialPageRoute(
-              builder: (_) => ChatPage(
-                  conversationId: result.toString(),
-                  title: title,
-                  kind: 'group')));
+      // Capture the navigator before popping: the sheet's context is
+      // deactivated by the pop (C2).
+      final nav = Navigator.of(context);
+      nav.pop();
+      nav.push(MaterialPageRoute(
+          builder: (_) => ChatPage(
+              conversationId: conversationId,
+              title: title,
+              kind: 'group',
+              isAdmin: true)));
+    } on TimeoutException {
+      if (mounted) {
+        setState(() =>
+            error = 'انتهت المهلة. تحقق من الاتصال وحاول مجدداً.');
+      }
     } catch (_) {
       if (mounted) {
         setState(() =>
@@ -375,8 +678,9 @@ class _NewChatSheetState extends State<NewChatSheet> {
   }
 
   Future<void> createChannel() async {
-    if (groupTitle.text.trim().length < 2 || selectedIds.isEmpty) {
-      setState(() => error = 'اكتب اسم القناة واختر عضواً واحداً على الأقل.');
+    // A solo channel is allowed: members are optional here (M16).
+    if (groupTitle.text.trim().length < 2) {
+      setState(() => error = 'اكتب اسم القناة.');
       return;
     }
     setState(() {
@@ -384,23 +688,36 @@ class _NewChatSheetState extends State<NewChatSheet> {
       error = null;
     });
     try {
-      final result = await Supabase.instance.client.rpc(
-        'create_channel',
-        params: {
-          'channel_title': groupTitle.text.trim(),
-          'member_ids': selectedIds.toList()
-        },
-      );
+      final result = await Supabase.instance.client
+          .rpc(
+            'create_channel',
+            params: {
+              'channel_title': groupTitle.text.trim(),
+              'member_ids': selectedIds.toList()
+            },
+          )
+          .timeout(const Duration(seconds: 20));
       if (!mounted) return;
+      final conversationId = asUuidOrNull(result);
+      if (conversationId == null) {
+        setState(() =>
+            error = 'تعذر إنشاء القناة. تحقق من إعداد قاعدة البيانات.');
+        return;
+      }
       final title = groupTitle.text.trim();
-      Navigator.pop(context);
-      Navigator.push(
-          context,
-          MaterialPageRoute(
-              builder: (_) => ChatPage(
-                  conversationId: result.toString(),
-                  title: title,
-                  kind: 'channel')));
+      final nav = Navigator.of(context);
+      nav.pop();
+      nav.push(MaterialPageRoute(
+          builder: (_) => ChatPage(
+              conversationId: conversationId,
+              title: title,
+              kind: 'channel',
+              isAdmin: true)));
+    } on TimeoutException {
+      if (mounted) {
+        setState(() =>
+            error = 'انتهت المهلة. تحقق من الاتصال وحاول مجدداً.');
+      }
     } catch (_) {
       if (mounted) {
         setState(() =>
@@ -414,17 +731,36 @@ class _NewChatSheetState extends State<NewChatSheet> {
   Future<void> startChat(Map<String, dynamic> user) async {
     setState(() => busy = true);
     try {
-      final result = await Supabase.instance.client.rpc(
-          'create_direct_conversation',
-          params: {'target_user': user['id']});
+      final result = await Supabase.instance.client
+          .rpc('create_direct_conversation',
+              params: {'target_user': user['id']})
+          .timeout(const Duration(seconds: 20));
       if (!mounted) return;
-      Navigator.pop(context);
-      Navigator.push(
-          context,
-          MaterialPageRoute(
-              builder: (_) => ChatPage(
-                  conversationId: result.toString(),
-                  title: user['display_name']?.toString() ?? 'محادثة')));
+      final conversationId = asUuidOrNull(result);
+      if (conversationId == null) {
+        setState(() =>
+            error = 'تعذر إنشاء المحادثة. تحقق من إعداد قاعدة البيانات.');
+        return;
+      }
+      // Trim-or-fallback title: an empty-string display name must not
+      // yield an empty title (M16).
+      final display = user['display_name']?.toString().trim();
+      final username = user['username']?.toString().trim();
+      final title = (display != null && display.isNotEmpty)
+          ? display
+          : (username != null && username.isNotEmpty)
+              ? '@$username'
+              : 'محادثة';
+      final nav = Navigator.of(context);
+      nav.pop();
+      nav.push(MaterialPageRoute(
+          builder: (_) =>
+              ChatPage(conversationId: conversationId, title: title)));
+    } on TimeoutException {
+      if (mounted) {
+        setState(() =>
+            error = 'انتهت المهلة. تحقق من الاتصال وحاول مجدداً.');
+      }
     } catch (_) {
       if (mounted) {
         setState(() => error = 'تعذر إنشاء المحادثة. تحقق من إعداد قاعدة البيانات.');
@@ -436,6 +772,7 @@ class _NewChatSheetState extends State<NewChatSheet> {
 
   @override
   void dispose() {
+    _findUsersTimer?.cancel();
     controller.dispose();
     groupTitle.dispose();
     super.dispose();
@@ -478,6 +815,11 @@ class _NewChatSheetState extends State<NewChatSheet> {
               mode = selected.first;
               selectedIds.clear();
               error = null;
+              // Mode switch clears stale search results AND text (M30).
+              users = [];
+              controller.clear();
+              _searchHint = false;
+              _findUsersTimer?.cancel();
             }),
           ),
           if (creatingGroupOrChannel) ...[
@@ -498,6 +840,11 @@ class _NewChatSheetState extends State<NewChatSheet> {
                   hintText: 'ابحث بالاسم أو اسم المستخدم',
                   prefixIcon: Icon(Icons.search),
                   border: OutlineInputBorder())),
+          if (_searchHint)
+            const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: Text('اكتب حرفين على الأقل للبحث.',
+                    style: TextStyle(color: Colors.black54))),
           if (busy)
             const Padding(
                 padding: EdgeInsets.all(10), child: LinearProgressIndicator()),
@@ -507,11 +854,15 @@ class _NewChatSheetState extends State<NewChatSheet> {
               child: ListView(
                   shrinkWrap: true,
                   children: users
-                      .map((u) => ListTile(
+                      .map((u) {
+                        final username = u['username']?.toString().trim() ?? '';
+                        return ListTile(
                             leading:
                                 const CircleAvatar(child: Icon(Icons.person)),
-                            title: Text(u['display_name']?.toString() ?? ''),
-                            subtitle: Text('@${u['username'] ?? ''}'),
+                            title: Text(displayNameForUser(u)),
+                            subtitle: username.isNotEmpty
+                                ? Text('@$username')
+                                : null,
                             trailing: creatingGroupOrChannel
                                 ? Checkbox(
                                     value: selectedIds
@@ -538,7 +889,8 @@ class _NewChatSheetState extends State<NewChatSheet> {
                                 startChat(u);
                               }
                             },
-                          ))
+                          );
+                      })
                       .toList())),
           if (creatingGroupOrChannel)
             Padding(

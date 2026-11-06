@@ -14,6 +14,8 @@
 //     before anyone wrapped the key for them.
 //   * Attachments (files in Storage) are NOT end-to-end encrypted by this
 //     scheme — only text message bodies are. sendAttachment() is unchanged.
+//     The UI label for that (finding #29) is the chat agent's job
+//     (chat.dart), not this file's.
 //   * The server still sees who talks to whom, when, and message metadata;
 //     only the text body is opaque to it.
 //
@@ -24,9 +26,14 @@
 //   * Each conversation has one random 32-byte AES-256-GCM key. It is
 //     wrapped (AES-256-GCM, fresh nonce) once per member with a
 //     key-encryption key derived from the X25519 shared secret between the
-//     wrapper and that member (HKDF-SHA256, info 'helba-e2e-kek-v1'), and
+//     wrapper and that member (HKDF-SHA256, info
+//     'helba-e2e-kek-v1:<conversationId>'), and
 //     stored in public.conversation_keys (one row per member, RLS: each
-//     user reads only their own row).
+//     user reads only their own row). Rows wrapped by the pre-fix code
+//     used the unbound info 'helba-e2e-kek-v1'; unwrapConversationKey()
+//     falls back to that legacy KEK once when the bound KEK fails, so
+//     existing encrypted conversations keep working. New wraps always
+//     use the conversation-bound KEK.
 //   * Message storage format (defined in exactly one place, here):
 //     messages.nonce = base64(12-byte random GCM nonce, fresh per message)
 //     messages.ciphertext = base64(cipherText || mac) where mac is the
@@ -41,9 +48,9 @@
 
 import 'dart:convert';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart';
+import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'config.dart';
@@ -54,8 +61,50 @@ const encryptedMessagePlaceholder = '🔒 رسالة مشفّرة';
 const _privateKeyStorageKey = 'helba_e2e_private_key';
 
 /// HKDF info string binding the derived key-encryption key to this app
-/// and scheme version. Changing it makes old wrapped keys undecryptable.
+/// and scheme version. Changing it makes old wrapped keys undecryptable
+/// (see the legacy fallback in [unwrapConversationKey]).
 const _kekInfo = 'helba-e2e-kek-v1';
+
+/// HKDF info for a conversation: the KEK is bound to the conversation
+/// id (finding #26), so a wrapped row cannot be transplanted into another
+/// conversation and one pairwise KEK compromise does not expose every
+/// conversation between the same two users. A null/empty id keeps the
+/// legacy unbound info, for callers (and tests) that predate binding.
+String _kekInfoFor(String? conversationId) =>
+    conversationId == null || conversationId.isEmpty
+        ? _kekInfo
+        : '$_kekInfo:$conversationId';
+
+/// Thrown by [decryptText] when the stored row is malformed — missing
+/// ciphertext/nonce, invalid base64, a nonce of the wrong length, or a
+/// ciphertext shorter than the GCM tag — as opposed to a wrong key or
+/// tampered data (which throws [SecretBoxAuthenticationError]).
+///
+/// Extends [FormatException], so existing `catch (FormatException)`
+/// handlers still work; the UI layer can distinguish it with
+/// `is MalformedEncryptedMessageException` and show "رسالة تالفة"
+/// instead of "تعذّر فك تشفير هذه الرسالة" (finding #30).
+class MalformedEncryptedMessageException extends FormatException {
+  const MalformedEncryptedMessageException([
+    super.message = 'malformed encrypted message',
+  ]);
+}
+
+/// True only when [key] is a usable X25519 public key: valid base64
+/// decoding to exactly 32 bytes. Any other non-empty string (a truncated
+/// profile value, a typo, a key from another scheme) is NOT usable —
+/// [canEncryptFor] and [wrapKeyForMembers] reject it instead of silently
+/// excluding that member forever (finding #24). Never logs the key.
+bool isValidPublicKey(String? key) {
+  if (key == null) return false;
+  final trimmed = key.trim();
+  if (trimmed.isEmpty) return false;
+  try {
+    return decodeBase64(trimmed).length == 32;
+  } catch (_) {
+    return false;
+  }
+}
 
 /// GCM tag (MAC) length in bytes, appended to the ciphertext.
 const _gcmTagLength = 16;
@@ -82,13 +131,15 @@ bool isEncryptedMessage(Map<String, dynamic> row) {
   return ciphertext is String && ciphertext.isNotEmpty;
 }
 
-/// True only when EVERY member (including me) has a non-empty public key.
-/// An empty member list can never be encrypted (nothing proves who the
-/// members even are).
+/// True only when EVERY member (including me) has a valid public key
+/// (see [isValidPublicKey]: base64, exactly 32 bytes). An empty member
+/// list can never be encrypted (nothing proves who the members even
+/// are). NOTE: a placeholder string such as 'key-a' is NOT valid — the
+/// pre-fix test matrix that treated any non-empty string as a key is
+/// outdated; see test/e2ee_push_fix_test.dart.
 bool canEncryptFor(Map<String, String?> memberPublicKeys) {
   if (memberPublicKeys.isEmpty) return false;
-  return memberPublicKeys.values
-      .every((key) => key != null && key.trim().isNotEmpty);
+  return memberPublicKeys.values.every(isValidPublicKey);
 }
 
 /// A fresh random 32-byte conversation key.
@@ -102,27 +153,54 @@ List<int> generateConversationKey() {
 }
 
 /// Derives the 32-byte key-encryption key from a raw X25519 shared secret
-/// with HKDF-SHA256 (info 'helba-e2e-kek-v1'). The raw shared secret is
+/// with HKDF-SHA256. When [conversationId] is given, the HKDF info is
+/// `helba-e2e-kek-v1:<conversationId>` (finding #26: the KEK is bound to
+/// the conversation); without it the legacy unbound info is used, so
+/// pre-binding callers and tests keep working. The raw shared secret is
 /// never used directly as an encryption key.
-Future<List<int>> deriveKeyEncryptionKey(List<int> sharedSecretBytes) async {
+Future<List<int>> deriveKeyEncryptionKey(
+  List<int> sharedSecretBytes, {
+  String? conversationId,
+}) async {
   final derived = await _hkdf.deriveKey(
     secretKey: SecretKeyData(sharedSecretBytes),
     nonce: const <int>[],
-    info: utf8.encode(_kekInfo),
+    info: utf8.encode(_kekInfoFor(conversationId)),
   );
   return derived.extractBytes();
 }
 
 /// X25519 shared secret between my private key and their public key.
 /// The two sides compute the same bytes (tested: symmetry).
+///
+/// Validates the peer key first (finding #28): it must be valid base64
+/// decoding to exactly 32 bytes, otherwise a clear [FormatException]
+/// is thrown instead of a cryptic failure deep inside the X25519 call.
+/// A single garbage profiles.public_key must not silently poison every
+/// wrap/unwrap that touches it.
 Future<List<int>> deriveSharedSecret(
   List<int> myPrivateKeyBytes,
   String theirPublicKeyBase64,
 ) async {
+  List<int> theirPublicKeyBytes;
+  try {
+    theirPublicKeyBytes = decodeBase64(theirPublicKeyBase64.trim());
+  } catch (_) {
+    throw const FormatException(
+      'Invalid peer public key: not valid base64 (expected a 32-byte '
+      'X25519 public key)',
+    );
+  }
+  if (theirPublicKeyBytes.length != 32) {
+    throw FormatException(
+      'Invalid peer public key: decoded to '
+      '${theirPublicKeyBytes.length} bytes, expected 32 (X25519)',
+    );
+  }
   final keyPair =
       await _x25519.newKeyPairFromSeed(myPrivateKeyBytes);
   final theirPublicKey = SimplePublicKey(
-    decodeBase64(theirPublicKeyBase64),
+    theirPublicKeyBytes,
     type: KeyPairType.x25519,
   );
   final shared = await _x25519.sharedSecretKey(
@@ -136,14 +214,18 @@ Future<List<int>> deriveSharedSecret(
 /// derived from my private key + their public key. Result is
 /// base64(nonce || cipherText || mac) with a fresh random nonce.
 /// Throws on bad input; callers treat failure as "cannot wrap for them".
+/// When [conversationId] is given the KEK is bound to that conversation
+/// (finding #26); new wraps should always pass it.
 Future<String> wrapConversationKey(
   List<int> convKeyBytes,
   List<int> myPrivateKeyBytes,
-  String theirPublicKeyBase64,
-) async {
+  String theirPublicKeyBase64, {
+  String? conversationId,
+}) async {
   final shared =
       await deriveSharedSecret(myPrivateKeyBytes, theirPublicKeyBase64);
-  final kek = await deriveKeyEncryptionKey(shared);
+  final kek =
+      await deriveKeyEncryptionKey(shared, conversationId: conversationId);
   final box = await _aesGcm.encrypt(
     convKeyBytes,
     secretKey: SecretKeyData(kek),
@@ -160,11 +242,20 @@ Future<String> wrapConversationKey(
 /// needed to derive the same shared secret. Throws (including
 /// SecretBoxAuthenticationError) on a wrong key or tampered data — callers
 /// treat any throw as "cannot decrypt".
+///
+/// When [conversationId] is given, the conversation-bound KEK is tried
+/// first; if that fails, the legacy unbound KEK ('helba-e2e-kek-v1') is
+/// tried once, so wrapped rows created before conversation binding
+/// (finding #26) keep unwrapping. This fallback is deliberate and
+/// documented — it is what makes the KEK change non-breaking for
+/// existing encrypted conversations. Without [conversationId] only the
+/// legacy KEK is tried (pre-binding behaviour).
 Future<List<int>> unwrapConversationKey(
   String wrappedBase64,
   List<int> myPrivateKeyBytes,
-  String wrapperPublicKeyBase64,
-) async {
+  String wrapperPublicKeyBase64, {
+  String? conversationId,
+}) async {
   final wrapped = decodeBase64(wrappedBase64);
   if (wrapped.length <= _aesGcmNonceLength + _gcmTagLength) {
     throw const FormatException('Wrapped key too short');
@@ -176,11 +267,25 @@ Future<List<int>> unwrapConversationKey(
   final mac = Mac(cipherAndTag.sublist(cipherAndTag.length - _gcmTagLength));
   final shared =
       await deriveSharedSecret(myPrivateKeyBytes, wrapperPublicKeyBase64);
-  final kek = await deriveKeyEncryptionKey(shared);
-  return _aesGcm.decrypt(
-    SecretBox(cipherText, nonce: nonce, mac: mac),
-    secretKey: SecretKeyData(kek),
-  );
+  Future<List<int>> tryUnwrap({String? convId}) async {
+    final kek =
+        await deriveKeyEncryptionKey(shared, conversationId: convId);
+    return _aesGcm.decrypt(
+      SecretBox(cipherText, nonce: nonce, mac: mac),
+      secretKey: SecretKeyData(kek),
+    );
+  }
+
+  if (conversationId == null || conversationId.isEmpty) {
+    return tryUnwrap();
+  }
+  try {
+    return await tryUnwrap(convId: conversationId);
+  } catch (_) {
+    // Bound KEK failed: this row may predate conversation binding.
+    // One legacy attempt; its error (if any) is the one reported.
+    return tryUnwrap();
+  }
 }
 
 /// Encrypts one text message body with the conversation key.
@@ -206,22 +311,50 @@ Future<({String ciphertext, String nonce})> encryptText(
 /// Decrypts a message body stored by [encryptText]. Splits the last 16
 /// bytes of the ciphertext back off as the GCM tag. Throws
 /// (SecretBoxAuthenticationError on a wrong key or tampered data,
-/// FormatException on malformed input) — callers show
-/// 'تعذّر فك تشفير هذه الرسالة' instead of the body.
+/// [MalformedEncryptedMessageException] — a [FormatException] — on
+/// malformed input, finding #30) — callers show
+/// 'تعذّر فك تشفير هذه الرسالة' instead of the body, and can show
+/// 'رسالة تالفة' for the malformed case.
 Future<String> decryptText(
   String ciphertextBase64,
   String nonceBase64,
   List<int> convKeyBytes,
 ) async {
-  final cipherAndTag = decodeBase64(ciphertextBase64);
+  // Pre-validate (finding #30): a row with a missing/empty ciphertext or
+  // nonce, invalid base64, or a wrong-length nonce is malformed, not a
+  // wrong key — report it distinctly instead of letting it surface as a
+  // generic decrypt failure.
+  if (ciphertextBase64.trim().isEmpty || nonceBase64.trim().isEmpty) {
+    throw const MalformedEncryptedMessageException(
+      'malformed encrypted message: missing ciphertext or nonce',
+    );
+  }
+  List<int> cipherAndTag;
+  List<int> nonceBytes;
+  try {
+    cipherAndTag = decodeBase64(ciphertextBase64.trim());
+    nonceBytes = decodeBase64(nonceBase64.trim());
+  } on FormatException {
+    throw const MalformedEncryptedMessageException(
+      'malformed encrypted message: ciphertext or nonce is not valid base64',
+    );
+  }
   if (cipherAndTag.length < _gcmTagLength) {
-    throw const FormatException('Ciphertext too short');
+    throw const MalformedEncryptedMessageException(
+      'malformed encrypted message: ciphertext too short',
+    );
+  }
+  if (nonceBytes.length != _aesGcmNonceLength) {
+    throw MalformedEncryptedMessageException(
+      'malformed encrypted message: nonce is ${nonceBytes.length} bytes, '
+      'expected $_aesGcmNonceLength',
+    );
   }
   final cipherText =
       cipherAndTag.sublist(0, cipherAndTag.length - _gcmTagLength);
   final mac = Mac(cipherAndTag.sublist(cipherAndTag.length - _gcmTagLength));
   final plain = await _aesGcm.decrypt(
-    SecretBox(cipherText, nonce: decodeBase64(nonceBase64), mac: mac),
+    SecretBox(cipherText, nonce: nonceBytes, mac: mac),
     secretKey: SecretKeyData(convKeyBytes),
   );
   return utf8.decode(plain);
@@ -231,12 +364,54 @@ Future<String> decryptText(
 // Keypair management (secure storage + profiles.public_key).
 // ---------------------------------------------------------------------------
 
+/// Memoised in-flight/completed keypair load (finding #22): concurrent
+/// callers share one [Future], so two racing callers can never generate
+/// two different keypairs. Cleared on failure so a later call retries.
+Future<SimpleKeyPair>? _pairFuture;
+
+/// True when the stored private key was corrupt and [ensureKeyPair]
+/// generated a replacement pair. The profile's public key then has to be
+/// republished (see [publishPublicKeyIfNeeded], which now compares
+/// instead of only filling an empty slot). Stays true until a publish
+/// succeeds, so a failed (e.g. offline) republish is retried by the
+/// next [publishPublicKeyIfNeeded] call instead of being forgotten.
+bool _keyWasReplaced = false;
+
+/// Whether the local keypair was replaced because the stored private key
+/// was corrupt/unparseable. Callers (chat) can use this to force a
+/// [publishPublicKeyIfNeeded] after [ensureKeyPair]; the publish itself
+/// is also attempted inside [ensureKeyPair] (best-effort) and retried by
+/// [publishPublicKeyIfNeeded] whenever the profile key differs.
+bool get e2eKeyWasReplaced => _keyWasReplaced;
+
 /// Loads my X25519 keypair from secure storage, generating and storing a
 /// fresh one (private key bytes, base64) when absent. The private key
 /// never leaves the device. Restoring re-derives the same public key:
 /// the stored bytes are the clamped private-key bytes returned by
 /// extractPrivateKeyBytes(), which newKeyPairFromSeed() accepts as-is.
-Future<SimpleKeyPair> ensureKeyPair() async {
+///
+/// Memoised (finding #22): concurrent callers share one future. If the
+/// stored bytes are corrupt, a fresh pair is generated AND the new
+/// public key is republished to the profile (finding #21) — the old
+/// code generated a fresh private key but left the OLD public key in
+/// the profile, permanently bricking E2E on that device.
+Future<SimpleKeyPair> ensureKeyPair() {
+  final existing = _pairFuture;
+  if (existing != null) return existing;
+  final future = _ensureKeyPairUncached();
+  _pairFuture = future;
+  // A failed attempt must not poison the memo: clear it so a retry is
+  // possible (finding #22).
+  future.then(
+    (_) {},
+    onError: (_) {
+      if (identical(_pairFuture, future)) _pairFuture = null;
+    },
+  );
+  return future;
+}
+
+Future<SimpleKeyPair> _ensureKeyPairUncached() async {
   final stored = await secureStore.read(key: _privateKeyStorageKey);
   if (stored != null && stored.isNotEmpty) {
     try {
@@ -244,7 +419,10 @@ Future<SimpleKeyPair> ensureKeyPair() async {
     } catch (_) {
       // A corrupt stored key must not brick messaging: fall through and
       // generate a fresh pair (old wrapped rows become unreadable on this
-      // device, which the reader reports honestly).
+      // device, which the reader reports honestly) — but the profile
+      // MUST learn the new public key (finding #21), or nobody can wrap
+      // anything for this device ever again.
+      _keyWasReplaced = true;
     }
   }
   final pair = await _x25519.newKeyPair();
@@ -253,7 +431,45 @@ Future<SimpleKeyPair> ensureKeyPair() async {
     key: _privateKeyStorageKey,
     value: base64Encode(privateBytes),
   );
+  if (_keyWasReplaced) {
+    // Best-effort, never throws: if there is no signed-in user or no
+    // network, publishPublicKeyIfNeeded() (which compares keys) republishes
+    // on the next chat/send attempt.
+    await _publishReplacedPublicKey(pair);
+  }
   return pair;
+}
+
+/// Publishes [pair]'s public key to profiles.public_key when the stored
+/// profile key differs from it (including when it is empty). Shared by
+/// [publishPublicKeyIfNeeded] and the corrupt-key replacement path in
+/// [_ensureKeyPairUncached]; never calls [ensureKeyPair] itself, so
+/// there is no recursion. Never throws.
+Future<void> _publishReplacedPublicKey(SimpleKeyPair pair) async {
+  try {
+    final client = Supabase.instance.client;
+    final uid = client.auth.currentUser?.id;
+    if (uid == null) return;
+    final publicKey = await myPublicKeyBase64(pair);
+    final row = await client
+        .from('profiles')
+        .select('public_key')
+        .eq('id', uid)
+        .maybeSingle();
+    final existing = row?['public_key']?.toString() ?? '';
+    if (existing.trim() == publicKey) {
+      _keyWasReplaced = false;
+      return;
+    }
+    await client
+        .from('profiles')
+        .update({'public_key': publicKey})
+        .eq('id', uid);
+    _keyWasReplaced = false;
+  } catch (_) {
+    // Best-effort: the flag stays set and publishPublicKeyIfNeeded()
+    // retries on the next call.
+  }
 }
 
 /// Base64 of the public key bytes of [pair].
@@ -262,23 +478,31 @@ Future<String> myPublicKeyBase64(SimpleKeyPair pair) async {
   return base64Encode(publicKey.bytes);
 }
 
-/// Publishes my public key to profiles.public_key when it is not already
-/// set. Best-effort by callers: a failure must never block sending.
+/// Publishes my public key to profiles.public_key when the profile key
+/// differs from my CURRENT local public key — not merely when it is
+/// empty (finding #21). After a corrupt-key replacement or a reinstall,
+/// the profile still holds the OLD public key while the device holds a
+/// NEW private key; comparing and updating here is what heals that.
+/// Best-effort by callers: a failure must never block sending.
 /// Requires migration 012's extended column-level UPDATE grant.
 Future<void> publishPublicKeyIfNeeded({SimpleKeyPair? pair}) async {
   final client = Supabase.instance.client;
   final uid = client.auth.currentUser?.id;
   if (uid == null) return;
+  final keyPair = pair ?? await ensureKeyPair();
+  final publicKey = await myPublicKeyBase64(keyPair);
   final row = await client
       .from('profiles')
       .select('public_key')
       .eq('id', uid)
       .maybeSingle();
   final existing = row?['public_key']?.toString() ?? '';
-  if (existing.trim().isNotEmpty) return;
-  final keyPair = pair ?? await ensureKeyPair();
-  final publicKey = await myPublicKeyBase64(keyPair);
+  if (existing.trim() == publicKey) {
+    _keyWasReplaced = false;
+    return;
+  }
   await client.from('profiles').update({'public_key': publicKey}).eq('id', uid);
+  _keyWasReplaced = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -302,10 +526,24 @@ Future<void> wrapKeyForMembers(
   for (final entry in memberPublicKeys.entries) {
     final userId = entry.key;
     final publicKey = entry.value;
-    if (publicKey == null || publicKey.trim().isEmpty) continue;
+    if (!isValidPublicKey(publicKey)) {
+      // Log the user id only — never key material (finding #24/#28).
+      // A member with a corrupt profile key is skipped, not wrapped for;
+      // canEncryptFor() reports the same member as unencryptable, so the
+      // sender falls back to plaintext with the 🔓 label instead of
+      // silently encrypting for everyone-but-them.
+      debugPrint(
+        'Helba E2E: skipping wrap for member $userId: invalid public key',
+      );
+      continue;
+    }
     try {
-      final wrapped =
-          await wrapConversationKey(convKeyBytes, myPrivate, publicKey);
+      final wrapped = await wrapConversationKey(
+        convKeyBytes,
+        myPrivate,
+        publicKey!,
+        conversationId: conversationId,
+      );
       await client.from('conversation_keys').upsert(
         {
           'conversation_id': conversationId,
@@ -315,13 +553,100 @@ Future<void> wrapKeyForMembers(
         },
         onConflict: 'conversation_id,user_id',
       );
-    } catch (_) {
+    } catch (e) {
       // One member unwrappable now (bad key, network blip) — the next
-      // send retries via the same lazy re-wrap.
+      // send retries via the same lazy re-wrap. Log the user id only,
+      // never key material.
+      debugPrint('Helba E2E: wrap failed for member $userId: $e');
     }
   }
 }
 
+/// Outcome of looking up my own wrapped conversation-key row.
+enum _MyKeyOutcome {
+  /// No row for me (yet).
+  noRow,
+
+  /// Row exists and unwrapped successfully.
+  loaded,
+
+  /// Row exists but cannot be used (no wrapper public key, or it does
+  /// not unwrap): creating a fresh key over it would orphan the old
+  /// messages, so the caller must NOT create one.
+  blocked,
+}
+
+/// Loads my wrapped conversation-key row and unwraps it (conversation-
+/// bound KEK, legacy fallback). Throws on a Supabase/network error so
+/// the caller can distinguish "no row" from "could not check".
+Future<({_MyKeyOutcome outcome, List<int>? key})> _loadMyWrappedKey(
+  String conversationId,
+  List<int> myPrivate,
+) async {
+  final client = Supabase.instance.client;
+  final myId = client.auth.currentUser?.id;
+  if (myId == null) return (outcome: _MyKeyOutcome.blocked, key: null);
+  final rows = await client
+      .from('conversation_keys')
+      .select('wrapped_key, wrapped_by')
+      .eq('conversation_id', conversationId)
+      .eq('user_id', myId)
+      .limit(1);
+  if (rows.isEmpty) return (outcome: _MyKeyOutcome.noRow, key: null);
+  final row = rows.first;
+  final wrappedBy = row['wrapped_by']?.toString() ?? '';
+  final wrapped = row['wrapped_key']?.toString() ?? '';
+  if (wrappedBy.isEmpty || wrapped.isEmpty) {
+    return (outcome: _MyKeyOutcome.blocked, key: null);
+  }
+  final profile = await client
+      .from('profiles')
+      .select('public_key')
+      .eq('id', wrappedBy)
+      .maybeSingle();
+  final wrapperPublic = profile?['public_key']?.toString() ?? '';
+  if (wrapperPublic.trim().isEmpty) {
+    return (outcome: _MyKeyOutcome.blocked, key: null);
+  }
+  try {
+    final key = await unwrapConversationKey(
+      wrapped,
+      myPrivate,
+      wrapperPublic,
+      conversationId: conversationId,
+    );
+    return (outcome: _MyKeyOutcome.loaded, key: key);
+  } catch (_) {
+    // My row exists but does not unwrap (corrupt / wrong key):
+    // do NOT create a fresh key over it — that would orphan the
+    // old messages for everyone. Report "no key".
+    return (outcome: _MyKeyOutcome.blocked, key: null);
+  }
+}
+
+/// True when the conversation already has encrypted messages: either
+/// `is_encrypted = true` OR a non-empty `ciphertext` (finding #27 —
+/// the old guard only checked `is_encrypted`, so a row with ciphertext
+/// but `is_encrypted = false` could be overwritten by a competing key).
+/// Throws on a Supabase/network error.
+Future<bool> _hasEncryptedMessages(String conversationId) async {
+  final client = Supabase.instance.client;
+  final flagged = await client
+      .from('messages')
+      .select('id')
+      .eq('conversation_id', conversationId)
+      .eq('is_encrypted', true)
+      .limit(1);
+  if (flagged.isNotEmpty) return true;
+  final withCiphertext = await client
+      .from('messages')
+      .select('id')
+      .eq('conversation_id', conversationId)
+      .not('ciphertext', 'is', null)
+      .neq('ciphertext', '')
+      .limit(1);
+  return withCiphertext.isNotEmpty;
+}
 /// Loads this conversation's key, creating it when nobody has one yet.
 ///
 /// Returns null when the key cannot be obtained: no signed-in user, a
@@ -332,6 +657,20 @@ Future<void> wrapKeyForMembers(
 /// everyone's rows and orphan the old messages, so the caller must fall
 /// back to plaintext for sending and show the decrypt-failure note for
 /// reading instead. A later sender's lazy re-wrap fixes the missing row.
+///
+/// Creator election (finding #23, client side only — a server-side RPC
+/// is the atomic fix, owned by another coordinator): the
+/// lexicographically smallest member id creates the key; the others
+/// poll for their wrapped row (bounded: 6 attempts, 500 ms apart) and
+/// never create their own. After creating, the creator re-reads its own
+/// wrapped row and adopts whatever key is actually stored
+/// (last-writer-wins reconciliation) instead of trusting the locally
+/// generated key.
+///
+/// Re-callable (finding #25, e2ee side): this function keeps NO cache —
+/// no null result is ever memoised — so a failed/null load can be
+/// retried by a later call (the chat-side retry loop and clearing of
+/// `_decryptFailed` when a key later loads are the chat agent's job).
 Future<List<int>?> loadOrCreateConversationKey(
   String conversationId,
   Map<String, String?> memberPublicKeys,
@@ -343,68 +682,70 @@ Future<List<int>?> loadOrCreateConversationKey(
   final pair = await ensureKeyPair();
   final myPrivate = await pair.extractPrivateKeyBytes();
   final myPublic = await myPublicKeyBase64(pair);
-  // I always have a key after ensureKeyPair(); make sure my own entry is
-  // present even if _loadMembers has not run (or has not loaded me) yet.
+  // I always have a key after ensureKeyPair(); my own entry is ALWAYS
+  // overwritten with the current local public key (finding #21) — a
+  // stale profile key loaded by _loadMembers must never be wrapped for,
+  // because I no longer own its private key.
   final members = Map<String, String?>.from(memberPublicKeys);
-  members.putIfAbsent(myId, () => myPublic);
-  if ((members[myId] ?? '').trim().isEmpty) members[myId] = myPublic;
+  members[myId] = myPublic;
 
-  // 1. My wrapped row, if one exists.
-  try {
-    final rows = await client
-        .from('conversation_keys')
-        .select('wrapped_key, wrapped_by')
-        .eq('conversation_id', conversationId)
-        .eq('user_id', myId)
-        .limit(1);
-    if (rows.isNotEmpty) {
-      final row = rows.first;
-      final wrappedBy = row['wrapped_by']?.toString() ?? '';
-      final wrapped = row['wrapped_key']?.toString() ?? '';
-      if (wrappedBy.isNotEmpty && wrapped.isNotEmpty) {
-        final profile = await client
-            .from('profiles')
-            .select('public_key')
-            .eq('id', wrappedBy)
-            .maybeSingle();
-        final wrapperPublic = profile?['public_key']?.toString() ?? '';
-        if (wrapperPublic.trim().isNotEmpty) {
-          try {
-            return await unwrapConversationKey(wrapped, myPrivate, wrapperPublic);
-          } catch (_) {
-            // My row exists but does not unwrap (corrupt / wrong key):
-            // do NOT create a fresh key over it — that would orphan the
-            // old messages for everyone. Report "no key".
-            return null;
-          }
-        }
-      }
-      // My row exists but its wrapper has no public key: same guard.
+  // Creator election (finding #23): smallest member id creates.
+  final sortedIds = members.keys.toList()..sort();
+  final iAmCreator = sortedIds.isEmpty || sortedIds.first == myId;
+
+  // Poll loop for non-creators; the creator breaks out immediately.
+  // 6 attempts x 500 ms ≈ 2.5 s of waiting for the creator's row.
+  const maxPollAttempts = 6;
+  for (var attempt = 0; attempt < maxPollAttempts; attempt++) {
+    // 1. My wrapped row, if one exists.
+    try {
+      final mine = await _loadMyWrappedKey(conversationId, myPrivate);
+      if (mine.outcome == _MyKeyOutcome.loaded) return mine.key;
+      if (mine.outcome == _MyKeyOutcome.blocked) return null;
+    } catch (_) {
+      // conversation_keys missing (pre-migration) or network error: no
+      // key, caller falls back to plaintext.
       return null;
     }
-  } catch (_) {
-    // conversation_keys missing (pre-migration) or network error: no key,
-    // caller falls back to plaintext.
-    return null;
+
+    // 2. No row for me. If the conversation already has encrypted
+    // messages, a key exists that I do not have — do not create a
+    // competing one.
+    try {
+      if (await _hasEncryptedMessages(conversationId)) return null;
+    } catch (_) {
+      return null;
+    }
+
+    // 3. Fresh conversation (or none encrypted yet): the elected
+    // creator creates; everyone else waits for the creator's row.
+    if (iAmCreator) break;
+    if (attempt == maxPollAttempts - 1) {
+      debugPrint(
+        'Helba E2E: no conversation key appeared after polling; not '
+        'creating one (not the elected creator)',
+      );
+      return null;
+    }
+    await Future.delayed(const Duration(milliseconds: 500));
   }
 
-  // 2. No row for me. If the conversation already has encrypted messages,
-  // a key exists that I do not have — do not create a competing one.
-  try {
-    final encrypted = await client
-        .from('messages')
-        .select('id')
-        .eq('conversation_id', conversationId)
-        .eq('is_encrypted', true)
-        .limit(1);
-    if (encrypted.isNotEmpty) return null;
-  } catch (_) {
-    return null;
-  }
-
-  // 3. Fresh conversation (or none encrypted yet): create the key and wrap
-  // it for every member who has a public key, including myself.
+  // 3. Create the key and wrap it for every member who has a public
+  // key, including myself.
   final convKey = generateConversationKey();
   await wrapKeyForMembers(conversationId, convKey, members);
+  // Re-read my own wrapped row and adopt whatever key is actually
+  // stored (finding #23): if another creator overwrote my row in the
+  // meantime, the stored key — not my locally generated one — is the
+  // key everyone else will use. On a re-read failure, fall back to the
+  // local key (the wraps were already attempted).
+  try {
+    final stored = await _loadMyWrappedKey(conversationId, myPrivate);
+    if (stored.outcome == _MyKeyOutcome.loaded && stored.key != null) {
+      return stored.key;
+    }
+  } catch (_) {
+    // Re-read failed (network blip): keep the locally generated key.
+  }
   return convKey;
 }

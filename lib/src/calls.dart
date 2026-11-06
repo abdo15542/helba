@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -195,6 +196,18 @@ class CallService {
   /// call screen before it pops. Null while a call is in progress.
   String? endReason;
 
+  /// Last connection-failure message for the call screen to show
+  /// ('تعذّر الاتصال'), e.g. when the peer connection fails after the
+  /// call was answered. Null unless the call ended this way; cleared
+  /// when the next call starts.
+  final ValueNotifier<String?> callError = ValueNotifier(null);
+
+  /// Offer queued when the incoming-call overlay could not be shown
+  /// (no navigator context yet). Retried until the call is answered,
+  /// declined or times out. See [_showIncomingOverlay].
+  CallSignal? _pendingIncomingCall;
+  Timer? _pendingOverlayTimer;
+
   String? currentCallId;
   String? currentPeerId;
   String? currentPeerName;
@@ -209,9 +222,11 @@ class CallService {
   final Map<String, RealtimeChannel> _peerChannels = {};
   String? _listeningUserId;
   Timer? _ringTimer;
+  Timer? _connectionTimer;
   bool _answered = false;
   bool _rowFinalized = false;
   bool _overlayShowing = false;
+  bool _starting = false;
 
   SupabaseClient get _client => Supabase.instance.client;
 
@@ -244,45 +259,75 @@ class CallService {
         await _client.removeChannel(channel);
       } catch (_) {}
     }
+    // Peer channels are created per call in [_sendSignal] and must not
+    // outlive sign-out either (finding #12).
+    await _closeAllPeerChannels();
+  }
+
+  /// Removes and unsubscribes every peer signalling channel.
+  Future<void> _closeAllPeerChannels() async {
+    final channels = _peerChannels.values.toList();
+    _peerChannels.clear();
+    for (final channel in channels) {
+      try {
+        await _client.removeChannel(channel);
+      } catch (_) {}
+    }
+  }
+
+  /// Removes and unsubscribes the signalling channel for one peer.
+  Future<void> _removePeerChannel(String peerId) async {
+    final channel = _peerChannels.remove(peerId);
+    if (channel == null) return;
+    try {
+      await _client.removeChannel(channel);
+    } catch (_) {}
   }
 
   void _handleBroadcast(Map<String, dynamic> payload) {
     final signal = parseCallSignal(payload);
     if (signal == null) return;
     if (signal.to != _client.auth.currentUser?.id) return;
+    // Every handler is async and was previously fire-and-forget: an
+    // unhandled error inside one could kill the isolate (finding #2).
+    // Guard each call so a bad signal can never crash the app.
     switch (signal.type) {
       case CallSignalType.offer:
-        _handleOffer(signal);
+        unawaited(_handleOffer(signal).catchError((_) {}));
         break;
       case CallSignalType.answer:
-        _handleAnswer(signal);
+        unawaited(_handleAnswer(signal).catchError((_) {}));
         break;
       case CallSignalType.ice:
-        _handleIce(signal);
+        unawaited(_handleIce(signal).catchError((_) {}));
         break;
       case CallSignalType.hangup:
-        _handleRemoteHangup(signal);
+        unawaited(_handleRemoteHangup(signal).catchError((_) {}));
         break;
       case CallSignalType.decline:
-        _handleDecline(signal);
+        unawaited(_handleDecline(signal).catchError((_) {}));
         break;
     }
   }
 
   Future<void> _sendSignal(CallSignal signal) async {
-    final peerId = signal.to;
-    var channel = _peerChannels[peerId];
-    if (channel == null) {
-      // Broadcasts go to the peer's personal channel. subscribe() is
-      // called first, but sendBroadcastMessage falls back to the Realtime
-      // REST endpoint when the socket has not joined yet, so the offer
-      // does not depend on the join racing the send.
-      channel = _client.channel('call:user:$peerId');
-      channel.subscribe();
-      _peerChannels[peerId] = channel;
-    }
-    await channel.sendBroadcastMessage(
-        event: signal.type.name, payload: encodeCallSignal(signal));
+    // A failed broadcast (socket down, channel gone) must never throw
+    // into a fire-and-forget caller such as pc.onIceCandidate (#2).
+    try {
+      final peerId = signal.to;
+      var channel = _peerChannels[peerId];
+      if (channel == null) {
+        // Broadcasts go to the peer's personal channel. subscribe() is
+        // called first, but sendBroadcastMessage falls back to the Realtime
+        // REST endpoint when the socket has not joined yet, so the offer
+        // does not depend on the join racing the send.
+        channel = _client.channel('call:user:$peerId');
+        channel.subscribe();
+        _peerChannels[peerId] = channel;
+      }
+      await channel.sendBroadcastMessage(
+          event: signal.type.name, payload: encodeCallSignal(signal));
+    } catch (_) {}
   }
 
   // -- Incoming call ---------------------------------------------------------
@@ -291,6 +336,19 @@ class CallService {
     // Busy in another call: decline immediately so the caller is not left
     // ringing, and never overwrite the call already in progress.
     if (state.value != CallState.idle) {
+      // Write the history row before sending the decline (#10), so the
+      // caller does not time out with the row stuck as 'missed'. The
+      // row id / finalized flag belong to the call in progress, so save
+      // and restore them around this one-off update.
+      final prevRowId = currentCallRowId;
+      final prevFinalized = _rowFinalized;
+      currentCallRowId = signal.callId;
+      _rowFinalized = false;
+      try {
+        await _updateCallRow('declined', end: true);
+      } catch (_) {}
+      currentCallRowId = prevRowId;
+      _rowFinalized = prevFinalized;
       await _sendSignal(CallSignal(
           type: CallSignalType.decline,
           from: signal.to,
@@ -305,15 +363,22 @@ class CallService {
     currentCallRowId = signal.callId;
     _answered = false;
     endReason = null;
+    callError.value = null;
     incomingCall.value = signal;
     incomingCallerName.value = null;
     state.value = CallState.incoming;
     _loadCallerName(signal.from);
+    // Tactile alert on offer. There is no ringtone mechanism in the app
+    // (no audio asset / ringtone package) — a real ringtone is still
+    // pending and is NOT faked here (findings #8/#9).
+    unawaited(HapticFeedback.vibrate().catchError((_) {}));
     _armRingTimer(() async {
       // Unanswered: the callee marks it missed, then dismisses the overlay.
       await _updateCallRow('missed', end: true);
       endReason = 'missed';
       incomingCall.value = null;
+      _pendingIncomingCall = null;
+      _pendingOverlayTimer?.cancel();
       _resetCall();
     });
     _showIncomingOverlay(signal);
@@ -341,14 +406,65 @@ class CallService {
 
   void _showIncomingOverlay(CallSignal signal) {
     final context = helbaNavigatorKey.currentContext;
-    if (context == null || _overlayShowing) return;
+    if (context == null) {
+      // No navigator yet (login / loading / banned screen): queue the
+      // offer instead of silently dropping it (#9) and retry until a
+      // context appears or the call ends (ring timeout / decline).
+      _pendingIncomingCall = signal;
+      _scheduleOverlayRetry();
+      return;
+    }
+    if (_overlayShowing) {
+      if (_pendingIncomingCall?.callId != signal.callId) {
+        _pendingIncomingCall = signal;
+      }
+      return;
+    }
+    _pendingIncomingCall = null;
+    _pendingOverlayTimer?.cancel();
     _overlayShowing = true;
     showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) => IncomingCallDialog(signal: signal),
-    ).then((_) => _overlayShowing = false);
+    ).then((_) {
+      _overlayShowing = false;
+      // An offer queued while the dialog was up gets its chance now.
+      final pending = _pendingIncomingCall;
+      if (pending != null &&
+          incomingCall.value != null &&
+          state.value == CallState.incoming) {
+        _showIncomingOverlay(pending);
+      }
+    });
   }
+
+  /// Retries a queued incoming-call overlay once a second until it can
+  /// be shown or the incoming call is gone. Bounded by the ring timer,
+  /// which clears the pending offer on timeout.
+  void _scheduleOverlayRetry() {
+    _pendingOverlayTimer?.cancel();
+    _pendingOverlayTimer = Timer(const Duration(seconds: 1), () {
+      final pending = _pendingIncomingCall;
+      if (pending == null ||
+          incomingCall.value == null ||
+          state.value != CallState.incoming) {
+        return;
+      }
+      _showIncomingOverlay(pending);
+      if (_pendingIncomingCall != null) _scheduleOverlayRetry();
+    });
+  }
+
+  /// Lets the UI layer poll/retry a queued incoming call, e.g. after the
+  /// navigator becomes available. No-op when nothing is queued.
+  void retryPendingIncomingOverlay() {
+    final pending = _pendingIncomingCall;
+    if (pending != null) _showIncomingOverlay(pending);
+  }
+
+  /// True while an incoming offer is queued waiting for a navigator.
+  bool get hasPendingIncomingCall => _pendingIncomingCall != null;
 
   /// Accepts a ringing incoming call. Returns false when the microphone
   /// (or camera, for video) permission is denied — the call is declined
@@ -357,6 +473,9 @@ class CallService {
     final myId = _client.auth.currentUser?.id;
     if (myId == null) return false;
     _ringTimer?.cancel();
+    _pendingIncomingCall = null;
+    _pendingOverlayTimer?.cancel();
+    callError.value = null;
     final video = signal.callType == 'video';
     if (!await _ensurePermissions(video: video)) {
       await declineCall(signal);
@@ -396,6 +515,8 @@ class CallService {
     final incoming = signal ?? incomingCall.value;
     if (incoming == null) return;
     _ringTimer?.cancel();
+    _pendingIncomingCall = null;
+    _pendingOverlayTimer?.cancel();
     final myId = _client.auth.currentUser?.id;
     if (myId != null) {
       try {
@@ -428,68 +549,117 @@ class CallService {
     required String callType,
   }) async {
     final myId = _client.auth.currentUser?.id;
-    if (myId == null || state.value != CallState.idle) return null;
+    // Synchronous guard against double-tap (#5): claim the call before
+    // the first await, so a second rapid tap sees `outgoing`/`_starting`
+    // instead of passing the idle check and starting a second call.
+    if (myId == null || _starting || state.value != CallState.idle) {
+      return null;
+    }
+    _starting = true;
+    state.value = CallState.outgoing;
+    callError.value = null;
     final video = callType == 'video';
-    if (!await _ensurePermissions(video: video)) return null;
-    final row = await _client.from('calls').insert({
-      'caller_id': myId,
-      'callee_id': calleeId,
-      'type': callType,
-      'status': 'ringing',
-    }).select('id').single();
-    final callId = row['id'].toString();
-    currentCallId = callId;
-    currentPeerId = calleeId;
-    currentPeerName = calleeName;
-    currentCallType = callType;
-    currentCallRowId = callId;
-    _answered = false;
-    endReason = null;
     try {
-      await _setupPeerConnection(peerId: calleeId, callType: callType);
-      final offer = await _pc!.createOffer();
-      await _pc!.setLocalDescription(offer);
-      await _sendSignal(CallSignal(
-          type: CallSignalType.offer,
-          from: myId,
-          to: calleeId,
-          callId: callId,
-          callType: callType,
-          payload: {'sdp': offer.sdp, 'type': offer.type}));
+      if (!await _ensurePermissions(video: video)) {
+        _resetCall();
+        return null;
+      }
+      final row = await _client.from('calls').insert({
+        'caller_id': myId,
+        'callee_id': calleeId,
+        'type': callType,
+        'status': 'ringing',
+      }).select('id').single();
+      final callId = row['id'].toString();
+      currentCallId = callId;
+      currentPeerId = calleeId;
+      currentPeerName = calleeName;
+      currentCallType = callType;
+      currentCallRowId = callId;
+      _answered = false;
+      endReason = null;
+      try {
+        await _setupPeerConnection(peerId: calleeId, callType: callType);
+        final offer = await _pc!.createOffer();
+        await _pc!.setLocalDescription(offer);
+        await _sendSignal(CallSignal(
+            type: CallSignalType.offer,
+            from: myId,
+            to: calleeId,
+            callId: callId,
+            callType: callType,
+            payload: {'sdp': offer.sdp, 'type': offer.type}));
+      } catch (_) {
+        await _closePeerConnection();
+        await _updateCallRow('cancelled', end: true);
+        _resetCall();
+        rethrow;
+      }
+      _armRingTimer(() async {
+        // Nobody answered: mark it missed and end the outgoing screen.
+        await _updateCallRow('missed', end: true);
+        endReason = 'missed';
+        await hangUp(sendSignal: true);
+      });
+      return callId;
     } catch (_) {
-      await _closePeerConnection();
-      await _updateCallRow('cancelled', end: true);
+      // Row creation / any other failure before the offer: the inner
+      // catch already reset for setup failures; this restores idle for
+      // the rest (e.g. the history-row insert throwing) and rethrows so
+      // the caller can show its SnackBar, as before.
       _resetCall();
       rethrow;
+    } finally {
+      _starting = false;
     }
-    state.value = CallState.outgoing;
-    _armRingTimer(() async {
-      // Nobody answered: mark it missed and end the outgoing screen.
-      await _updateCallRow('missed', end: true);
-      endReason = 'missed';
-      await hangUp(sendSignal: true);
-    });
-    return callId;
   }
 
   // -- Remote signals --------------------------------------------------------
 
   Future<void> _handleAnswer(CallSignal signal) async {
+    // Late answer (#11): we already ended (e.g. ring timeout) while the
+    // callee answered. Tell them to end too instead of leaving them
+    // alone in an "active" call.
+    if (state.value == CallState.ended) {
+      final myId = _client.auth.currentUser?.id;
+      if (myId != null) {
+        try {
+          await _sendSignal(CallSignal(
+              type: CallSignalType.hangup,
+              from: myId,
+              to: signal.from,
+              callId: signal.callId,
+              callType: signal.callType));
+        } catch (_) {}
+      }
+      return;
+    }
     if (state.value != CallState.outgoing ||
         signal.callId != currentCallId) {
       return;
     }
-    _ringTimer?.cancel();
     final sdp = signal.sdp;
-    if (sdp == null || _pc == null) return;
+    if (sdp == null || _pc == null) {
+      // An answer without usable SDP can never connect: end the call
+      // instead of stranding the caller on "جارٍ الاتصال…".
+      await hangUp(sendSignal: true);
+      return;
+    }
     try {
       await _pc!.setRemoteDescription(
           RTCSessionDescription(sdp, signal.sdpType ?? 'answer'));
+      // Cancel the ring timer only after the answer proved usable (#6):
+      // cancelling before setRemoteDescription stranded the caller when
+      // a bad answer threw.
+      _ringTimer?.cancel();
       await _updateCallRow('ongoing');
       _answered = true;
       state.value = CallState.active;
     } catch (_) {
-      // A bad answer leaves the call ringing until the ring timer ends it.
+      // A bad answer must not leave the caller ringing forever: end it.
+      try {
+        await hangUp(sendSignal: true);
+      } catch (_) {}
     }
   }
 
@@ -518,10 +688,14 @@ class CallService {
       return;
     }
     _ringTimer?.cancel();
-    endReason = 'ended';
+    // Still ringing (never answered) is a missed call, not a plain end.
+    endReason = _answered ? 'ended' : 'missed';
     incomingCall.value = null;
+    _pendingIncomingCall = null;
+    _pendingOverlayTimer?.cancel();
     await _closePeerConnection();
     state.value = CallState.ended;
+    _scheduleIdleReset();
     _clearCurrentCall();
   }
 
@@ -536,6 +710,7 @@ class CallService {
     endReason = 'declined';
     await _closePeerConnection();
     state.value = CallState.ended;
+    _scheduleIdleReset();
     _clearCurrentCall();
   }
 
@@ -547,6 +722,9 @@ class CallService {
   /// pops itself.
   Future<void> hangUp({bool sendSignal = true}) async {
     _ringTimer?.cancel();
+    _connectionTimer?.cancel();
+    _pendingIncomingCall = null;
+    _pendingOverlayTimer?.cancel();
     final peerId = currentPeerId;
     final callId = currentCallId;
     final myId = _client.auth.currentUser?.id;
@@ -571,7 +749,32 @@ class CallService {
     endReason ??= 'ended';
     await _closePeerConnection();
     state.value = CallState.ended;
+    _scheduleIdleReset();
     _clearCurrentCall();
+  }
+
+  /// Resets the state machine to idle shortly after a call ends (#4).
+  /// CallPage pops on `ended`, so the reset is delayed ~300ms to let it
+  /// read the final state first. Guarded: a new call that started in
+  /// the meantime (state no longer `ended`, or a different call row)
+  /// is never clobbered.
+  void _scheduleIdleReset() {
+    final rowIdAtEnd = currentCallRowId;
+    Future.delayed(const Duration(milliseconds: 300), () {
+      if (state.value != CallState.ended) return;
+      if (rowIdAtEnd != null &&
+          currentCallRowId != null &&
+          currentCallRowId != rowIdAtEnd) {
+        return;
+      }
+      _resetCall();
+    });
+  }
+
+  /// Safety net for the call screen: back to idle only if the call
+  /// already ended. CallPage.dispose() calls this.
+  void resetToIdleIfEnded() {
+    if (state.value == CallState.ended) _resetCall();
   }
 
   // -- In-call controls ------------------------------------------------------
@@ -594,10 +797,15 @@ class CallService {
 
   Future<void> toggleSpeaker() async {
     final on = !isSpeakerOn.value;
-    isSpeakerOn.value = on;
+    // Flip the UI only after the Helper call succeeds (#7): on failure
+    // (e.g. MODIFY_AUDIO_SETTINGS missing) the old code flipped anyway
+    // and the speaker button lied about the actual audio route.
     try {
       await Helper.setSpeakerphoneOn(on);
-    } catch (_) {}
+    } catch (_) {
+      return;
+    }
+    isSpeakerOn.value = on;
   }
 
   // -- Internals ---------------------------------------------------------------
@@ -621,7 +829,11 @@ class CallService {
   }) async {
     final video = callType == 'video';
     final stream = await navigator.mediaDevices.getUserMedia({
-      'audio': true,
+      'audio': {
+        'echoCancellation': true,
+        'noiseSuppression': true,
+        'autoGainControl': true,
+      },
       'video': video ? {'facingMode': 'user'} : false,
     });
     _local = stream;
@@ -651,19 +863,75 @@ class CallService {
     pc.onTrack = (event) {
       if (event.streams.isNotEmpty) remoteStream.value = event.streams.first;
     };
-    await pc.addStream(stream);
+    // End the call (with a message) if the connection fails or stays
+    // disconnected, instead of a silent black screen / silence (#11).
+    pc.onConnectionState = _onConnectionState;
+    pc.onIceConnectionState = (state) {
+      if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+        _onConnectionState(
+            RTCPeerConnectionState.RTCPeerConnectionStateFailed);
+      }
+    };
+    // addStream is deprecated (pre-Unified-Plan): add each track (#13).
+    for (final track in stream.getTracks()) {
+      await pc.addTrack(track, stream);
+    }
     // Voice calls default to the earpiece, video calls to the speaker.
-    isSpeakerOn.value = video;
+    // Only record the route after the Helper call succeeds (#7).
     try {
       await Helper.setSpeakerphoneOn(video);
-    } catch (_) {}
+      isSpeakerOn.value = video;
+    } catch (_) {
+      isSpeakerOn.value = false;
+    }
     isMuted.value = false;
     isCameraOff.value = false;
+  }
+
+  void _onConnectionState(RTCPeerConnectionState connectionState) {
+    if (connectionState ==
+        RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
+      _connectionTimer?.cancel();
+      unawaited(_endWithConnectionError().catchError((_) {}));
+    } else if (connectionState ==
+        RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+      // Brief drops recover on their own; only end after 5s down.
+      _connectionTimer?.cancel();
+      _connectionTimer = Timer(const Duration(seconds: 5), () {
+        if ((state.value == CallState.active ||
+                state.value == CallState.outgoing) &&
+            _pc?.connectionState ==
+                RTCPeerConnectionState
+                    .RTCPeerConnectionStateDisconnected) {
+          unawaited(_endWithConnectionError().catchError((_) {}));
+        }
+      });
+    } else if (connectionState ==
+        RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+      _connectionTimer?.cancel();
+    }
+  }
+
+  Future<void> _endWithConnectionError() async {
+    if (state.value != CallState.active &&
+        state.value != CallState.outgoing) {
+      return;
+    }
+    callError.value = 'تعذّر الاتصال';
+    try {
+      await hangUp(sendSignal: true);
+    } catch (_) {}
   }
 
   Future<void> _closePeerConnection() async {
     final pc = _pc;
     _pc = null;
+    _connectionTimer?.cancel();
+    // The peer signalling channel was created for this call: remove and
+    // unsubscribe it here so channels do not leak per call (#12).
+    // hangUp() sends its hangup signal before calling this, so removing
+    // the channel now cannot drop that signal.
+    final peerId = currentPeerId;
     if (pc != null) {
       try {
         await pc.close();
@@ -683,12 +951,15 @@ class CallService {
     }
     localStream.value = null;
     remoteStream.value = null;
+    if (peerId != null) await _removePeerChannel(peerId);
   }
 
   void _armRingTimer(Future<void> Function() onTimeout) {
     _ringTimer?.cancel();
     _ringTimer = Timer(callRingTimeout, () {
-      unawaited(onTimeout());
+      // Guard the fire-and-forget timeout so an error in it cannot
+      // become an unhandled async error (#2).
+      unawaited(onTimeout().catchError((_) {}));
     });
   }
 
@@ -708,6 +979,9 @@ class CallService {
 
   void _resetCall() {
     _ringTimer?.cancel();
+    _connectionTimer?.cancel();
+    _pendingOverlayTimer?.cancel();
+    _pendingIncomingCall = null;
     _clearCurrentCall();
     state.value = CallState.idle;
   }
@@ -887,6 +1161,18 @@ class CallPage extends StatefulWidget {
 class _CallPageState extends State<CallPage> {
   final _localRenderer = RTCVideoRenderer();
   final _remoteRenderer = RTCVideoRenderer();
+  // Renderer lifecycle (#1/#3): initialize() is async and only assigns
+  // the texture id when it completes; assigning srcObject before that
+  // throws 'Call initialize before setting the stream'. Track each
+  // renderer separately, assign only after it is ready, and never touch
+  // a renderer after dispose.
+  bool _localRendererReady = false;
+  bool _remoteRendererReady = false;
+  bool _disposed = false;
+  // Final status captured when the call ends (#14): the service resets
+  // to idle ~300ms after `ended`, so the screen keeps its own copy to
+  // show while it pops (including the connection-error message).
+  String? _endStatusText;
   Timer? _timer;
   Duration _elapsed = Duration.zero;
   DateTime? _activeSince;
@@ -896,12 +1182,11 @@ class _CallPageState extends State<CallPage> {
   @override
   void initState() {
     super.initState();
-    _localRenderer.initialize();
-    _remoteRenderer.initialize();
+    // Voice calls never show video: skip renderer init entirely (#1).
+    unawaited(_initRenderers().catchError((_) {}));
     _service.localStream.addListener(_updateRenderers);
     _service.remoteStream.addListener(_updateRenderers);
     _service.state.addListener(_onStateChanged);
-    _updateRenderers();
     _onStateChanged();
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (_activeSince != null && mounted) {
@@ -911,24 +1196,71 @@ class _CallPageState extends State<CallPage> {
     });
   }
 
+  /// Awaits both renderer initializations (video only). If dispose
+  /// happens first, the just-initialized renderer is disposed right
+  /// away instead of being left live on a dead page (#3).
+  Future<void> _initRenderers() async {
+    if (widget.callType != 'video') return;
+    var localOk = false;
+    try {
+      await _localRenderer.initialize();
+      localOk = true;
+    } catch (_) {}
+    if (_disposed) {
+      if (localOk) await _disposeRenderer(_localRenderer);
+      return;
+    }
+    _localRendererReady = localOk;
+    var remoteOk = false;
+    try {
+      await _remoteRenderer.initialize();
+      remoteOk = true;
+    } catch (_) {}
+    if (_disposed) {
+      if (localOk) await _disposeRenderer(_localRenderer);
+      if (remoteOk) await _disposeRenderer(_remoteRenderer);
+      return;
+    }
+    _remoteRendererReady = remoteOk;
+    _updateRenderers();
+  }
+
+  Future<void> _disposeRenderer(RTCVideoRenderer renderer) async {
+    try {
+      await renderer.dispose();
+    } catch (_) {}
+  }
+
   @override
   void dispose() {
+    _disposed = true;
     _timer?.cancel();
     _service.localStream.removeListener(_updateRenderers);
     _service.remoteStream.removeListener(_updateRenderers);
     _service.state.removeListener(_onStateChanged);
-    _localRenderer.dispose();
-    _remoteRenderer.dispose();
+    // Only dispose renderers that finished initializing, via the async
+    // helper, so dispose cannot race a pending initialize() (#3).
+    // Voice calls never initialized them.
+    if (_localRendererReady) unawaited(_disposeRenderer(_localRenderer));
+    if (_remoteRendererReady) unawaited(_disposeRenderer(_remoteRenderer));
+    // Safety net (#4): if this page is going away with the call ended,
+    // do not leave the service bricked at `ended`.
+    _service.resetToIdleIfEnded();
     super.dispose();
   }
 
   void _updateRenderers() {
+    if (_disposed) return;
     final local = _service.localStream.value;
-    if (local != null && _localRenderer.srcObject != local) {
+    if (local != null &&
+        _localRendererReady &&
+        _localRenderer.srcObject != local) {
       _localRenderer.srcObject = local;
     }
     final remote = _service.remoteStream.value;
-    if (remote != null && _remoteRenderer.srcObject != remote) {
+    if (remote != null &&
+        _remoteRendererReady &&
+        _remoteRenderer.srcObject != remote) {
       _remoteRenderer.srcObject = remote;
     }
   }
@@ -939,10 +1271,25 @@ class _CallPageState extends State<CallPage> {
       _activeSince = DateTime.now();
     }
     if (state == CallState.ended && mounted) {
-      // Let the next frame finish, then leave the call screen.
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) Navigator.of(context).pop();
-      });
+      // Capture the end reason / error now (#14/#11): the service
+      // resets to idle 300ms later, which would otherwise erase it.
+      _endStatusText = _service.callError.value ??
+          (_service.endReason == 'missed'
+              ? 'مكالمة فائتة'
+              : _service.endReason == 'declined'
+                  ? 'تم رفض المكالمة'
+                  : 'انتهت المكالمة');
+      // Give the user a moment to read a connection error; otherwise
+      // leave on the next frame, as before.
+      if (_service.callError.value != null) {
+        Future.delayed(const Duration(milliseconds: 1500), () {
+          if (mounted) Navigator.of(context).pop();
+        });
+      } else {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) Navigator.of(context).pop();
+        });
+      }
     }
   }
 
@@ -974,8 +1321,11 @@ class _CallPageState extends State<CallPage> {
                   : callState == CallState.active
                       ? formatCallDuration(_elapsed)
                       : callState == CallState.ended
-                          ? 'انتهت المكالمة'
-                          : 'مكالمة';
+                          ? (_endStatusText ?? 'انتهت المكالمة')
+                          // After `ended` the service resets to idle
+                          // (~300ms) before this page pops; keep showing
+                          // the captured end status until then.
+                          : (_endStatusText ?? 'مكالمة');
               return Stack(children: [
                 if (isVideo)
                   Positioned.fill(

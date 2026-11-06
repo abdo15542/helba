@@ -10,6 +10,23 @@ bool isAdminProfile(Map<String, dynamic>? row) => row?['is_admin'] == true;
 /// True when the profile row marks the user as banned.
 bool isBannedProfile(Map<String, dynamic>? row) => row?['is_banned'] == true;
 
+/// The moment a mute expires, parsed defensively: missing, unparsable or
+/// non-string values mean "not muted". The muted_until column is added by
+/// the backend coordinator; until it exists the field is simply absent.
+DateTime? mutedUntilOf(Map<String, dynamic>? row) {
+  final raw = row?['muted_until'];
+  if (raw is! String) return null;
+  return DateTime.tryParse(raw);
+}
+
+/// True when the profile row marks the user as currently muted
+/// (muted_until in the future). A past/missing value means not muted.
+bool isMutedProfile(Map<String, dynamic>? row, [DateTime? now]) {
+  final until = mutedUntilOf(row);
+  if (until == null) return false;
+  return until.isAfter(now ?? DateTime.now());
+}
+
 /// True when the profile row belongs to a user who may see the admin panel.
 bool canSeeAdminPanel(Map<String, dynamic>? row) => isAdminProfile(row);
 
@@ -42,9 +59,10 @@ String reportTargetLabel(String? type) {
 }
 
 /// A report target is valid when its type is one of the known kinds and its
-/// id is a non-empty UUID-shaped string.
+/// id is a non-empty UUID-shaped string. 'post' is NOT accepted: Helba has
+/// no posts feature, so no post report can ever be resolvable.
 bool isValidReportTarget(String? type, String? id) {
-  if (type != 'post' && type != 'message' && type != 'user') return false;
+  if (type != 'message' && type != 'user') return false;
   if (id == null || id.trim().isEmpty) return false;
   return RegExp(
           r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
@@ -77,7 +95,7 @@ Future<Map<String, dynamic>?> loadMyProfile() async {
   if (uid == null) return null;
   final row = await Supabase.instance.client
       .from('profiles')
-      .select('id,display_name,username,is_admin,is_banned')
+      .select('id,display_name,username,is_admin,is_banned,muted_until')
       .eq('id', uid)
       .maybeSingle();
   if (row == null) return null;
@@ -85,26 +103,121 @@ Future<Map<String, dynamic>?> loadMyProfile() async {
 }
 
 /// All reports with the reporter's profile embedded, pending first.
-Future<List<Map<String, dynamic>>> loadReports() async {
+/// Bounded: at most [limit] rows (default 100); the panel raises the
+/// limit with "show more" instead of fetching the whole table.
+Future<List<Map<String, dynamic>>> loadReports({int limit = 100}) async {
   final rows = await Supabase.instance.client
       .from('reports')
-      .select('*,profiles(display_name,username)')
-      .order('created_at', ascending: false);
+      .select(
+          'id,reporter_id,target_type,target_id,reason,status,created_at,profiles(display_name,username)')
+      .order('created_at', ascending: false)
+      .limit(limit);
   return sortReports(rows.cast<Map<String, dynamic>>());
+}
+
+/// Resolves the reported content for a page of reports, batching the
+/// lookups instead of one query per report. Returns a map keyed by
+/// target id:
+/// - message targets: {'kind': 'message', 'body': ..., 'sender_name': ...,
+///   'conversation_id': ...} (body is the plaintext placeholder for
+///   encrypted messages — the server never stores E2E plaintext);
+/// - user targets: {'kind': 'user', 'name': ...}.
+/// Targets that no longer exist (deleted message / user) are absent.
+Future<Map<String, Map<String, dynamic>>> resolveReportTargets(
+    List<Map<String, dynamic>> reports) async {
+  final messageIds = <String>{};
+  final userIds = <String>{};
+  for (final report in reports) {
+    final id = report['target_id']?.toString().trim() ?? '';
+    if (id.isEmpty) continue;
+    if (report['target_type']?.toString() == 'message') {
+      messageIds.add(id);
+    } else if (report['target_type']?.toString() == 'user') {
+      userIds.add(id);
+    }
+  }
+  final resolved = <String, Map<String, dynamic>>{};
+  final client = Supabase.instance.client;
+  if (messageIds.isNotEmpty) {
+    final rows = await client
+        .from('messages')
+        .select('id,conversation_id,sender_id,body,message_type')
+        .inFilter('id', messageIds.toList());
+    final messages = rows.cast<Map<String, dynamic>>();
+    // Sender names in a second batch query: no embedded join, so this
+    // never depends on guessing the messages->profiles FK name.
+    final senderIds = messages
+        .map((m) => m['sender_id']?.toString() ?? '')
+        .where((id) => id.isNotEmpty)
+        .toSet();
+    final senderNames = <String, String>{};
+    if (senderIds.isNotEmpty) {
+      final profiles = await client
+          .from('profiles')
+          .select('id,display_name,username')
+          .inFilter('id', senderIds.toList());
+      for (final row in profiles.cast<Map<String, dynamic>>()) {
+        final name =
+            row['display_name']?.toString().trim().isNotEmpty == true
+                ? row['display_name'].toString()
+                : (row['username']?.toString().isNotEmpty == true
+                    ? '@${row['username']}'
+                    : 'مستخدم');
+        senderNames[row['id'].toString()] = name;
+      }
+    }
+    for (final row in messages) {
+      resolved[row['id'].toString()] = {
+        'kind': 'message',
+        'body': row['body']?.toString() ?? '',
+        'message_type': row['message_type']?.toString() ?? 'text',
+        'sender_name':
+            senderNames[row['sender_id']?.toString()] ?? 'مستخدم',
+        'conversation_id': row['conversation_id']?.toString() ?? '',
+      };
+    }
+  }
+  if (userIds.isNotEmpty) {
+    final rows = await client
+        .from('profiles')
+        .select('id,display_name,username')
+        .inFilter('id', userIds.toList());
+    for (final row in rows.cast<Map<String, dynamic>>()) {
+      final name = row['display_name']?.toString().trim().isNotEmpty == true
+          ? row['display_name'].toString()
+          : (row['username']?.toString().isNotEmpty == true
+              ? '@${row['username']}'
+              : 'مستخدم');
+      resolved[row['id'].toString()] = {'kind': 'user', 'name': name};
+    }
+  }
+  return resolved;
+}
+
+/// Sets a report's status and throws when no row matched, so a silent
+/// no-op (wrong id / RLS denial) can never look like success.
+Future<void> _setReportStatus(String reportId, String status) async {
+  final updated = await Supabase.instance.client
+      .from('reports')
+      .update({'status': status}).eq('id', reportId).select('id');
+  if ((updated as List).isEmpty) {
+    throw StateError('Report $reportId was not updated');
+  }
 }
 
 /// Mark a report as reviewed (admin-only, enforced server-side).
 Future<void> reviewReport(String reportId) async {
-  await Supabase.instance.client
-      .from('reports')
-      .update({'status': 'reviewed'}).eq('id', reportId);
+  await _setReportStatus(reportId, 'reviewed');
 }
 
 /// Mark a report as dismissed (admin-only, enforced server-side).
 Future<void> dismissReport(String reportId) async {
-  await Supabase.instance.client
-      .from('reports')
-      .update({'status': 'dismissed'}).eq('id', reportId);
+  await _setReportStatus(reportId, 'dismissed');
+}
+
+/// Reopen a reviewed/dismissed report back to pending (undo).
+Future<void> reopenReport(String reportId) async {
+  await _setReportStatus(reportId, 'pending');
 }
 
 /// Ban or unban a user through the admin-only RPC. Admins never update
@@ -114,6 +227,22 @@ Future<void> setUserBanned(String userId, bool banned) async {
       params: {'target_user': userId, 'banned': banned});
 }
 
+/// Mute or unmute a user through the admin-only RPC.
+/// Exact RPC contract assumed here (backend coordinator to match):
+///   rpc 'set_user_muted'
+///   params: {'p_target_user': `<uuid>`, 'p_muted_until': `<ISO-8601 string | null>`}
+/// Pass mutedUntil == null to unmute. Throws when the RPC is not deployed
+/// yet (or the caller is not an admin); callers surface that error.
+/// NOTE: the muted_until column + this RPC are backend-owned and may not
+/// exist yet — this function must only be called from a try/catch that
+/// shows the failure (see AdminPanelPage._setMuted).
+Future<void> setUserMuted(String userId, DateTime? mutedUntil) async {
+  await Supabase.instance.client.rpc('set_user_muted', params: {
+    'p_target_user': userId,
+    'p_muted_until': mutedUntil?.toIso8601String(),
+  });
+}
+
 /// Admin stats in one call: {'users': n, 'conversations': n, 'messages': n}.
 Future<Map<String, dynamic>> loadAdminStats() async {
   final result = await Supabase.instance.client.rpc('admin_stats');
@@ -121,12 +250,35 @@ Future<Map<String, dynamic>> loadAdminStats() async {
   return {'users': 0, 'conversations': 0, 'messages': 0};
 }
 
-/// All user profiles, newest first.
-Future<List<Map<String, dynamic>>> loadAllUsers() async {
-  final rows = await Supabase.instance.client
+/// All user profiles, newest first. Bounded to [limit] rows (default 100).
+/// When [query] is non-empty, filters server-side by username or
+/// display_name (case-insensitive). Escape % / _ / \ so a search string
+/// can never act as a LIKE wildcard.
+String escapeLikePattern(String value) =>
+    value.replaceAll(r'\', r'\\').replaceAll('%', r'\%').replaceAll('_', r'\_');
+
+Future<List<Map<String, dynamic>>> loadAllUsers(
+    {int limit = 100, String? query}) async {
+  // NOTE: muted_until is deliberately NOT selected here: the column is
+  // added by the backend coordinator and selecting a missing column
+  // would fail the whole query. Once it exists, add it to this select
+  // so the panel can show the muted state from the loaded row.
+  // The .or() filter must come before .order(): order() returns a
+  // PostgrestTransformBuilder, which has no .or() method.
+  final q = query?.trim() ?? '';
+  final PostgrestFilterBuilder<List<Map<String, dynamic>>> filtered;
+  final base = Supabase.instance.client
       .from('profiles')
-      .select('id,display_name,username,is_admin,is_banned,created_at')
-      .order('created_at', ascending: false);
+      .select('id,display_name,username,is_admin,is_banned,muted_until,created_at');
+  if (q.isNotEmpty) {
+    final pattern = '%${escapeLikePattern(q)}%';
+    filtered = base.or('username.ilike.$pattern,display_name.ilike.$pattern');
+  } else {
+    filtered = base;
+  }
+  final rows = await filtered
+      .order('created_at', ascending: false)
+      .limit(limit);
   return rows.cast<Map<String, dynamic>>();
 }
 
