@@ -29,7 +29,11 @@ jobs:
           packages: platform-tools
 
       - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+        # Pinned to the latest v2.x release, verified 2026-11-06 via the
+        # GitHub releases API (v2.23.0, published 2026-03-25). Do not
+        # float on @v2: a stable-channel bump can change the manifest /
+        # Gradle template strings the patch steps below match.
+        uses: subosito/flutter-action@v2.23.0
         with:
           channel: stable
           cache: true
@@ -125,6 +129,12 @@ jobs:
           # declare them — the app still asks the user at runtime (via
           # permission_handler) before getUserMedia. Same patch style as
           # the INTERNET step above; idempotent, skipped if already present.
+          # flutter_webrtc declares no permissions itself, so the audio
+          # and network ones must be declared here too:
+          # Helper.setSpeakerphoneOn needs MODIFY_AUDIO_SETTINGS, and
+          # Bluetooth routing needs BLUETOOTH_CONNECT on Android 12+
+          # (BLUETOOTH covers older versions); ACCESS_NETWORK_STATE is
+          # what the WebRTC stack checks for connectivity changes.
           python3 - <<'PY'
           from pathlib import Path
           path = Path("android/app/src/main/AndroidManifest.xml")
@@ -132,6 +142,10 @@ jobs:
           wanted = [
               "android.permission.RECORD_AUDIO",
               "android.permission.CAMERA",
+              "android.permission.MODIFY_AUDIO_SETTINGS",
+              "android.permission.BLUETOOTH_CONNECT",
+              "android.permission.BLUETOOTH",
+              "android.permission.ACCESS_NETWORK_STATE",
           ]
           missing = [p for p in wanted if p not in source]
           if not missing:
@@ -156,6 +170,43 @@ jobs:
         run: |
           grep -q 'android.permission.RECORD_AUDIO' android/app/src/main/AndroidManifest.xml || (echo "RECORD_AUDIO permission missing from AndroidManifest.xml" && exit 1)
           grep -q 'android.permission.CAMERA' android/app/src/main/AndroidManifest.xml || (echo "CAMERA permission missing from AndroidManifest.xml" && exit 1)
+          grep -q 'android.permission.MODIFY_AUDIO_SETTINGS' android/app/src/main/AndroidManifest.xml || (echo "MODIFY_AUDIO_SETTINGS permission missing from AndroidManifest.xml" && exit 1)
+          grep -q 'android.permission.BLUETOOTH_CONNECT' android/app/src/main/AndroidManifest.xml || (echo "BLUETOOTH_CONNECT permission missing from AndroidManifest.xml" && exit 1)
+          grep -q 'android.permission.BLUETOOTH' android/app/src/main/AndroidManifest.xml || (echo "BLUETOOTH permission missing from AndroidManifest.xml" && exit 1)
+          grep -q 'android.permission.ACCESS_NETWORK_STATE' android/app/src/main/AndroidManifest.xml || (echo "ACCESS_NETWORK_STATE permission missing from AndroidManifest.xml" && exit 1)
+
+      - name: Add FCM Installation ID opt-in to the main manifest
+        shell: bash
+        run: |
+          # Firebase Cloud Messaging only registers an Installation ID
+          # (FID) when the app opts in via this meta-data (Firebase
+          # Flutter FCM guide). Without it, firebase_messaging's
+          # onRegistered callback never fires, register() fails silently,
+          # and no FID is ever upserted into push_tokens — so closed-app
+          # push has nobody to send to. The firebase_messaging library
+          # manifest does NOT contain this entry (only its example app
+          # does), so insert it inside <application>, just before
+          # </application>. Idempotent, skipped if already present.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("android/app/src/main/AndroidManifest.xml")
+          source = path.read_text()
+          name = "firebase_messaging_installation_id_enabled"
+          if name in source:
+              print("FCM Installation ID opt-in meta-data already present")
+          else:
+              entry = '        <meta-data android:name="firebase_messaging_installation_id_enabled" android:value="true" />\n'
+              marker = "</application>"
+              if marker not in source:
+                  raise SystemExit("Could not find </application> in AndroidManifest.xml")
+              source = source.replace(marker, entry + marker, 1)
+              path.write_text(source)
+              print("Added FCM Installation ID opt-in meta-data to AndroidManifest.xml")
+          PY
+
+      - name: Verify FCM Installation ID opt-in in manifest
+        run: |
+          grep -q 'firebase_messaging_installation_id_enabled' android/app/src/main/AndroidManifest.xml || (echo "FCM Installation ID opt-in meta-data missing from AndroidManifest.xml" && exit 1)
 
       - name: Set Android compile SDK to 36
         shell: bash
@@ -244,16 +295,48 @@ jobs:
           sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
 
       - name: Install dependencies
-        run: flutter pub get
+        run: flutter pub get --enforce-lockfile
 
-      - name: Align Android plugin compile SDK versions
+      - name: Fail if any plugin needs compileSdk above 36
         shell: bash
         run: |
+          # NEVER silently rewrite compileSdk declarations again. The old
+          # version of this step rewrote EVERY compileSdk line under
+          # android/ and ~/.pub-cache to 36 — including plugins that
+          # legitimately need a higher SDK (e.g.
+          # permission_handler_android 14.x declares compileSdk = 37).
+          # Downgrading such a plugin breaks the build with
+          # "cannot find symbol" for API-36+ symbols. This step only
+          # READS: it fails loudly, naming the file and the required
+          # value, so the fix is a plugin pin change or a deliberate
+          # target-SDK raise (see pubspec.yaml), not a silent downgrade.
+          # Values <= 36 are left alone: the "Set Android compile SDK
+          # to 36" step and the "Force compile SDK 36" init script
+          # already handle the app module, and plugin declarations that
+          # defer to flutter.compileSdkVersion / project.ext.compileSdk
+          # (no literal number) resolve to the app's 36 at build time.
+          # Current tree check (2026-11-06, pubspec.lock): nothing needs
+          # more than 36 — permission_handler_android 13.0.1 is 35,
+          # flutter_webrtc 1.6.3 / flutter_local_notifications 22.3.3 /
+          # app_links 7.2.2 / native_flutter_proxy 0.3.1 are 36,
+          # file_picker 8.3.7 / flutter_secure_storage 9.2.4 are 34,
+          # firebase_* / url_launcher_android / video_player_android
+          # defer to flutter.compileSdkVersion.
           python3 - <<'PY'
+          import re
           from pathlib import Path
 
+          MAX_COMPILE_SDK = 36
+          # Matches literal declarations only: "compileSdk = 37",
+          # "compileSdkVersion 37", "compileSdk 37". Deferring forms
+          # ("compileSdk = flutter.compileSdkVersion",
+          # "compileSdkVersion project.ext.compileSdk") carry no literal
+          # number and are skipped by design.
+          pattern = re.compile(r'compileSdk(?:Version)?\s*(?:=\s*)?(\d+)')
+
           roots = [Path("android"), Path.home() / ".pub-cache" / "hosted" / "pub.dev"]
-          changed = []
+          checked = 0
+          offenders = []
           for root in roots:
               if not root.exists():
                   continue
@@ -262,39 +345,22 @@ jobs:
                       lines = path.read_text().splitlines()
                   except (OSError, UnicodeDecodeError):
                       continue
-                  updated = []
-                  count = 0
-                  for line in lines:
-                      stripped = line.strip()
-                      # Rewrite EVERY compileSdk declaration to 36, whatever
-                      # value it carries (34, 35, 37, flutter.compileSdkVersion
-                      # or a literal). The old rule only matched "34" and
-                      # flutter.compileSdkVersion, so it missed
-                      # permission_handler_android 14.x, which declares
-                      # compileSdk = 37 with AGP 9 — and the build then
-                      # failed with "cannot find symbol" for API-36
-                      # symbols (ACCESS_LOCAL_NETWORK, CINNAMON_BUN).
-                      if stripped.startswith("compileSdk"):
-                          indent = line[:len(line) - len(line.lstrip())]
-                          if stripped.startswith("compileSdk ="):
-                              line = indent + "compileSdk = 36"
-                          elif stripped.startswith("compileSdkVersion"):
-                              line = indent + "compileSdkVersion 36"
-                          elif stripped.startswith("compileSdk "):
-                              line = indent + "compileSdk 36"
-                          count += 1
-                      updated.append(line)
-                  if count:
-                      path.write_text("\n".join(updated) + "\n")
-                      changed.append(f"{path}: {count}")
-          if not changed:
-              # Plugins already align: that is a pass, not a failure.
-              # Failing here used to break the build on every Flutter/plugin
-              # update that already shipped compileSdk 36.
-              print("No Android compileSdk declarations needed adjustment")
-          else:
-              print("Aligned Android compileSdk declarations to 36:")
-              print("\n".join(changed))
+                  for lineno, line in enumerate(lines, 1):
+                      match = pattern.search(line)
+                      if not match:
+                          continue
+                      checked += 1
+                      value = int(match.group(1))
+                      if value > MAX_COMPILE_SDK:
+                          offenders.append(
+                              f"Plugin {path}:{lineno} requires compileSdk {value} > {MAX_COMPILE_SDK}"
+                          )
+          if offenders:
+              raise SystemExit(
+                  "Plugin(s) require compileSdk above 36; update the plugin pin or raise the target SDK — see pubspec.yaml:\n"
+                  + "\n".join(offenders)
+              )
+          print(f"Checked {checked} compileSdk declarations; none requires more than 36")
           PY
 
       - name: Analyze Dart code
@@ -325,7 +391,12 @@ jobs:
           # Use repository secrets when configured; otherwise the build falls
           # back to the defaults compiled into lib/main.dart. Previously the
           # build silently ignored the secrets entirely.
-          args=(--release --verbose)
+          # No --verbose: under --verbose the --dart-define values for
+          # SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY are echoed into CI
+          # logs. --build-number overrides the +1 in pubspec version
+          # 0.1.0+1 so every CI build ships a distinct versionCode
+          # (without it, every build was versionCode 1).
+          args=(--release --build-number=${{ github.run_number }})
           # Bake the commit SHA into the app so the login screen can show
           # which build is installed.
           args+=(--dart-define=HELBA_COMMIT=${{ github.sha }})
@@ -339,6 +410,37 @@ jobs:
 
       - name: Verify APK exists
         run: test -s build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Verify built APK contents
+        shell: bash
+        run: |
+          # The greps above only check the generated source files before
+          # the build. Verify the BUILT APK itself carries what push,
+          # deep links and calls need — a flutter create drift or a
+          # plugin manifest-merge failure would otherwise ship silently.
+          # aapt2 dump xmltree prints each attribute's name and value on
+          # one line (e.g. A: android:name(...)="android.permission.INTERNET"),
+          # so grep for the literal names / package string, not for an
+          # XML layout. The package must be com.example.helba: the
+          # explicit FirebaseOptions in lib/src/push.dart hardcode that
+          # package, and a drift would silently disable push.
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          SDK_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          AAPT2="$SDK_HOME/build-tools/36.0.0/aapt2"
+          if [ ! -x "$AAPT2" ]; then
+            AAPT2=$(find "$SDK_HOME/build-tools" -name aapt2 -type f 2>/dev/null | head -1)
+          fi
+          if [ -z "$AAPT2" ] || [ ! -x "$AAPT2" ]; then
+            echo "aapt2 not found under \$ANDROID_HOME/build-tools (build-tools 36.0.0 is installed by the 'Install Android compile SDK' step)" && exit 1
+          fi
+          DUMP=$("$AAPT2" dump xmltree "$APK" AndroidManifest.xml)
+          echo "$DUMP" | grep -q 'android.permission.INTERNET' || (echo "Built APK is missing the INTERNET permission" && exit 1)
+          echo "$DUMP" | grep -q 'android:scheme.*helba' || (echo "Built APK is missing the helba deep-link scheme" && exit 1)
+          echo "$DUMP" | grep -q 'android:host.*auth' || (echo "Built APK is missing the auth deep-link host" && exit 1)
+          echo "$DUMP" | grep -q 'android:host.*chat' || (echo "Built APK is missing the chat deep-link host" && exit 1)
+          echo "$DUMP" | grep -q 'firebase_messaging_installation_id_enabled' || (echo "Built APK is missing the FCM Installation ID opt-in meta-data" && exit 1)
+          echo "$DUMP" | grep -q 'package="com.example.helba"' || (echo "Built APK package is not com.example.helba (FirebaseOptions in lib/src/push.dart hardcode that package)" && exit 1)
+          echo "Built APK verified: INTERNET, helba deep links (auth + chat), FID opt-in meta-data, package com.example.helba"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
