@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:io' as io;
 
 import 'package:http/http.dart' as http;
-import 'package:open_file_plus/open_file_plus.dart';
+import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -200,7 +200,7 @@ class UpdateInstallResult {
 /// The HTTP client, the install-permission calls and the file opener are
 /// injectable so the whole flow is unit-testable without platform
 /// channels. In production the defaults are used: a direct (non-proxied)
-/// HTTP client, permission_handler, and open_file_plus.
+/// HTTP client, permission_handler, and open_filex.
 class AppUpdateChecker {
   final AppUpdateStore store;
   final http.Client Function() _clientFactory;
@@ -221,7 +221,7 @@ class AppUpdateChecker {
         _requestInstallPermission = requestInstallPermission ??
             (() => Permission.requestInstallPackages.request()),
         _openFile = openFile ??
-            ((path) => OpenFile.open(
+            ((path) => OpenFilex.open(
                   path,
                   type: 'application/vnd.android.package-archive',
                 ));
