@@ -20,7 +20,12 @@ import 'push.dart';
 // ---------------------------------------------------------------------------
 
 /// How long an unanswered call rings before it is marked missed.
-const callRingTimeout = Duration(seconds: 30);
+/// 60s (was 30s, fix 10): a callee answering from a cold start — push
+/// tap, app launch, offer re-request — needs more than 30s, and the
+/// pg_cron job that marks ringing calls missed runs every minute, so a
+/// 60s window is compatible with it. Do not exceed 60s, or the cron
+/// would mark the call missed while the client is still ringing.
+const callRingTimeout = Duration(seconds: 60);
 
 /// The navigator key the app's MaterialApp uses, so an incoming call can
 /// be shown from anywhere (inbox or inside a chat) without a BuildContext.
@@ -209,6 +214,87 @@ Map<String, dynamic> buildCallPushBody({
       'call_type': callType,
     };
 
+/// Outcome of one `send-call-push` invocation (fixes 7/8). The Edge
+/// Function returns `{ok, sent, failed, reason, details}` on every
+/// call, so the caller can tell whether the callee was actually woken
+/// instead of ringing into the void for 30s. Pure: unit-tested.
+class CallPushResult {
+  /// False when the function answered with an error, or the request
+  /// itself failed (network / timeout / non-2xx).
+  final bool ok;
+
+  /// FCM messages accepted for the callee's devices.
+  final int sent;
+
+  /// FCM sends that failed (dead token, FCM error).
+  final int failed;
+
+  /// Stable reason code when nothing was sent (`no_tokens`,
+  /// `call_not_ringing`, `all_failed`), or when the request failed
+  /// (`request_failed`, `bad_response`, `no_user`). Null when the push
+  /// reached the callee.
+  final String? reason;
+
+  const CallPushResult({
+    required this.ok,
+    required this.sent,
+    required this.failed,
+    this.reason,
+  });
+
+  /// True when at least one FCM message was accepted for the callee.
+  bool get reachedCallee => ok && sent > 0;
+
+  /// True when the function answered but nothing was sent.
+  bool get nothingSent => ok && sent == 0;
+}
+
+/// Parses the `send-call-push` response into a [CallPushResult].
+/// Never throws: a malformed response (or a null one) is a failed
+/// result, not a crash. Pure (no Supabase): unit-tested.
+CallPushResult parseCallPushResult(dynamic data) {
+  if (data is! Map) {
+    return const CallPushResult(
+      ok: false,
+      sent: 0,
+      failed: 0,
+      reason: 'bad_response',
+    );
+  }
+  int asInt(dynamic value) =>
+      value is int ? value : int.tryParse(value?.toString() ?? '') ?? 0;
+  final ok = data['ok'] == true;
+  final sent = asInt(data['sent']);
+  final failed = asInt(data['failed']);
+  final reason = data['reason']?.toString().trim();
+  return CallPushResult(
+    ok: ok,
+    sent: sent,
+    failed: failed,
+    reason: reason?.isNotEmpty == true ? reason : null,
+  );
+}
+
+/// The user-facing warning for a call-push outcome, or null when no
+/// warning is needed (the push reached the callee, or the call is
+/// already dead so waking them is pointless). Pure: unit-tested.
+String? callPushWarningMessage(CallPushResult result) {
+  if (result.reachedCallee) return null;
+  if (!result.ok) {
+    return 'تعذّر إرسال إشعار المكالمة — تحقق من الاتصال وحاول مجدداً.';
+  }
+  switch (result.reason) {
+    case 'no_tokens':
+      return 'الهاتف الآخر غير مسجّل لاستقبال الإشعارات — لن يرنّ إن كان التطبيق مغلقاً.';
+    case 'all_failed':
+      return 'لم يصل إشعار المكالمة إلى الهاتف الآخر — قد يكون مغلقاً أو بلا اتصال.';
+    case 'call_not_ringing':
+      return null;
+    default:
+      return 'لم يصل إشعار المكالمة إلى الهاتف الآخر.';
+  }
+}
+
 /// Plays the device's real system ringtone in a loop while an incoming
 /// call rings, and stops it on accept / decline / end / timeout.
 ///
@@ -300,6 +386,15 @@ class CallService {
   /// call was answered. Null unless the call ended this way; cleared
   /// when the next call starts.
   final ValueNotifier<String?> callError = ValueNotifier(null);
+
+  /// Warning for the CALLER when the call push did not reach the callee
+  /// (fix 8): no push token registered for them, or every FCM send
+  /// failed. The call screen observes this and shows a banner, so the
+  /// caller knows the other phone may not ring instead of waiting out
+  /// the ring window in silence. Null when the push reached the callee
+  /// (or no push was attempted yet). Cleared when the next call starts
+  /// and when the call ends.
+  final ValueNotifier<String?> callPushWarning = ValueNotifier(null);
 
   /// Offer queued when the incoming-call overlay could not be shown
   /// (no navigator context yet). Retried until the call is answered,
@@ -750,8 +845,11 @@ class CallService {
             to: signal.from,
             callId: signal.callId,
             callType: signal.callType));
+        // 20s (was 10s, fix 10): a push-triggered accept needs the
+        // cold-start budget — app launch plus the caller re-sending the
+        // offer — and the 60s ring window leaves room for it.
         effective =
-            await completer.future.timeout(const Duration(seconds: 10));
+            await completer.future.timeout(const Duration(seconds: 20));
       } catch (_) {
         _pendingOfferCompleter = null;
         await declineCall(signal);
@@ -883,26 +981,39 @@ class CallService {
             callType: callType,
             payload: {'sdp': offer.sdp, 'type': offer.type}));
         // Wake the callee if their app is closed or backgrounded: the
-        // Realtime offer only reaches a connected client. Best-effort
-        // and fire-and-forget — a failed push never breaks the ringing
-        // call, and the push must not delay the ring timer.
-        unawaited(_sendCallPush(
+        // Realtime offer only reaches a connected client. Fix 8: the
+        // push is AWAITED (bounded to 5s inside _sendCallPush) and its
+        // result is surfaced on the call screen — when nothing was
+        // sent, the caller sees why instead of ringing into the void.
+        // The ring timer starts after the push returns, so the ring
+        // window is not spent waiting on it. NOTE: a pre-ring check of
+        // the callee's push_tokens row is not possible client-side —
+        // the RLS SELECT policy is own-rows-only (migration 011) — so
+        // the push result itself (sent: 0, reason: no_tokens) is the
+        // authoritative "callee has no push registration" signal.
+        callPushWarning.value = null;
+        final pushResult = await _sendCallPush(
           calleeId: calleeId,
           callId: callId,
           callType: callType,
-        ).catchError((_) {}));
+        );
+        callPushWarning.value = callPushWarningMessage(pushResult);
       } catch (_) {
         await _closePeerConnection();
         await _updateCallRow('cancelled', end: true);
         _resetCall();
         rethrow;
       }
-      _armRingTimer(() async {
-        // Nobody answered: mark it missed and end the outgoing screen.
-        await _updateCallRow('missed', end: true);
-        endReason = 'missed';
-        await hangUp(sendSignal: true);
-      });
+      // The callee may have answered over Realtime while the push was
+      // awaited: only arm the ring timer while still outgoing.
+      if (state.value == CallState.outgoing) {
+        _armRingTimer(() async {
+          // Nobody answered: mark it missed and end the outgoing screen.
+          await _updateCallRow('missed', end: true);
+          endReason = 'missed';
+          await hangUp(sendSignal: true);
+        });
+      }
       return callId;
     } catch (_) {
       // Row creation / any other failure before the offer: the inner
@@ -1070,30 +1181,52 @@ class CallService {
   }
 
   /// Asks the `send-call-push` Edge Function to wake the callee with a
-  /// high-priority incoming-call push. Best-effort: the Realtime offer
-  /// is the primary path, so a failure here (no function deployed yet,
-  /// no network) never throws and never breaks the call. The app
+  /// high-priority incoming-call push. The Realtime offer is the
+  /// primary path, so a failure here (no function deployed yet, no
+  /// network) never throws and never breaks the call. The app
   /// authenticates with its own Supabase session (JWT) — it never holds
   /// the trigger secret.
-  Future<void> _sendCallPush({
+  ///
+  /// Fix 8: this is NOT fire-and-forget any more. The result is
+  /// returned (never thrown) so the caller can surface it: when the
+  /// function answers `sent: 0` the callee was not woken, and the call
+  /// screen warns the caller instead of ringing into the void. The
+  /// invoke is bounded (5s) so a slow push cannot stall the call.
+  Future<CallPushResult> _sendCallPush({
     required String calleeId,
     required String callId,
     required String callType,
   }) async {
     final myId = _client.auth.currentUser?.id;
-    if (myId == null) return;
-    try {
-      await _client.functions.invoke(
-        'send-call-push',
-        body: buildCallPushBody(
-          callId: callId,
-          calleeId: calleeId,
-          callerId: myId,
-          callType: callType,
-        ),
+    if (myId == null) {
+      return const CallPushResult(
+        ok: false,
+        sent: 0,
+        failed: 0,
+        reason: 'no_user',
       );
+    }
+    try {
+      final response = await _client.functions
+          .invoke(
+            'send-call-push',
+            body: buildCallPushBody(
+              callId: callId,
+              calleeId: calleeId,
+              callerId: myId,
+              callType: callType,
+            ),
+          )
+          .timeout(const Duration(seconds: 5));
+      return parseCallPushResult(response.data);
     } catch (_) {
       // Best-effort: the ringing call continues over Realtime.
+      return const CallPushResult(
+        ok: false,
+        sent: 0,
+        failed: 0,
+        reason: 'request_failed',
+      );
     }
   }
 
@@ -1384,6 +1517,8 @@ class CallService {
     _rowFinalized = false;
     _outgoingOfferSdp = null;
     _outgoingOfferType = null;
+    // A stale push warning must not survive into the next call (fix 8).
+    callPushWarning.value = null;
     // A waiting accept must not hang when the call ends underneath it
     // (remote hangup while it waits for the re-sent offer).
     final completer = _pendingOfferCompleter;
@@ -1706,6 +1841,35 @@ class _CallPageState extends State<CallPage> {
     if (mounted) Navigator.of(context).pop();
   }
 
+  /// Banner shown while ringing when the call push did not reach the
+  /// callee (fix 8): the caller sees why the other phone may not ring.
+  /// Hidden once the push is confirmed delivered (or the call ends).
+  Widget _callPushWarningBanner() {
+    return ValueListenableBuilder<String?>(
+      valueListenable: _service.callPushWarning,
+      builder: (_, warning, __) {
+        if (warning == null) return const SizedBox.shrink();
+        return ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 300),
+          child: Container(
+            margin: const EdgeInsets.only(top: 12),
+            padding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.amber.shade700,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              warning,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white, fontSize: 13),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final isVideo = widget.callType == 'video';
@@ -1772,6 +1936,7 @@ class _CallPageState extends State<CallPage> {
                         Text(statusText,
                             style: const TextStyle(
                                 fontSize: 16, color: Colors.white70)),
+                        _callPushWarningBanner(),
                       ],
                     ),
                   ),
@@ -1790,6 +1955,7 @@ class _CallPageState extends State<CallPage> {
                       Text(statusText,
                           textAlign: TextAlign.center,
                           style: const TextStyle(color: Colors.white70)),
+                      _callPushWarningBanner(),
                     ]),
                   ),
                 if (isVideo)

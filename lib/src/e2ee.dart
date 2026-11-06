@@ -167,6 +167,44 @@ bool canEncryptFor(Map<String, List<DeviceKey>> memberDeviceKeys) {
   );
 }
 
+/// Members of [memberIds] who have no usable device key in
+/// [memberDeviceKeys] (fix 1): the reset must abort when this is
+/// non-empty instead of creating a key that covers only some members.
+/// A member counts as covered when they have at least one valid public
+/// key on any device (the same rule as [canEncryptFor]); a member
+/// missing from the map entirely, or with only invalid keys, is
+/// uncovered. Pure (no Supabase): unit-tested.
+List<String> membersMissingKeys(
+  Set<String> memberIds,
+  Map<String, List<DeviceKey>> memberDeviceKeys,
+) =>
+    memberIds
+        .where(
+          (id) =>
+              !(memberDeviceKeys[id]
+                      ?.any((d) => isValidPublicKey(d.publicKey)) ??
+                  false),
+        )
+        .toList();
+
+/// The wrap targets for one member's device list (fix 2): every device
+/// in [devices], EXCEPT the legacy per-user entry (deviceId null) when
+/// the member already has at least one valid device row. The legacy row
+/// is wrapped for profiles.public_key, which is stale after a reinstall
+/// (the device holds a new keypair while the profile still names the
+/// old one) — a stale legacy row is poison: it can be picked up as the
+/// fallback wrapped row and fail to unwrap, blocking the key load. So
+/// the legacy row is written ONLY when the member has no device rows
+/// at all (pre-023 members, whose only key is the profiles one). Pure
+/// (no Supabase): unit-tested.
+List<DeviceKey> wrapTargetsForMember(List<DeviceKey> devices) {
+  final hasValidDevice = devices.any(
+    (d) => d.deviceId != null && isValidPublicKey(d.publicKey),
+  );
+  if (!hasValidDevice) return List<DeviceKey>.from(devices);
+  return devices.where((d) => d.deviceId != null).toList();
+}
+
 /// A fresh random 32-byte conversation key.
 List<int> generateConversationKey() {
   final bytes = Uint8List(32);
@@ -601,15 +639,17 @@ Future<void> _publishReplacedPublicKey(SimpleKeyPair pair) async {
 
 /// Upserts my (user, device, public key) row into user_devices
 /// (migration 023) so other members can wrap the conversation key for
-/// THIS device. Best-effort, never throws: a pre-migration-023 DB has
-/// no user_devices table, and publishing must never block the chat —
-/// the profiles.public_key publish still happens, and the next publish
-/// retries this one.
-Future<void> _upsertMyDeviceKey(String publicKey) async {
+/// THIS device. Returns true when the row landed. A failure (pre-
+/// migration-023 DB with no user_devices table, or offline) returns
+/// false and is logged — never thrown, and never blocks the chat: the
+/// profiles.public_key publish still happens, and the next publish
+/// retries this one. (Fix 4: the old code swallowed the failure
+/// silently, so a device that never registered stayed invisible.)
+Future<bool> _upsertMyDeviceKey(String publicKey) async {
   try {
     final client = Supabase.instance.client;
     final uid = client.auth.currentUser?.id;
-    if (uid == null) return;
+    if (uid == null) return false;
     final deviceId = await getDeviceId();
     await client.from('user_devices').upsert(
       {
@@ -620,8 +660,11 @@ Future<void> _upsertMyDeviceKey(String publicKey) async {
       },
       onConflict: 'user_id,device_id',
     );
-  } catch (_) {
-    // Best-effort (pre-migration 023 / offline): ignored.
+    return true;
+  } catch (e) {
+    // Best-effort (pre-migration 023 / offline): logged, not thrown.
+    debugPrint('Helba E2E: failed to upsert my device key: $e');
+    return false;
   }
 }
 
@@ -639,28 +682,65 @@ Future<String> myPublicKeyBase64(SimpleKeyPair pair) async {
 /// Also upserts my (user, device) row into user_devices (migration
 /// 023) on every call — the profiles key alone cannot tell my devices
 /// apart, and a device that only ever relied on profiles would never
-/// be wrapped for by its own id. Best-effort by callers: a failure
-/// must never block sending.
+/// be wrapped for by its own id.
+///
+/// Returns true ONLY when the publish is verified: the profile key
+/// already matched, or the update landed and a read-back confirms it.
+/// Returns false (never throws) when anything failed — a failure must
+/// never block sending, but it must not be silent either (fix 4): the
+/// caller surfaces a warning, because without a published key other
+/// members cannot wrap the conversation key for this device. A failed
+/// device upsert alone does not fail the publish (pre-023 DBs have no
+/// user_devices table) — it is logged, and the profiles read-back
+/// still decides the result.
 /// Requires migration 012's extended column-level UPDATE grant.
-Future<void> publishPublicKeyIfNeeded({SimpleKeyPair? pair}) async {
+Future<bool> publishPublicKeyIfNeeded({SimpleKeyPair? pair}) async {
   final client = Supabase.instance.client;
   final uid = client.auth.currentUser?.id;
-  if (uid == null) return;
-  final keyPair = pair ?? await ensureKeyPair();
-  final publicKey = await myPublicKeyBase64(keyPair);
-  await _upsertMyDeviceKey(publicKey);
-  final row = await client
-      .from('profiles')
-      .select('public_key')
-      .eq('id', uid)
-      .maybeSingle();
-  final existing = row?['public_key']?.toString() ?? '';
-  if (existing.trim() == publicKey) {
+  if (uid == null) return false;
+  try {
+    final keyPair = pair ?? await ensureKeyPair();
+    final publicKey = await myPublicKeyBase64(keyPair);
+    final deviceOk = await _upsertMyDeviceKey(publicKey);
+    if (!deviceOk) {
+      debugPrint(
+        'Helba E2E: my device key upsert failed; profiles publish '
+        'continues',
+      );
+    }
+    final row = await client
+        .from('profiles')
+        .select('public_key')
+        .eq('id', uid)
+        .maybeSingle();
+    final existing = row?['public_key']?.toString() ?? '';
+    if (existing.trim() == publicKey) {
+      _keyWasReplaced = false;
+      return true;
+    }
+    await client.from('profiles').update({'public_key': publicKey}).eq('id', uid);
     _keyWasReplaced = false;
-    return;
+    // Read-back verification (fix 4): the update can fail silently
+    // (RLS / network) and the caller must not assume it landed.
+    final verify = await client
+        .from('profiles')
+        .select('public_key')
+        .eq('id', uid)
+        .maybeSingle();
+    final stored = verify?['public_key']?.toString() ?? '';
+    if (stored.trim() != publicKey) {
+      debugPrint(
+        'Helba E2E: profiles.public_key did not update on read-back',
+      );
+      return false;
+    }
+    return true;
+  } catch (e) {
+    // Best-effort by callers: log the failure instead of swallowing it
+    // (fix 4), and report false so the caller can warn the user.
+    debugPrint('Helba E2E: publishPublicKeyIfNeeded failed: $e');
+    return false;
   }
-  await client.from('profiles').update({'public_key': publicKey}).eq('id', uid);
-  _keyWasReplaced = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -746,23 +826,30 @@ Future<Map<String, List<DeviceKey>>> loadMemberDeviceKeys(
 /// [memberDeviceKeys] (migration 023) and upserts one
 /// conversation_keys row per (user, device). The list for each member
 /// also carries the legacy per-user entry (deviceId null, wrapped for
-/// profiles.public_key) — see [mergeMemberDeviceKeys] — so the legacy
-/// row keeps being written and old builds keep working during the
-/// transition. The RLS INSERT policy allows any member to wrap for
-/// other members. Best-effort per device: one device's failure must
-/// not block the rest.
+/// profiles.public_key) — see [mergeMemberDeviceKeys] — but that entry
+/// is only written when the member has NO valid device rows
+/// ([wrapTargetsForMember], fix 2): a legacy row wrapped for a stale
+/// profiles key is poison. The RLS INSERT policy allows any member to
+/// wrap for other members. Best-effort per device: one device's failure
+/// must not block the rest.
+///
+/// Returns the user ids for whom NO device row was written
+/// successfully (every wrap skipped for an invalid key, or failed):
+/// the caller (the reset flow) warns when this is non-empty instead of
+/// assuming the wrap covered everyone. An empty set means every member
+/// got at least one row.
 ///
 /// My own device entry is ALWAYS refreshed with the current local
 /// public key (finding #21) before wrapping — a stale device row must
 /// never be wrapped for, because I no longer own its private key.
-Future<void> wrapKeyForMembers(
+Future<Set<String>> wrapKeyForMembers(
   String conversationId,
   List<int> convKeyBytes,
   Map<String, List<DeviceKey>> memberDeviceKeys,
 ) async {
   final client = Supabase.instance.client;
   final myId = client.auth.currentUser?.id;
-  if (myId == null) return;
+  if (myId == null) return memberDeviceKeys.keys.toSet();
   final pair = await ensureKeyPair();
   final myPrivate = await pair.extractPrivateKeyBytes();
   final myDeviceId = await getDeviceId();
@@ -774,9 +861,14 @@ Future<void> wrapKeyForMembers(
   final myDevices = members.putIfAbsent(myId, () => []);
   myDevices.removeWhere((d) => d.deviceId == myDeviceId);
   myDevices.add((deviceId: myDeviceId, publicKey: myPublic));
+  final uncovered = <String>{};
   for (final entry in members.entries) {
     final userId = entry.key;
-    for (final device in entry.value) {
+    // Fix 2: never write the legacy (device_id NULL) row when the
+    // member already has valid device rows — see wrapTargetsForMember.
+    final targets = wrapTargetsForMember(entry.value);
+    var wroteOne = false;
+    for (final device in targets) {
       final publicKey = device.publicKey;
       if (!isValidPublicKey(publicKey)) {
         // Log the user id only — never key material (finding #24/#28).
@@ -809,6 +901,7 @@ Future<void> wrapKeyForMembers(
           },
           onConflict: 'conversation_id,user_id,device_id',
         );
+        wroteOne = true;
       } catch (e) {
         // One device unwrappable now (bad key, network blip) — the next
         // send retries via the same lazy re-wrap. Log the user id only,
@@ -816,7 +909,9 @@ Future<void> wrapKeyForMembers(
         debugPrint('Helba E2E: wrap failed for member $userId: $e');
       }
     }
+    if (!wroteOne) uncovered.add(userId);
   }
+  return uncovered;
 }
 
 /// Outcome of looking up my own wrapped conversation-key row.
@@ -1033,7 +1128,11 @@ bool shouldCreateKey({
 /// holds), as opposed to a transient failure (no row yet, network
 /// error) where [blocked] is false and the caller must keep retrying;
 /// [fromLegacy] is true when the key came from a pre-binding (legacy)
-/// wrapped row, so the caller can heal it by re-wrapping.
+/// wrapped row, so the caller can heal it by re-wrapping;
+/// [uncoveredMembers] is the set of member ids for whom the creation
+/// wrap wrote NO row (every wrap skipped or failed) — empty on every
+/// non-creation path, and the reset flow warns when it is non-empty
+/// instead of assuming the fresh key covers everyone.
 ///
 /// Returns null key when the key cannot be obtained: no signed-in user,
 /// a network/Supabase error (pre-migration 012 included), or — the
@@ -1047,7 +1146,7 @@ bool shouldCreateKey({
 /// [afterReset] is true: the caller just deleted every wrapped row via
 /// `reset_conversation_keys`, so there is no old key left to orphan
 /// and the caller acts as the creator of the fresh key.
-Future<({List<int>? key, bool blocked, bool fromLegacy})>
+Future<({List<int>? key, bool blocked, bool fromLegacy, Set<String> uncoveredMembers})>
     loadOrCreateConversationKey(
   String conversationId,
   Map<String, List<DeviceKey>> memberDeviceKeys, {
@@ -1056,7 +1155,7 @@ Future<({List<int>? key, bool blocked, bool fromLegacy})>
   final client = Supabase.instance.client;
   final myId = client.auth.currentUser?.id;
   if (myId == null) {
-    return (key: null, blocked: false, fromLegacy: false);
+    return (key: null, blocked: false, fromLegacy: false, uncoveredMembers: const <String>{});
   }
 
   final pair = await ensureKeyPair();
@@ -1088,15 +1187,16 @@ Future<({List<int>? key, bool blocked, bool fromLegacy})>
           key: mine.key,
           blocked: false,
           fromLegacy: mine.fromLegacy,
+          uncoveredMembers: const <String>{},
         );
       }
       if (mine.outcome == _MyKeyOutcome.blocked) {
-        return (key: null, blocked: true, fromLegacy: false);
+        return (key: null, blocked: true, fromLegacy: false, uncoveredMembers: const <String>{});
       }
     } catch (_) {
       // conversation_keys missing (pre-migration) or network error: no
       // key, caller falls back to plaintext.
-      return (key: null, blocked: false, fromLegacy: false);
+      return (key: null, blocked: false, fromLegacy: false, uncoveredMembers: const <String>{});
     }
 
     // 2. No row for me. If the conversation already has encrypted
@@ -1109,10 +1209,10 @@ Future<({List<int>? key, bool blocked, bool fromLegacy})>
         hasEncryptedMessages: hasEncrypted,
         afterReset: afterReset,
       )) {
-        return (key: null, blocked: false, fromLegacy: false);
+        return (key: null, blocked: false, fromLegacy: false, uncoveredMembers: const <String>{});
       }
     } catch (_) {
-      return (key: null, blocked: false, fromLegacy: false);
+      return (key: null, blocked: false, fromLegacy: false, uncoveredMembers: const <String>{});
     }
 
     // 3. Fresh conversation (or none encrypted yet): the elected
@@ -1123,7 +1223,7 @@ Future<({List<int>? key, bool blocked, bool fromLegacy})>
         'Helba E2E: no conversation key appeared after polling; not '
         'creating one (not the elected creator)',
       );
-      return (key: null, blocked: false, fromLegacy: false);
+      return (key: null, blocked: false, fromLegacy: false, uncoveredMembers: const <String>{});
     }
     await Future.delayed(const Duration(milliseconds: 500));
   }
@@ -1131,7 +1231,7 @@ Future<({List<int>? key, bool blocked, bool fromLegacy})>
   // 3. Create the key and wrap it for every member who has a public
   // key, including myself.
   final convKey = generateConversationKey();
-  await wrapKeyForMembers(conversationId, convKey, members);
+  final uncovered = await wrapKeyForMembers(conversationId, convKey, members);
   // Re-read my own wrapped row and adopt whatever key is actually
   // stored (finding #23): if another creator overwrote my row in the
   // meantime, the stored key — not my locally generated one — is the
@@ -1144,10 +1244,11 @@ Future<({List<int>? key, bool blocked, bool fromLegacy})>
         key: stored.key,
         blocked: false,
         fromLegacy: stored.fromLegacy,
+        uncoveredMembers: uncovered,
       );
     }
   } catch (_) {
     // Re-read failed (network blip): keep the locally generated key.
   }
-  return (key: convKey, blocked: false, fromLegacy: false);
+  return (key: convKey, blocked: false, fromLegacy: false, uncoveredMembers: uncovered);
 }

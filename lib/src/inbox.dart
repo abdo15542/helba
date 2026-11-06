@@ -87,6 +87,9 @@ class _InboxPageState extends State<InboxPage> {
   RealtimeChannel? _realtimeChannel;
   Timer? _realtimeDebounce;
   bool _pushDeniedPromptShown = false;
+  // One-time prompt for the push-registration warning (fix 9), same
+  // pattern as the denied-permission prompt above.
+  bool _pushRegistrationPromptShown = false;
   // In-app update (app_update.dart): a newer published build, when the
   // daily check finds one and the user has not dismissed that build.
   final _updateChecker = AppUpdateChecker();
@@ -100,6 +103,12 @@ class _InboxPageState extends State<InboxPage> {
     _chatsFuture = loadChats();
     _subscribeInboxRealtime();
     pushNotificationsPermanentlyDenied.addListener(_onPushDeniedChanged);
+    pushRegistrationWarning.addListener(_onPushRegistrationChanged);
+    // The warning may already be set (registration failed before this
+    // page was built): pick it up now, after the first frame.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _onPushRegistrationChanged();
+    });
     // Best-effort update check, off the startup path: never blocks the
     // inbox and never shows an error when it fails.
     WidgetsBinding.instance.addPostFrameCallback((_) => _checkForUpdate());
@@ -281,6 +290,30 @@ class _InboxPageState extends State<InboxPage> {
     );
   }
 
+  /// One-time prompt when push registration could not be verified
+  /// (fix 9): without a registered FID no call/message push arrives
+  /// while the app is closed. Offers a retry, which re-runs the whole
+  /// setup (register + upsert + verification).
+  void _onPushRegistrationChanged() {
+    final warning = pushRegistrationWarning.value;
+    if (warning == null || _pushRegistrationPromptShown || !mounted) {
+      return;
+    }
+    _pushRegistrationPromptShown = true;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(warning),
+        action: SnackBarAction(
+          label: 'إعادة المحاولة',
+          onPressed: () {
+            _pushRegistrationPromptShown = false;
+            unawaited(setupPushNotifications());
+          },
+        ),
+      ),
+    );
+  }
+
   /// Live inbox updates: a new message, or a conversation's updated_at
   /// changing, schedules a debounced refresh (~500ms). One channel for
   /// both tables; unsubscribed in dispose().
@@ -335,6 +368,7 @@ class _InboxPageState extends State<InboxPage> {
   @override
   void dispose() {
     pushNotificationsPermanentlyDenied.removeListener(_onPushDeniedChanged);
+    pushRegistrationWarning.removeListener(_onPushRegistrationChanged);
     _searchDebounce?.cancel();
     _realtimeDebounce?.cancel();
     final channel = _realtimeChannel;

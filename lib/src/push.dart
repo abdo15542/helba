@@ -269,12 +269,30 @@ final ValueNotifier<String?> currentOpenConversationId = ValueNotifier(null);
 final ValueNotifier<bool> pushNotificationsPermanentlyDenied =
     ValueNotifier(false);
 
+/// Warning shown to the user when push registration could not be
+/// verified (fix 9): the FCM Installation ID never arrived via
+/// `onRegistered`, or its `push_tokens` upsert kept failing. Without a
+/// registered FID this device receives no call/message push while the
+/// app is closed — and the old code failed silently, so the user only
+/// discovered it when a call never rang. Null when registration is
+/// verified (or not yet checked). The inbox observes this and shows a
+/// one-time prompt with a retry action. push.dart has no BuildContext,
+/// so it exposes state instead of showing a dialog itself.
+final ValueNotifier<String?> pushRegistrationWarning = ValueNotifier(null);
+
 /// The FID currently registered for this device, if one has arrived.
 /// Exposed for diagnostics and for the sign-out pruning path.
 String? get currentPushToken => _currentFid;
 
 /// Whether push setup has completed a successful registration.
 bool get pushSetupComplete => _pushSetupDone;
+
+/// True once the current FID has been confirmed stored in `push_tokens`
+/// (fix 9). The FID arriving via `onRegistered` is not enough: the
+/// upsert can still fail (network / RLS), leaving the device
+/// unregistered with no visible error. Reset to false whenever a new
+/// FID arrives, so [_verifyPushRegistration] waits for the upsert too.
+bool _pushTokenUpsertConfirmed = false;
 
 StreamSubscription<String>? _registeredSubscription;
 StreamSubscription<String>? _unregisteredSubscription;
@@ -343,6 +361,8 @@ Future<void> setupPushNotifications() async {
     _registeredSubscription ??= messaging.onRegistered.listen(
       (fid) {
         _currentFid = fid;
+        // A new FID is unconfirmed until its upsert lands (fix 9).
+        _pushTokenUpsertConfirmed = false;
         unawaited(_upsertPushToken(fid));
       },
       onError: (Object e) {
@@ -354,6 +374,7 @@ Future<void> setupPushNotifications() async {
         // This install is no longer registered: forget the FID so the
         // next setup re-registers instead of trusting a stale token.
         if (_currentFid == fid) _currentFid = null;
+        _pushTokenUpsertConfirmed = false;
         _pushSetupDone = false;
         debugPrint('Helba push: unregistered (FID $fid no longer active)');
       },
@@ -374,6 +395,16 @@ Future<void> setupPushNotifications() async {
     // sure its upsert is (re-)attempted even if the listener's
     // unawaited call raced with this return.
     await retryPushTokenUpsert();
+    // Fix 9: verify the registration actually landed (FID arrived AND
+    // its push_tokens upsert confirmed) instead of assuming it. Runs
+    // in the background: a missing FID or a failed upsert sets
+    // [pushRegistrationWarning] so the user sees it instead of
+    // silently missing every closed-app call and message.
+    // Re-registration on every launch is already guaranteed: the
+    // setup flags are per-process, so a fresh launch (including after
+    // a reinstall, which changes the FID) always runs register() again
+    // and replaces the stale token.
+    unawaited(_verifyPushRegistration());
   } catch (e) {
     // Any later failure (permissions, registration, listeners) also just
     // disables push; the app must never crash over notifications. Reset
@@ -382,6 +413,38 @@ Future<void> setupPushNotifications() async {
     _pushSetupDone = false;
     return;
   }
+}
+
+/// Verifies (fix 9) that this launch actually registered a push token:
+/// waits up to 20s for the FID to arrive via `onRegistered` AND for its
+/// `push_tokens` upsert to be confirmed. If either never happens, sets
+/// [pushRegistrationWarning] so the user sees it instead of silently
+/// missing every closed-app call and message. Never throws; the app
+/// works without push. A later successful upsert clears the warning
+/// (see [_upsertPushToken]).
+Future<void> _verifyPushRegistration() async {
+  const deadline = Duration(seconds: 20);
+  const pollEvery = Duration(seconds: 1);
+  final started = DateTime.now();
+  while (DateTime.now().difference(started) < deadline) {
+    if (_currentFid != null && _pushTokenUpsertConfirmed) {
+      pushRegistrationWarning.value = null;
+      return;
+    }
+    await Future.delayed(pollEvery);
+  }
+  if (_currentFid == null) {
+    debugPrint(
+      'Helba push: no FID arrived within 20s; registration unverified',
+    );
+  } else {
+    debugPrint(
+      'Helba push: FID arrived but its push_tokens upsert was not '
+      'confirmed within 20s',
+    );
+  }
+  pushRegistrationWarning.value =
+      'تعذّر تسجيل الإشعارات على هذا الجهاز — لن تصلك المكالمات والرسائل والهاتف مغلق. تحقق من الاتصال ثم أعد فتح التطبيق.';
 }
 
 /// Re-runs the push-token upsert for the FID we already have, if any
@@ -556,6 +619,10 @@ Future<void> _upsertPushToken(String fid) async {
       );
       _currentFid = fid.trim();
       _pendingFid = null;
+      // The FID is confirmed stored: registration is verified (fix 9),
+      // so any earlier warning is cleared.
+      _pushTokenUpsertConfirmed = true;
+      pushRegistrationWarning.value = null;
       return;
     } catch (e) {
       // The token table (migration 011) may not be applied yet, or the
@@ -568,8 +635,14 @@ Future<void> _upsertPushToken(String fid) async {
     }
   }
   _pendingFid = fid.trim();
+  _pushTokenUpsertConfirmed = false;
   debugPrint('Helba push: token upsert failed after 3 attempts; will retry '
       'on next sign-in');
+  // Fix 9: do not fail silently — without a stored token this device
+  // receives no closed-app push. The warning is cleared by the next
+  // successful upsert (above) or the next setup's verification.
+  pushRegistrationWarning.value =
+      'تعذّر تسجيل الإشعارات على هذا الجهاز — لن تصلك المكالمات والرسائل والهاتف مغلق. تحقق من الاتصال ثم أعد فتح التطبيق.';
 }
 
 /// Shows a foreground FCM message as a local notification. The Edge

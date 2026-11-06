@@ -56,6 +56,13 @@ String plaintextBannerMessage(
         ? '🔓 غير مشفّرة — تعذّر تحميل مفتاح التشفير'
         : '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح';
 
+/// Empty key loads after which pending encrypted rows stop spinning on
+/// "جارٍ فك التشفير…" and are marked failed (retryable) instead
+/// (fix 5). A load counts as empty when it returns no key without a
+/// definitive block — the creator has not created a key yet, or the
+/// key is still missing for another transient reason.
+const keyLoadGiveUpAttempts = 3;
+
 class ChatPage extends StatefulWidget {
   final String conversationId, title;
   final String kind;
@@ -112,11 +119,47 @@ class _ChatPageState extends State<ChatPage> {
   // is missing (malformed), shown as "رسالة تالفة" — never in
   // _decryptFailed, so a later key load does not mislabel them.
   final Set<String> _malformedIds = {};
+  // Encrypted rows that failed to decrypt WITH a loaded key (fix 5):
+  // their ciphertext was encrypted under a key this device no longer
+  // has (lost on reinstall / deleted by a reset). No retry can ever
+  // succeed, so they are labelled permanently unreadable in the UI
+  // with NO retry link, instead of spinning on "جارٍ فك التشفير…" or
+  // offering a futile "إعادة المحاولة". Unlike _decryptFailed (key
+  // missing/blocked — a reset may heal it), these never leave this set
+  // except on a reset, which re-evaluates them against the fresh key.
+  final Set<String> _permanentlyUnreadable = {};
   List<int>? _conversationKey;
   // True ONLY once a non-null key has actually been loaded. A null key
   // must not set this, otherwise the key load never retries.
   bool _conversationKeyLoaded = false;
-  bool _keyLoading = false;
+  // The key load currently in flight, if any (fix 3): a second request
+  // awaits it instead of silently dropping its own load — the reset's
+  // load used to be dropped this way when _initChat's load was still
+  // running. [_keyLoadInFlightAfterReset] records whether the in-flight
+  // load is a reset load, so a reset load still runs after a plain one
+  // (only it may create a key when encrypted messages exist).
+  Future<void>? _keyLoadInFlight;
+  bool _keyLoadInFlightAfterReset = false;
+  // Generation counter for key loads (fix 3): incremented by
+  // _resetEncryption, so a load that started BEFORE the reset cannot
+  // apply a stale key after the reset deleted the rows. A load that
+  // finds its generation outdated discards its result.
+  int _keyLoadGeneration = 0;
+  // Consecutive key loads that returned no key without a definitive
+  // block (fix 5): after [_keyLoadGiveUpAttempts] of them, pending
+  // encrypted rows stop spinning on "جارٍ فك التشفير…" and are marked
+  // failed (retryable) instead. Reset when a key loads, or when the
+  // user taps retry.
+  int _keyLoadNullCount = 0;
+  // Members the last key-creation wrap wrote NO row for (fix 1):
+  // _resetEncryption warns when this is non-empty.
+  Set<String> _lastWrapUncovered = {};
+  // One-time-per-session publish-failure warning (fix 4).
+  bool _publishWarningShown = false;
+  // Periodic key-load retry while the chat is open and keyless (fix 6):
+  // a fresh reset (e.g. from the other phone) takes effect without
+  // reopening the chat, instead of waiting for new stream data.
+  Timer? _keyRetryTimer;
   // True when the last key load DEFINITIVELY failed: my wrapped row
   // exists but cannot be unwrapped with either KEK (corrupt row, or
   // wrapped for a key this device no longer holds). Unlike a transient
@@ -165,6 +208,16 @@ class _ChatPageState extends State<ChatPage> {
     // members we actually know about, not just for the creator.
     _initChat();
     _loadMutedUntil();
+    // Fix 6: while the chat is open and keyless, retry the key load
+    // every ~10s (bounded by _maybeRetryKeyLoad) so a fresh reset —
+    // e.g. from the other phone — takes effect without reopening the
+    // chat. _maybeRetryKeyLoad is a no-op once a key is loaded.
+    _keyRetryTimer = Timer.periodic(
+      const Duration(seconds: 10),
+      (_) {
+        if (mounted) _maybeRetryKeyLoad();
+      },
+    );
   }
 
   Future<void> _initChat() async {
@@ -299,6 +352,16 @@ class _ChatPageState extends State<ChatPage> {
   /// so a transient failure retries instead of being remembered forever.
   /// When the key does arrive late, previously failed decryptions are
   /// cleared and re-attempted against the rows last seen.
+  ///
+  /// Fix 3: a load already in flight is AWAITED instead of silently
+  /// dropping this request — the reset's load used to be dropped when
+  /// _initChat's load was still running, leaving the conversation
+  /// keyless after the reset. A reset load (afterReset: true) still
+  /// runs after a plain load finishes, because only it may create a
+  /// key when encrypted messages exist; an identical load does not
+  /// re-run (the bounded retry covers it) — unless a reset invalidated
+  /// the in-flight load while it was running, in which case this
+  /// request runs regardless.
   Future<void> _ensureConversationKey({bool afterReset = false}) async {
     if (_conversationKey != null) {
       if (!_conversationKeyLoaded && mounted) {
@@ -306,20 +369,61 @@ class _ChatPageState extends State<ChatPage> {
       }
       return;
     }
-    if (_keyLoading) return;
-    _keyLoading = true;
+    final inFlight = _keyLoadInFlight;
+    if (inFlight != null) {
+      final inFlightWasReset = _keyLoadInFlightAfterReset;
+      final generationBefore = _keyLoadGeneration;
+      await inFlight;
+      if (_conversationKey != null) {
+        if (!_conversationKeyLoaded && mounted) {
+          setState(() => _conversationKeyLoaded = true);
+        }
+        return;
+      }
+      if (inFlightWasReset == afterReset &&
+          generationBefore == _keyLoadGeneration) {
+        return;
+      }
+    }
+    final generation = _keyLoadGeneration;
+    final load = _loadConversationKey(
+      afterReset: afterReset,
+      generation: generation,
+    );
+    _keyLoadInFlight = load;
+    _keyLoadInFlightAfterReset = afterReset;
+    try {
+      await load;
+    } finally {
+      if (identical(_keyLoadInFlight, load)) _keyLoadInFlight = null;
+    }
+  }
+
+  /// The actual key-load work for [_ensureConversationKey]. [generation]
+  /// is the [_keyLoadGeneration] captured when the load started: if a
+  /// reset incremented it meanwhile, this load's result is discarded
+  /// (the reset's own load runs after it) instead of applying a stale
+  /// key for rows the reset just deleted.
+  Future<void> _loadConversationKey({
+    required bool afterReset,
+    required int generation,
+  }) async {
     try {
       final pair = await ensureKeyPair();
-      try {
-        await publishPublicKeyIfNeeded(pair: pair);
-      } catch (_) {
-        // Publishing must never block the chat (e.g. pre-migration 012).
-      }
+      // Fix 4: a failed/unverified publish warns the user (once per
+      // session) instead of being swallowed — without a published key,
+      // other members cannot wrap the conversation key for this device.
+      // Publishing must never block the chat (e.g. pre-migration 012).
+      final published = await publishPublicKeyIfNeeded(pair: pair);
+      if (!published) _warnPublishFailed();
       final loaded = await loadOrCreateConversationKey(
         widget.conversationId,
         _memberDeviceKeys,
         afterReset: afterReset,
       );
+      // A reset happened while this load was running: discard the
+      // result — the reset's own load will create the fresh key.
+      if (generation != _keyLoadGeneration) return;
       final key = loaded.key;
       if (mounted) {
         setState(() {
@@ -328,12 +432,18 @@ class _ChatPageState extends State<ChatPage> {
           // (no row yet / network) report blocked: false, so pending
           // rows stay in "decrypting" and keep their bounded retry.
           _keyDefinitivelyBlocked = loaded.blocked;
+          _lastWrapUncovered = loaded.uncoveredMembers;
           if (key != null) {
             _conversationKey = key;
             _conversationKeyLoaded = true;
+            _keyLoadNullCount = 0;
             // The key is here now: rows marked failed only because
             // there was no key get another chance.
             _decryptFailed.clear();
+          } else if (!loaded.blocked) {
+            // Empty load (no key, no definitive block): count it
+            // towards the give-up threshold (fix 5).
+            _keyLoadNullCount++;
           }
         });
       }
@@ -348,8 +458,11 @@ class _ChatPageState extends State<ChatPage> {
           // [wrapKeyForMembers] refreshes my own device entry with
           // the current local public key (finding #21).
           try {
-            await wrapKeyForMembers(
+            final healUncovered = await wrapKeyForMembers(
                 widget.conversationId, key, _memberDeviceKeys);
+            if (mounted) {
+              setState(() => _lastWrapUncovered = healUncovered);
+            }
           } catch (_) {
             // Heal is best-effort; the key itself already loaded.
           }
@@ -362,19 +475,41 @@ class _ChatPageState extends State<ChatPage> {
         // encrypted rows are marked failed (they show a retry
         // affordance) instead of spinning on "decrypting…" forever.
         _decryptPendingRows(_lastRows);
+      } else if (mounted &&
+          _lastRows.isNotEmpty &&
+          _keyLoadNullCount >= keyLoadGiveUpAttempts) {
+        // Fix 5: no key after several empty loads and no definitive
+        // block — stop spinning on the pending rows. _decryptPendingRows
+        // marks them failed (retryable) at the give-up threshold.
+        _decryptPendingRows(_lastRows);
       }
     } catch (_) {
       // Deliberately do NOT set _conversationKeyLoaded: a transient
       // failure must be retryable (bounded, see _maybeRetryKeyLoad).
-    } finally {
-      _keyLoading = false;
     }
   }
 
+  /// One-time-per-session warning when my public key could not be
+  /// published/verified (fix 4): without it, other members cannot wrap
+  /// the conversation key for this device and my messages go out
+  /// plaintext. Best-effort: never throws, never blocks the chat.
+  void _warnPublishFailed() {
+    if (_publishWarningShown || !mounted) return;
+    _publishWarningShown = true;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+            'تعذّر نشر مفتاح التشفير الخاص بك — قد تصل رسائلك غير مشفّرة. تحقق من الاتصال وأعد فتح المحادثة.'),
+      ),
+    );
+  }
+
   /// Bounded key retry: at most once per ~10s, only when new stream
-  /// data arrives while there is still no key.
+  /// data arrives while there is still no key. Also driven by the
+  /// open-chat timer (fix 6), so a fresh reset takes effect without
+  /// reopening the chat.
   void _maybeRetryKeyLoad() {
-    if (_conversationKey != null || _keyLoading) return;
+    if (_conversationKey != null || _keyLoadInFlight != null) return;
     final now = DateTime.now();
     if (_lastKeyRetryAt != null &&
         now.difference(_lastKeyRetryAt!).inSeconds < 10) {
@@ -391,9 +526,13 @@ class _ChatPageState extends State<ChatPage> {
   /// failed. Rows that cannot be decrypted only because the key is null
   /// are NOT marked failed either — they are retried when the key loads
   /// — EXCEPT when the key load definitively failed (a wrapped row
-  /// exists but unwraps with neither KEK): those rows are marked failed
-  /// so the UI shows "تعذّر فك التشفير" with a tap-to-retry instead of
-  /// an eternal "جارٍ فك التشفير…".
+  /// exists but unwraps with neither KEK) or after several empty loads
+  /// (fix 5): those rows are marked failed so the UI shows "تعذّر فك
+  /// التشفير" with a tap-to-retry instead of an eternal "جارٍ فك
+  /// التشفير…". A row whose decryption THROWS with a loaded key is
+  /// different: its ciphertext was encrypted under a key that is gone
+  /// for good, so it goes to [_permanentlyUnreadable] (no retry — the
+  /// retry can never succeed) instead of [_decryptFailed].
   Future<void> _decryptPendingRows(List<Map<String, dynamic>> rows) async {
     if (_decryptRunning) return;
     final malformed = <String>[];
@@ -407,7 +546,8 @@ class _ChatPageState extends State<ChatPage> {
       }
       return !_decrypted.containsKey(id) &&
           !_decrypting.contains(id) &&
-          !_decryptFailed.contains(id);
+          !_decryptFailed.contains(id) &&
+          !_permanentlyUnreadable.contains(id);
     }).toList();
     if (malformed.isNotEmpty && mounted) {
       setState(() => _malformedIds.addAll(malformed));
@@ -416,9 +556,12 @@ class _ChatPageState extends State<ChatPage> {
     if (!_conversationKeyLoaded) {
       // No key yet. If the load already failed definitively, fall
       // through and mark the pending rows failed below — waiting
-      // would never heal them. Otherwise trigger a (bounded) load
-      // and wait for it.
-      if (!_keyDefinitivelyBlocked) {
+      // would never heal them. After several empty loads (fix 5),
+      // also fall through: the rows cannot be decrypted with any key
+      // available now. Otherwise trigger a (bounded) load and wait
+      // for it.
+      if (!_keyDefinitivelyBlocked &&
+          _keyLoadNullCount < keyLoadGiveUpAttempts) {
         await _ensureConversationKey();
         if (!mounted) return;
         // Key load triggers a rebuild, which re-schedules this step.
@@ -427,11 +570,14 @@ class _ChatPageState extends State<ChatPage> {
     }
     final key = _conversationKey;
     if (key == null) {
-      // No key yet. A definitive load failure marks these rows failed
-      // (retry affordance in the UI). A transient failure (no row yet
-      // / network) leaves them pending: the builder re-schedules
-      // decryption (bounded) when new data arrives or the key loads.
-      if (_keyDefinitivelyBlocked && mounted) {
+      // No key yet. A definitive load failure — or the give-up
+      // threshold (fix 5) — marks these rows failed (retry affordance
+      // in the UI). A transient failure (no row yet / network) leaves
+      // them pending: the builder re-schedules decryption (bounded)
+      // when new data arrives or the key loads.
+      if ((_keyDefinitivelyBlocked ||
+              _keyLoadNullCount >= keyLoadGiveUpAttempts) &&
+          mounted) {
         setState(() {
           _decryptFailed
               .addAll(pending.map((row) => row['id'].toString()));
@@ -453,7 +599,11 @@ class _ChatPageState extends State<ChatPage> {
         _decrypted[id] = plain;
         changed = true;
       } catch (_) {
-        _decryptFailed.add(id);
+        // The key IS loaded and the ciphertext still does not decrypt:
+        // it was encrypted under a key that is gone for good (lost on
+        // reinstall / deleted by a reset). Permanently unreadable —
+        // no retry link, and never back to the "decrypting…" spinner.
+        _permanentlyUnreadable.add(id);
         changed = true;
       } finally {
         _decrypting.remove(id);
@@ -467,12 +617,14 @@ class _ChatPageState extends State<ChatPage> {
   /// the failed set and the blocked flag, then re-runs the key load
   /// (which re-runs decryption when the key arrives). If the key is
   /// still blocked, the rows fail again — the retry is honest, never a
-  /// silent spin back to "جارٍ فك التشفير…".
+  /// silent spin back to "جارٍ فك التشفير…". Permanently unreadable
+  /// rows (fix 5) have no retry link, so they are never cleared here.
   void _retryDecryption() {
     if (!mounted) return;
     setState(() {
       _decryptFailed.clear();
       _keyDefinitivelyBlocked = false;
+      _keyLoadNullCount = 0;
     });
     _ensureConversationKey();
   }
@@ -486,6 +638,7 @@ class _ChatPageState extends State<ChatPage> {
   @override
   void dispose() {
     currentOpenConversationId.value = null;
+    _keyRetryTimer?.cancel();
     input.dispose();
     _scroll.dispose();
     super.dispose();
@@ -906,7 +1059,49 @@ class _ChatPageState extends State<ChatPage> {
     await _resetEncryption();
   }
 
+  /// The reset itself. The reset is the recovery when the conversation
+  /// key is truly lost (a wrapped row that unwraps with neither KEK):
+  /// the server deletes every wrapped row for this conversation and
+  /// this device creates a fresh key. Old encrypted messages in this
+  /// conversation stay unreadable FOREVER — the dialog says so
+  /// plainly — and new messages use the fresh key.
+  ///
+  /// Fix 1: the reset NEVER silently creates a partial key again. The
+  /// order matters: (1) load FRESH member keys and ABORT — before the
+  /// RPC deletes anything — when a member has no usable key yet (the
+  /// 19:10 reset wrapped for a stale member map, before the second
+  /// phone's device key had registered, and produced a key only one
+  /// side could use; aborting after the delete would leave the
+  /// conversation keyless with no way back, because the
+  /// encrypted-messages guard blocks a fresh key without another
+  /// reset); (2) delete the old rows; (3) await the fresh key load
+  /// (fix 3 — the reset's load used to be dropped when another load
+  /// was in flight); (4) warn when the creation wrap wrote no row for
+  /// some member. Best-effort errors show a snackbar, never a crash.
   Future<void> _resetEncryption() async {
+    // (1) Fresh member keys first. A failed load aborts the reset: the
+    // member map may be stale, and wrapping from it could poison the
+    // fresh key.
+    await _loadMembers(silent: true);
+    if (!mounted) return;
+    if (_membersError || _memberIds.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text(
+                'تعذّر تحميل بيانات الأعضاء — تحقق من الاتصال وحاول مجدداً. لم يتم حذف أي مفتاح.')),
+      );
+      return;
+    }
+    final missing = membersMissingKeys(_memberIds, _memberDeviceKeys);
+    if (missing.isNotEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text(
+                'لم تكتمل إعادة التعيين: بعض الأعضاء بلا مفتاح تشفير بعد. افتح المحادثة على هواتفهم ثم أعد المحاولة. لم يتم حذف أي مفتاح.')),
+      );
+      return;
+    }
+    // (2) Delete the old rows.
     try {
       await client.rpc('reset_conversation_keys', params: {
         'p_conversation_id': widget.conversationId,
@@ -926,15 +1121,46 @@ class _ChatPageState extends State<ChatPage> {
     // (showing them would display text the new key cannot produce)
     // and reload with afterReset so a fresh key is created even though
     // encrypted messages exist. Malformed rows are NOT cleared: they
-    // are about the row format, not the key.
+    // are about the row format, not the key. The generation bump makes
+    // any load that started before the reset discard its result (fix 3).
+    _keyLoadGeneration++;
     setState(() {
       _conversationKey = null;
       _conversationKeyLoaded = false;
       _keyDefinitivelyBlocked = false;
+      _keyLoadNullCount = 0;
+      _lastWrapUncovered = {};
       _decrypted.clear();
       _decryptFailed.clear();
+      _permanentlyUnreadable.clear();
     });
-    _ensureConversationKey(afterReset: true);
+    // (3) Await the fresh key load — never fire-and-forget it.
+    await _ensureConversationKey(afterReset: true);
+    if (!mounted) return;
+    // (4) Report the outcome. NOTE on the read-back: conversation_keys
+    // SELECT is own-rows-only (migration 012), so other members' rows
+    // cannot be read back from the client — the wrap's own outcome
+    // (_lastWrapUncovered, from wrapKeyForMembers) is the coverage
+    // signal instead. A null key means the load itself failed.
+    if (_conversationKey == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text(
+                'تم حذف المفاتيح القديمة لكن تعذّر إنشاء مفتاح جديد — تحقق من الاتصال وأعد فتح المحادثة.')),
+      );
+    } else if (_lastWrapUncovered.isNotEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text(
+                'تمت إعادة تعيين التشفير لكن بعض الأعضاء بلا مفتاح بعد — افتح المحادثة على هواتفهم ثم أعد المحاولة.')),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text(
+                'تمت إعادة تعيين التشفير. الرسائل الجديدة ستُشفَّر.')),
+      );
+    }
   }
 
   /// Long-press on a message bubble: offer to report that message.
@@ -1128,6 +1354,21 @@ class _ChatPageState extends State<ChatPage> {
       if (_malformedIds.contains(id)) {
         return const Text('رسالة تالفة');
       }
+      if (_permanentlyUnreadable.contains(id)) {
+        // Fix 5: the ciphertext was encrypted under a key that is gone
+        // for good (lost on reinstall / deleted by a reset). Label it
+        // permanently unreadable — with NO retry link, because no
+        // retry can ever succeed — and never show the "جارٍ فك
+        // التشفير…" spinner for it again.
+        return const Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('تعذّر فك تشفير هذه الرسالة نهائياً'),
+            Text('فُقد مفتاح تشفيرها ولا يمكن استرجاعها.',
+                style: labelStyle),
+          ],
+        );
+      }
       if (_decryptFailed.contains(id)) {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1209,7 +1450,10 @@ class _ChatPageState extends State<ChatPage> {
       try {
         final pair = await ensureKeyPair();
         try {
-          await publishPublicKeyIfNeeded(pair: pair);
+          // Fix 4: a failed/unverified publish warns the user (once
+          // per session) instead of being swallowed.
+          final published = await publishPublicKeyIfNeeded(pair: pair);
+          if (!published) _warnPublishFailed();
         } catch (_) {
           // Publishing must never block sending.
         }
@@ -1218,8 +1462,9 @@ class _ChatPageState extends State<ChatPage> {
             widget.conversationId, _memberDeviceKeys);
         convKey = loadedKey.key;
         if (convKey != null) {
+          Set<String> uncovered = {};
           try {
-            await wrapKeyForMembers(
+            uncovered = await wrapKeyForMembers(
                 widget.conversationId, convKey, _memberDeviceKeys);
           } catch (_) {
             // Lazy re-wrap is best-effort; the message still goes out.
@@ -1229,6 +1474,11 @@ class _ChatPageState extends State<ChatPage> {
             setState(() {
               _conversationKey = convKey;
               _conversationKeyLoaded = true;
+              // The key is in hand now: a previous definitive block no
+              // longer applies, and the empty-load count resets.
+              _keyDefinitivelyBlocked = false;
+              _keyLoadNullCount = 0;
+              _lastWrapUncovered = uncovered;
               _decryptFailed.clear();
             });
           }
