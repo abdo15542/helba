@@ -76,6 +76,44 @@ alter database postgres
 supabase functions deploy send-message-push
 ```
 
+### JWT verification MUST be off for this function (fix 11)
+
+Supabase Edge Functions verify a user JWT on every request by default,
+before the handler runs. The database trigger calls this function via
+`pg_net` with **no** `Authorization` header — it has no user JWT, it
+authenticates with the `x-helba-push-secret` header — so with the
+default setting the platform rejects **every** trigger call with HTTP
+401 at the gateway and the function's own secret check never runs.
+That is exactly the 401 seen on 2026-11-06: closed-app message push
+never arrived, while the trigger kept firing.
+
+`supabase/config.toml` in this repo turns it off for this function
+only:
+
+```toml
+[functions.send-message-push]
+verify_jwt = false
+```
+
+The function's own `x-helba-push-secret` check (fail-closed 401 when
+`PUSH_TRIGGER_SECRET` is unset or the header mismatches) is the
+authentication, so turning the platform check off is safe. **Redeploy
+after adding or changing `config.toml`** — the setting only takes
+effect on deploy. Do NOT turn `verify_jwt` off for `send-call-push`:
+the app calls it with the caller's user JWT.
+
+Two different 401s, two different remedies:
+
+- 401 with an empty function log (the handler never ran): the gateway
+  rejected the call — `verify_jwt` is still on. Redeploy with the
+  `config.toml` above.
+- 401 with `error:"push secret not configured"` in the response: the
+  `PUSH_TRIGGER_SECRET` Edge Function secret was never set (or was set
+  after the last deploy without redeploying). Set it, then redeploy.
+- 401 with `error:"unauthorized"`: the Vault secret
+  `push_trigger_secret` (read by the trigger) does not match the Edge
+  Function secret `PUSH_TRIGGER_SECRET`. Make them the same value.
+
 ## 5. Apply migration 011
 
 ```bash

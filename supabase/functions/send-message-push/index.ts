@@ -18,6 +18,23 @@
 // pg_net response log, not silent, so a misconfigured secret is noticed
 // instead of silently dropping every push.
 //
+// VERIFY_JWT (fix 11 — the 2026-11-06 401): Supabase Edge Functions
+// verify a user JWT on every request BY DEFAULT, before the handler
+// runs. The database trigger calls this function via pg_net with NO
+// Authorization header (it has no user JWT — it authenticates with
+// `x-helba-push-secret`), so with the default setting the platform
+// rejected EVERY trigger call with 401 at the gateway and this
+// function's secret check never ran. The fix is
+// `supabase/config.toml`:
+//   [functions.send-message-push]
+//   verify_jwt = false
+// — plus a REDEPLOY of this function, or the setting never takes
+// effect. The function's own secret check below is the authentication
+// (fail closed), so turning the platform check off is safe: without
+// the secret, the handler still returns 401 and sends nothing. Do NOT
+// turn verify_jwt off for send-call-push — the app calls it with the
+// caller's user JWT.
+//
 // Required secrets (set with `supabase secrets set ...`):
 //   FCM_SERVICE_ACCOUNT      full Firebase service-account JSON (string)
 //   SUPABASE_URL             e.g. https://<project-ref>.supabase.co
@@ -191,9 +208,21 @@ Deno.serve(async (req: Request) => {
   // instead of silently looking like a working function.
   const pushSecret = Deno.env.get("PUSH_TRIGGER_SECRET") ?? "";
   if (!pushSecret) {
+    // Fix 11: log the distinction — a missing secret in THIS
+    // function's environment (never set, or set after the last deploy
+    // without redeploying) versus a wrong header below. Both are 401,
+    // but the remedy differs.
+    console.error(
+      "send-message-push: PUSH_TRIGGER_SECRET not configured in the " +
+        "function environment; rejecting (deploy after setting the secret)",
+    );
     return json({ ok: false, error: "push secret not configured" }, 401);
   }
   if (req.headers.get("x-helba-push-secret") !== pushSecret) {
+    console.error(
+      "send-message-push: unauthorized (x-helba-push-secret missing or " +
+        "does not match PUSH_TRIGGER_SECRET)",
+    );
     return json({ ok: false, error: "unauthorized" }, 401);
   }
 
