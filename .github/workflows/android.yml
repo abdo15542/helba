@@ -433,7 +433,7 @@ jobs:
           if [ -z "$AAPT2" ] || [ ! -x "$AAPT2" ]; then
             echo "aapt2 not found under \$ANDROID_HOME/build-tools (build-tools 36.0.0 is installed by the 'Install Android compile SDK' step)" && exit 1
           fi
-          DUMP=$("$AAPT2" dump xmltree "$APK" AndroidManifest.xml)
+          DUMP=$("$AAPT2" dump xmltree --file AndroidManifest.xml "$APK")
           echo "$DUMP" | grep -q 'android.permission.INTERNET' || (echo "Built APK is missing the INTERNET permission" && exit 1)
           echo "$DUMP" | grep -q 'android:scheme.*helba' || (echo "Built APK is missing the helba deep-link scheme" && exit 1)
           echo "$DUMP" | grep -q 'android:host.*auth' || (echo "Built APK is missing the auth deep-link host" && exit 1)
