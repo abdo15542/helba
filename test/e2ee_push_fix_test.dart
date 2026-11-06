@@ -475,4 +475,76 @@ void main() {
       expect(pickMyWrappedRow([], 'my-device'), isNull);
     });
   });
+
+  group('reset coverage + legacy wrap (fixes 1/2)', () {
+    test('membersMissingKeys reports members with no valid key', () {
+      expect(
+        membersMissingKeys(
+          {'a', 'b', 'c'},
+          {
+            'a': [(deviceId: 'd1', publicKey: validKey)],
+            'b': [(deviceId: null, publicKey: validKey)],
+            'c': <DeviceKey>[],
+          },
+        ),
+        ['c'],
+      );
+      // A member missing from the map entirely is uncovered too.
+      expect(
+        membersMissingKeys(
+          {'a', 'zzz'},
+          {
+            'a': [(deviceId: 'd1', publicKey: validKey)],
+          },
+        ),
+        ['zzz'],
+      );
+      // An invalid key does not cover a member.
+      expect(
+        membersMissingKeys(
+          {'a'},
+          {
+            'a': [(deviceId: 'd1', publicKey: 'key-a')],
+          },
+        ),
+        ['a'],
+      );
+      // Empty member set: nothing missing.
+      expect(membersMissingKeys({}, {}), isEmpty);
+    });
+
+    test('wrapTargetsForMember skips the legacy row when device rows exist',
+        () {
+      final targets = wrapTargetsForMember([
+        (deviceId: 'd1', publicKey: validKey),
+        (deviceId: null, publicKey: otherValidKey), // legacy
+      ]);
+      expect(targets, hasLength(1));
+      expect(targets.single.deviceId, 'd1');
+    });
+
+    test('wrapTargetsForMember keeps the legacy row when no device rows exist',
+        () {
+      expect(
+        wrapTargetsForMember([
+          (deviceId: null, publicKey: validKey),
+        ]),
+        hasLength(1),
+      );
+      expect(wrapTargetsForMember(<DeviceKey>[]), isEmpty);
+    });
+
+    test(
+        'wrapTargetsForMember keeps the legacy row when device keys are invalid',
+        () {
+      // A device row with a corrupt key does not count as a device row:
+      // the legacy entry is the only usable target (the wrap loop
+      // still skips the corrupt device key itself).
+      final targets = wrapTargetsForMember([
+        (deviceId: 'd1', publicKey: 'key-a'), // invalid
+        (deviceId: null, publicKey: validKey),
+      ]);
+      expect(targets, hasLength(2));
+    });
+  });
 }

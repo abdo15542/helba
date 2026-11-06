@@ -251,6 +251,89 @@ void main() {
     });
   });
 
+  group('parseCallPushResult + callPushWarningMessage (fixes 7/8)', () {
+    test('sent > 0 means the callee was reached, no warning', () {
+      final result = parseCallPushResult({
+        'ok': true,
+        'sent': 1,
+        'failed': 0,
+        'details': [
+          {'fid': 'abc…', 'ok': true, 'status': 200, 'error': null},
+        ],
+      });
+      expect(result.ok, isTrue);
+      expect(result.sent, 1);
+      expect(result.failed, 0);
+      expect(result.reachedCallee, isTrue);
+      expect(result.nothingSent, isFalse);
+      expect(callPushWarningMessage(result), isNull);
+    });
+
+    test('sent 0 with no_tokens warns that the other phone is unregistered',
+        () {
+      final result = parseCallPushResult({
+        'ok': true,
+        'sent': 0,
+        'failed': 0,
+        'reason': 'no_tokens',
+        'details': [],
+      });
+      expect(result.ok, isTrue);
+      expect(result.reachedCallee, isFalse);
+      expect(result.nothingSent, isTrue);
+      expect(result.reason, 'no_tokens');
+      final warning = callPushWarningMessage(result);
+      expect(warning, isNotNull);
+      expect(warning, contains('غير مسجّل'));
+    });
+
+    test('sent 0 with all_failed warns that the push did not arrive', () {
+      final result = parseCallPushResult({
+        'ok': true,
+        'sent': 0,
+        'failed': 2,
+        'reason': 'all_failed',
+        'details': [
+          {'fid': 'abc…', 'ok': false, 'status': 404, 'error': 'unregistered'},
+          {'fid': 'def…', 'ok': false, 'status': 500, 'error': 'fcm_500'},
+        ],
+      });
+      expect(result.nothingSent, isTrue);
+      expect(callPushWarningMessage(result), contains('لم يصل'));
+    });
+
+    test('call_not_ringing needs no warning (the call is already dead)',
+        () {
+      final result = parseCallPushResult({
+        'ok': true,
+        'sent': 0,
+        'failed': 0,
+        'reason': 'call_not_ringing',
+      });
+      expect(callPushWarningMessage(result), isNull);
+    });
+
+    test('a failed function call warns generically', () {
+      final result = parseCallPushResult({
+        'ok': false,
+        'error': 'oauth failed',
+      });
+      expect(result.ok, isFalse);
+      expect(result.reachedCallee, isFalse);
+      expect(callPushWarningMessage(result), contains('تعذّر إرسال'));
+    });
+
+    test('a malformed response is a failed result, never a crash', () {
+      for (final bad in [null, 'garbage', 42, [], {'ok': 'yes'}]) {
+        final result = parseCallPushResult(bad);
+        expect(result.ok, isFalse);
+        expect(result.sent, 0);
+        expect(result.reachedCallee, isFalse);
+        expect(callPushWarningMessage(result), isNotNull);
+      }
+    });
+  });
+
   group('CallRingtone', () {
     test('start plays once, second start is a no-op', () async {
       var playCalls = 0;
