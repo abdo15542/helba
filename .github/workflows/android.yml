@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-apk:
@@ -40,6 +40,33 @@ jobs:
 
       - name: Generate Android platform files
         run: flutter create --platforms=android .
+
+      - name: Install stable debug keystore
+        shell: bash
+        run: |
+          # The release build is signed with signingConfigs.debug, i.e.
+          # ~/.android/debug.keystore (verified against the flutter create
+          # template: the generated build.gradle.kts sets
+          # signingConfig = signingConfigs.getByName("debug") for the
+          # release build type, and there is no key.properties or custom
+          # signing in the repo). A fresh runner has no keystore, so
+          # Gradle would generate a new ephemeral one and every build
+          # would carry a different signature — the app could then only
+          # be installed after uninstalling (which wipes the E2E keys in
+          # secure storage). The repo commits one stable debug keystore
+          # (android/app/debug.keystore, a debug key — its only role is
+          # signature stability across builds); copy it into place so
+          # every build signs identically and updates install over the
+          # previous one. Fail LOUDLY if it is missing: a silent fallback
+          # to an ephemeral keystore must never happen. (flutter create
+          # preserves android/app/debug.keystore — verified locally —
+          # so this check runs after generation on purpose.)
+          if [ ! -f android/app/debug.keystore ]; then
+            echo "ERROR: android/app/debug.keystore is missing from the repo — refusing to build with an ephemeral keystore" && exit 1
+          fi
+          mkdir -p ~/.android
+          cp android/app/debug.keystore ~/.android/debug.keystore
+          echo "Installed stable debug keystore"
 
       - name: Add INTERNET permission to the main manifest
         shell: bash
@@ -139,6 +166,10 @@ jobs:
           # notification (helba_calls channel) show full-screen on
           # Android 14+; without it the notification is demoted to a
           # heads-up banner instead.
+          # REQUEST_INSTALL_PACKAGES is what lets the in-app updater
+          # install a downloaded APK via the package installer (the
+          # updater downloads the release asset and asks Android to
+          # install it); without it the install prompt is refused.
           python3 - <<'PY'
           from pathlib import Path
           path = Path("android/app/src/main/AndroidManifest.xml")
@@ -151,6 +182,7 @@ jobs:
               "android.permission.BLUETOOTH",
               "android.permission.ACCESS_NETWORK_STATE",
               "android.permission.USE_FULL_SCREEN_INTENT",
+              "android.permission.REQUEST_INSTALL_PACKAGES",
           ]
           missing = [p for p in wanted if p not in source]
           if not missing:
@@ -180,6 +212,7 @@ jobs:
           grep -q 'android.permission.BLUETOOTH' android/app/src/main/AndroidManifest.xml || (echo "BLUETOOTH permission missing from AndroidManifest.xml" && exit 1)
           grep -q 'android.permission.ACCESS_NETWORK_STATE' android/app/src/main/AndroidManifest.xml || (echo "ACCESS_NETWORK_STATE permission missing from AndroidManifest.xml" && exit 1)
           grep -q 'android.permission.USE_FULL_SCREEN_INTENT' android/app/src/main/AndroidManifest.xml || (echo "USE_FULL_SCREEN_INTENT permission missing from AndroidManifest.xml" && exit 1)
+          grep -q 'android.permission.REQUEST_INSTALL_PACKAGES' android/app/src/main/AndroidManifest.xml || (echo "REQUEST_INSTALL_PACKAGES permission missing from AndroidManifest.xml" && exit 1)
 
       - name: Add FCM Installation ID opt-in to the main manifest
         shell: bash
@@ -442,6 +475,7 @@ jobs:
           DUMP=$("$AAPT2" dump xmltree --file AndroidManifest.xml "$APK")
           echo "$DUMP" | grep -q 'android.permission.INTERNET' || (echo "Built APK is missing the INTERNET permission" && exit 1)
           echo "$DUMP" | grep -q 'android.permission.USE_FULL_SCREEN_INTENT' || (echo "Built APK is missing the USE_FULL_SCREEN_INTENT permission (incoming-call full-screen on Android 14+)" && exit 1)
+          echo "$DUMP" | grep -q 'android.permission.REQUEST_INSTALL_PACKAGES' || (echo "Built APK is missing the REQUEST_INSTALL_PACKAGES permission (in-app updater cannot install the downloaded APK)" && exit 1)
           echo "$DUMP" | grep -q 'android:scheme.*helba' || (echo "Built APK is missing the helba deep-link scheme" && exit 1)
           echo "$DUMP" | grep -q 'android:host.*auth' || (echo "Built APK is missing the auth deep-link host" && exit 1)
           echo "$DUMP" | grep -q 'android:host.*chat' || (echo "Built APK is missing the chat deep-link host" && exit 1)
@@ -449,9 +483,58 @@ jobs:
           echo "$DUMP" | grep -q 'package="com.example.helba"' || (echo "Built APK package is not com.example.helba (FirebaseOptions in lib/src/push.dart hardcode that package)" && exit 1)
           echo "Built APK verified: INTERNET, helba deep links (auth + chat), FID opt-in meta-data, package com.example.helba"
 
+      - name: Verify stable signing certificate
+        shell: bash
+        run: |
+          # Prove the APK was signed with the committed stable debug
+          # keystore, not an ephemeral runner keystore: the signer
+          # certificate SHA-256 must equal the fingerprint of
+          # android/app/debug.keystore. If this fails, the build would
+          # NOT install over the previous build and the user would have
+          # to uninstall (wiping the E2E keys in secure storage).
+          # apksigner prints the digest as plain lowercase hex without
+          # separators, so the expected fingerprint is matched in that
+          # form (07f66c4f…4bef); the comparison strips colons and case
+          # so either printed form matches.
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          SDK_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          APKSIGNER="$SDK_HOME/build-tools/36.0.0/apksigner"
+          if [ ! -x "$APKSIGNER" ]; then
+            APKSIGNER=$(find "$SDK_HOME/build-tools" -name apksigner -type f 2>/dev/null | head -1)
+          fi
+          if [ -z "$APKSIGNER" ] || [ ! -x "$APKSIGNER" ]; then
+            echo "apksigner not found under \$ANDROID_HOME/build-tools (build-tools 36.0.0 is installed by the 'Install Android compile SDK' step)" && exit 1
+          fi
+          CERTS=$("$APKSIGNER" verify --print-certs "$APK")
+          echo "$CERTS"
+          echo "$CERTS" | tr -d ':' | tr '[:upper:]' '[:lower:]' | grep -q '07f66c4f5a762a97427962e8dc0c377f2a08c59bd4394fca0361901565884bef' || (echo "APK certificate does NOT match the stable debug keystore fingerprint (07:F6:6C:4F:5A:76:2A:97:42:79:62:E8:DC:0C:37:7F:2A:08:C5:9B:D4:39:4F:CA:03:61:90:15:65:88:4B:EF) — refusing to ship an APK that cannot install over the previous build" && exit 1)
+          echo "APK signed with the stable debug keystore"
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: helba-android-apk
           path: build/app/outputs/flutter-apk/app-release.apk
           retention-days: 14
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Public release per build so the in-app updater (and the user)
+          # can download the APK without signing in to GitHub: the
+          # updater checks api.github.com/repos/abdo15542/helba/releases/latest
+          # and installs the first .apk asset. Exactly ONE .apk asset per
+          # release. Re-runs of the same workflow run reuse the same tag,
+          # so an existing release for this tag is replaced first.
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          TAG="build-${{ github.run_number }}"
+          ASSET="helba-build-${{ github.run_number }}.apk"
+          cp "$APK" "$ASSET"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" -y --cleanup-tag
+          fi
+          gh release create "$TAG" "$ASSET" \
+            --title "Helba build ${{ github.run_number }}" \
+            --notes "Helba Android build ${{ github.run_number }} (commit ${{ github.sha }}). Signed with the stable debug keystore — installs over previous stable-signed builds, no uninstall needed."
