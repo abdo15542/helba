@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io' as io;
 
 import 'package:firebase_core/firebase_core.dart';
@@ -57,6 +58,11 @@ import 'deeplink.dart';
 
 /// Android notification channel for incoming chat messages.
 const pushMessagesChannelId = 'helba_messages';
+
+/// Android notification channel for incoming calls. Max importance with
+/// sound, so a call push wakes the user even when the app is closed.
+/// The `send-call-push` Edge Function sends on this channel id.
+const pushCallsChannelId = 'helba_calls';
 
 /// Maximum characters of a message body shown in a notification preview.
 const pushPreviewMaxLength = 100;
@@ -131,6 +137,92 @@ int stableNotificationId(String conversationId) {
   }
   return hash & 0x7fffffff;
 }
+
+// ---------------------------------------------------------------------------
+// Incoming-call push (see lib/src/calls.dart for the call flow).
+// ---------------------------------------------------------------------------
+
+/// An incoming call announced by a push: the FCM data payload of a
+/// `send-call-push` message, or the payload of a local call notification
+/// tap. Carries no SDP — the offer arrives over Realtime, or is
+/// re-requested on accept (see CallService.acceptCall).
+class CallPushPayload {
+  final String callId;
+  final String callerId;
+  final String? callerName;
+  final String callType;
+
+  const CallPushPayload({
+    required this.callId,
+    required this.callerId,
+    this.callerName,
+    this.callType = 'voice',
+  });
+
+  Map<String, dynamic> toJson() => {
+        'type': 'call',
+        'call_id': callId,
+        'caller_id': callerId,
+        if (callerName != null) 'caller_name': callerName,
+        'call_type': callType,
+      };
+}
+
+/// Parses an FCM data payload into a call payload, or null when it is
+/// not an incoming-call message (any other `type`, or a missing /
+/// malformed call id / caller id). The ids must be well-formed UUIDs:
+/// a tap or a forged payload must never queue a call the database does
+/// not have. Pure (no Firebase): unit-tested.
+CallPushPayload? parseCallPushData(Map<String, dynamic> data) {
+  if (data['type']?.toString() != 'call') return null;
+  final callId = data['call_id']?.toString().trim() ?? '';
+  final callerId = data['caller_id']?.toString().trim() ?? '';
+  if (!isValidPushConversationId(callId)) return null;
+  if (!isValidPushConversationId(callerId)) return null;
+  final name = data['caller_name']?.toString().trim();
+  final type = data['call_type']?.toString() == 'video' ? 'video' : 'voice';
+  return CallPushPayload(
+    callId: callId,
+    callerId: callerId,
+    callerName: name?.isNotEmpty == true ? name : null,
+    callType: type,
+  );
+}
+
+/// Encodes a call payload as the `payload` string of a local
+/// notification, so a tap can reconstruct it. JSON, so a caller name
+/// containing any separator survives.
+String encodeCallPushPayload(CallPushPayload payload) =>
+    jsonEncode(payload.toJson());
+
+/// Decodes a local-notification payload string into a call payload, or
+/// null when it is not one (e.g. a chat payload, which is a bare
+/// conversation id). Pure: unit-tested.
+CallPushPayload? decodeCallPushPayload(String? payload) {
+  if (payload == null || payload.isEmpty) return null;
+  try {
+    final decoded = jsonDecode(payload);
+    if (decoded is! Map<String, dynamic>) return null;
+    return parseCallPushData(decoded);
+  } catch (_) {
+    return null;
+  }
+}
+
+/// An incoming call announced by a push, waiting to be handled: set when
+/// an FCM call message arrives (foreground) or is tapped (background /
+/// cold start). CallService observes this (see startListening) and runs
+/// the incoming-call flow once the user is signed in, then clears it.
+/// Same pattern as [pendingChatId]: a ValueNotifier so either entry
+/// point can set it without a BuildContext.
+final ValueNotifier<CallPushPayload?> pendingIncomingCallPush =
+    ValueNotifier(null);
+
+/// True while CallService is showing a ringing incoming call. Push.dart
+/// reads it (never writes it except for this initial false) to avoid
+/// showing a second, duplicate call notification for a call the in-app
+/// overlay already announces.
+final ValueNotifier<bool> callRinging = ValueNotifier(false);
 
 // ---------------------------------------------------------------------------
 // Setup: Firebase + local notifications + token registration.
@@ -350,7 +442,15 @@ Future<void> _setupLocalNotifications() async {
   await _localNotifications.initialize(
     settings: settings,
     onDidReceiveNotificationResponse: (response) {
-      final conversationId = response.payload?.trim() ?? '';
+      final payload = response.payload?.trim() ?? '';
+      final call = decodeCallPushPayload(payload);
+      if (call != null) {
+        // Tapping an incoming-call notification opens the app to the
+        // incoming call screen (CallService handles it, like a push).
+        pendingIncomingCallPush.value = call;
+        return;
+      }
+      final conversationId = payload;
       if (isValidPushConversationId(conversationId)) {
         pendingChatId.value = conversationId;
       } else if (conversationId.isNotEmpty) {
@@ -372,6 +472,26 @@ Future<void> _setupLocalNotifications() async {
       importance: Importance.high,
     ),
   );
+  await android?.createNotificationChannel(
+    const AndroidNotificationChannel(
+      pushCallsChannelId,
+      'مكالمات هلبة',
+      description: 'إشعارات المكالمات الواردة',
+      importance: Importance.max,
+      playSound: true,
+      enableVibration: true,
+    ),
+  );
+}
+
+/// Cancels the tray notification for an incoming call (by call id).
+/// Called when the in-app overlay takes over, and on every end path, so
+/// a ringing notification never lingers after the call. Best-effort:
+/// never throws.
+Future<void> cancelCallNotification(String callId) async {
+  try {
+    await _localNotifications.cancel(id: stableNotificationId(callId));
+  } catch (_) {}
 }
 
 /// Requests notification permission and records the outcome (finding
@@ -463,9 +583,49 @@ Future<void> _upsertPushToken(String fid) async {
 /// on screen ([currentOpenConversationId], set by ChatPage). The
 /// notification id is the stable [stableNotificationId] (finding #17),
 /// not `conversationId.hashCode`.
+///
+/// A call message (`data.type == 'call'`) takes a different path: it
+/// queues [pendingIncomingCallPush] (CallService shows the incoming-call
+/// overlay + ringtone) and, unless the overlay is already ringing for
+/// it, shows a high-priority incoming-call notification on the
+/// dedicated call channel (sound + vibration, full-screen intent) whose
+/// tap opens the app to the incoming call screen.
 Future<void> _showForegroundMessage(RemoteMessage message) async {
   try {
     final data = message.data;
+    final call = parseCallPushData(data);
+    if (call != null) {
+      final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+      if (currentUserId != null && call.callerId == currentUserId) {
+        return;
+      }
+      // Queue the call first: CallService shows the overlay + ringtone,
+      // and ignores it when already busy or ringing for this call.
+      pendingIncomingCallPush.value = call;
+      if (callRinging.value) return;
+      final isVideo = call.callType == 'video';
+      await _localNotifications.show(
+        id: stableNotificationId(call.callId),
+        title: call.callerName ?? 'هلبة',
+        body: isVideo ? 'مكالمة فيديو واردة' : 'مكالمة صوتية واردة',
+        notificationDetails: const NotificationDetails(
+          android: AndroidNotificationDetails(
+            pushCallsChannelId,
+            'مكالمات هلبة',
+            importance: Importance.max,
+            priority: Priority.max,
+            category: AndroidNotificationCategory.call,
+            fullScreenIntent: true,
+            ongoing: true,
+            autoCancel: false,
+            playSound: true,
+            enableVibration: true,
+          ),
+        ),
+        payload: encodeCallPushPayload(call),
+      );
+      return;
+    }
     final conversationId = data['conversation_id']?.toString().trim() ?? '';
     if (!isValidPushConversationId(conversationId)) return;
     final senderId = data['sender_id']?.toString().trim() ?? '';
@@ -508,7 +668,18 @@ Future<void> _showForegroundMessage(RemoteMessage message) async {
 /// auth.dart), so the tap path and the `helba://chat/<id>` link share one
 /// navigation handler. The id is only trusted when it is a well-formed
 /// UUID (finding F7/F8).
+///
+/// A call message tap instead queues [pendingIncomingCallPush]:
+/// CallService opens the incoming call screen once the user is signed
+/// in (see startListening in calls.dart).
 void _openChatFromMessage(RemoteMessage message) {
+  final call = parseCallPushData(message.data);
+  if (call != null) {
+    final currentUserId = Supabase.instance.client.auth.currentUser?.id;
+    if (currentUserId != null && call.callerId == currentUserId) return;
+    pendingIncomingCallPush.value = call;
+    return;
+  }
   final conversationId =
       message.data['conversation_id']?.toString().trim() ?? '';
   if (isValidPushConversationId(conversationId)) {

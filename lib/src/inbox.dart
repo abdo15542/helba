@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'admin_panel.dart';
+import 'call_history.dart';
 import 'chat.dart';
 import 'channels.dart';
 import 'config.dart';
@@ -314,6 +315,13 @@ class _InboxPageState extends State<InboxPage> {
                     isScrollControlled: true,
                     builder: (_) => const ChannelDirectorySheet()),
                 icon: const Icon(Icons.campaign_outlined)),
+            IconButton(
+                tooltip: 'المكالمات',
+                onPressed: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                        builder: (_) => const CallHistoryPage())),
+                icon: const Icon(Icons.call)),
             IconButton(
                 tooltip: 'تسجيل الخروج',
                 onPressed: _confirmSignOut,

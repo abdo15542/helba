@@ -45,12 +45,14 @@ bool isMalformedEncryptedRow(Map<String, dynamic> row) {
 /// The plaintext-banner message for a conversation whose messages are
 /// currently going out unencrypted. The banner is shown whenever there
 /// is no conversation key OR a member lacks a public key — but the two
-/// causes must not be confused: when every member HAS a valid key, the
-/// key itself failed to load (e.g. a wrapped row that unwraps with
-/// neither KEK), and blaming a missing member key sends the user
-/// chasing a member who already has one. Pure (unit-tested).
-String plaintextBannerMessage(Map<String, String?> memberPublicKeys) =>
-    canEncryptFor(memberPublicKeys)
+/// causes must not be confused: when every member HAS a valid key on at
+/// least one device, the key itself failed to load (e.g. a wrapped row
+/// that unwraps with neither KEK), and blaming a missing member key
+/// sends the user chasing a member who already has one. Pure
+/// (unit-tested).
+String plaintextBannerMessage(
+        Map<String, List<DeviceKey>> memberDeviceKeys) =>
+    canEncryptFor(memberDeviceKeys)
         ? '🔓 غير مشفّرة — تعذّر تحميل مفتاح التشفير'
         : '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح';
 
@@ -97,8 +99,11 @@ class _ChatPageState extends State<ChatPage> {
   bool _membersError = false;
 
   // E2E encryption state (see lib/src/e2ee.dart for the honest limits).
-  // Members' public keys, keyed by user id; null/empty means "no key yet".
-  Map<String, String?> _memberPublicKeys = {};
+  // Members' device keys, keyed by user id: one entry per registered
+  // device plus the legacy per-user entry (deviceId null, from
+  // profiles.public_key). An empty list means "no key yet" for that
+  // member (see [loadMemberDeviceKeys]).
+  Map<String, List<DeviceKey>> _memberDeviceKeys = {};
   // Decrypted bodies of encrypted messages, keyed by message id.
   final Map<String, String> _decrypted = {};
   final Set<String> _decrypting = {};
@@ -245,12 +250,18 @@ class _ChatPageState extends State<ChatPage> {
         if (name.isNotEmpty) names[row['user_id'].toString()] = name;
       }
       if (mounted) {
+        // Per-device keys (migration 023): each member's registered
+        // devices plus the legacy per-user entry from profiles. The
+        // legacy map above is the fallback when a member has no
+        // device rows (or the user_devices read fails).
+        final deviceKeys = await loadMemberDeviceKeys(keys);
+        if (!mounted) return;
         setState(() {
           _memberNames = names;
           _memberIds
             ..clear()
             ..addAll(ids);
-          _memberPublicKeys = keys;
+          _memberDeviceKeys = deviceKeys;
           // Group = more than two member ids, not more than two
           // non-empty display names (M-1).
           _isGroup = ids.length > 2;
@@ -306,7 +317,7 @@ class _ChatPageState extends State<ChatPage> {
       }
       final loaded = await loadOrCreateConversationKey(
         widget.conversationId,
-        _memberPublicKeys,
+        _memberDeviceKeys,
         afterReset: afterReset,
       );
       final key = loaded.key;
@@ -333,16 +344,12 @@ class _ChatPageState extends State<ChatPage> {
           // the row is readable by the current code path and future
           // loads no longer depend on the fallback. Best-effort: the
           // key itself already loaded, a heal failure must not break
-          // the chat. My own entry is overwritten with the current
-          // local public key (finding #21) — a stale profile key
-          // must never be wrapped for.
+          // the chat. The re-wrap is per device (migration 023);
+          // [wrapKeyForMembers] refreshes my own device entry with
+          // the current local public key (finding #21).
           try {
-            final myId = client.auth.currentUser?.id;
-            final myPublic = await myPublicKeyBase64(pair);
-            final members =
-                Map<String, String?>.from(_memberPublicKeys);
-            if (myId != null) members[myId] = myPublic;
-            await wrapKeyForMembers(widget.conversationId, key, members);
+            await wrapKeyForMembers(
+                widget.conversationId, key, _memberDeviceKeys);
           } catch (_) {
             // Heal is best-effort; the key itself already loaded.
           }
@@ -586,12 +593,12 @@ class _ChatPageState extends State<ChatPage> {
   /// public key. Subtle and non-blocking, above the composer.
   bool get _showPlaintextBanner =>
       _membersLoaded &&
-      (_conversationKey == null || !canEncryptFor(_memberPublicKeys));
+      (_conversationKey == null || !canEncryptFor(_memberDeviceKeys));
 
   /// The banner text: names the real cause (missing member key vs.
   /// key-load failure) instead of always blaming a member key.
   String get _plaintextBannerMessage =>
-      plaintextBannerMessage(_memberPublicKeys);
+      plaintextBannerMessage(_memberDeviceKeys);
 
   void _showReadOnlyNote() {
     if (!mounted) return;
@@ -1208,16 +1215,16 @@ class _ChatPageState extends State<ChatPage> {
         }
         await _loadMembers(silent: true);
         final loadedKey = await loadOrCreateConversationKey(
-            widget.conversationId, _memberPublicKeys);
+            widget.conversationId, _memberDeviceKeys);
         convKey = loadedKey.key;
         if (convKey != null) {
           try {
             await wrapKeyForMembers(
-                widget.conversationId, convKey, _memberPublicKeys);
+                widget.conversationId, convKey, _memberDeviceKeys);
           } catch (_) {
             // Lazy re-wrap is best-effort; the message still goes out.
           }
-          canEncrypt = canEncryptFor(_memberPublicKeys);
+          canEncrypt = canEncryptFor(_memberDeviceKeys);
           if (mounted) {
             setState(() {
               _conversationKey = convKey;

@@ -2,9 +2,12 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_ringtone_player_advanced/flutter_ringtone_player_advanced.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+
+import 'push.dart';
 
 // ---------------------------------------------------------------------------
 // Voice/video calls: WebRTC peer-to-peer with Supabase Realtime broadcast
@@ -29,8 +32,10 @@ final GlobalKey<NavigatorState> helbaNavigatorKey =
 // ---------------------------------------------------------------------------
 
 /// Signalling message kinds. `offer`/`answer` carry SDP, `ice` carries one
-/// ICE candidate, `hangup`/`decline` carry no payload.
-enum CallSignalType { offer, answer, ice, hangup, decline }
+/// ICE candidate, `hangup`/`decline` carry no payload, and `requestOffer`
+/// asks the caller to resend the offer (the callee answered a call push
+/// whose SDP never arrived over Realtime, e.g. the app was closed).
+enum CallSignalType { offer, answer, ice, hangup, decline, requestOffer }
 
 CallSignalType? _signalTypeFromString(String? value) {
   switch (value) {
@@ -44,6 +49,8 @@ CallSignalType? _signalTypeFromString(String? value) {
       return CallSignalType.hangup;
     case 'decline':
       return CallSignalType.decline;
+    case 'requestOffer':
+      return CallSignalType.requestOffer;
     default:
       return null;
   }
@@ -161,6 +168,98 @@ String callTypeLabel(String? callType) =>
 /// Groups and channels have no single other participant.
 bool canCall(String? kind) => kind == 'direct';
 
+/// Terminal call statuses: a row in one of these never changes again
+/// (migration 017's transition trigger rejects every move out of them).
+bool isTerminalCallStatus(String? status) => switch (status) {
+      'completed' || 'missed' || 'declined' || 'cancelled' => true,
+      _ => false,
+    };
+
+/// True when the calls transition trigger (migration 017) allows moving
+/// from [from] to [to]. Staying on the same status is allowed (a no-op
+/// re-write). Used by the remote-hangup / decline safety net so it never
+/// attempts a transition the database would reject.
+bool isValidCallTransition(String? from, String? to) {
+  if (from == null || to == null) return false;
+  if (from == to) return true;
+  if (from == 'ringing') {
+    return to == 'ongoing' ||
+        to == 'missed' ||
+        to == 'declined' ||
+        to == 'cancelled';
+  }
+  if (from == 'ongoing') return to == 'completed';
+  return false;
+}
+
+/// The JSON body the caller sends to the `send-call-push` Edge Function
+/// when a call starts, so the callee is woken even when their app is
+/// closed. Pure (no Supabase): unit-tested. The function verifies the
+/// caller (JWT or trigger secret) and the calls row before sending.
+Map<String, dynamic> buildCallPushBody({
+  required String callId,
+  required String calleeId,
+  required String callerId,
+  required String callType,
+}) =>
+    {
+      'call_id': callId,
+      'callee_id': calleeId,
+      'caller_id': callerId,
+      'call_type': callType,
+    };
+
+/// Plays the device's real system ringtone in a loop while an incoming
+/// call rings, and stops it on accept / decline / end / timeout.
+///
+/// The platform call is injected (defaults to FlutterRingtonePlayer, the
+/// system default ringtone, looping on Android) so unit tests can drive
+/// the start/stop state machine without a device. A failed playback
+/// never throws and never sets [playing]: the caller falls back to
+/// vibration (see _handleOffer). Never used for outgoing calls.
+class CallRingtone {
+  CallRingtone({
+    Future<void> Function()? play,
+    Future<void> Function()? stop,
+  })  : _play = play ?? _defaultPlay,
+        _stop = stop ?? _defaultStop;
+
+  static Future<void> _defaultPlay() =>
+      FlutterRingtonePlayer().playRingtone(looping: true);
+
+  static Future<void> _defaultStop() => FlutterRingtonePlayer().stop();
+
+  final Future<void> Function() _play;
+  final Future<void> Function() _stop;
+  bool _playing = false;
+
+  /// True once [start] has succeeded and [stop] has not run since.
+  bool get playing => _playing;
+
+  /// Starts the looping ringtone. Idempotent: a second call while it is
+  /// already playing does nothing. Never throws.
+  Future<void> start() async {
+    if (_playing) return;
+    try {
+      await _play();
+      _playing = true;
+    } catch (_) {
+      // No ringtone (no plugin, no system sound): the caller vibrates.
+      _playing = false;
+    }
+  }
+
+  /// Stops the ringtone. A no-op when it is not playing, so every end
+  /// path can call it unconditionally. Never throws.
+  Future<void> stop() async {
+    if (!_playing) return;
+    _playing = false;
+    try {
+      await _stop();
+    } catch (_) {}
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Call state.
 // ---------------------------------------------------------------------------
@@ -214,6 +313,26 @@ class CallService {
   String? currentCallType;
   String? currentCallRowId;
 
+  /// The looping system ringtone while an incoming call rings. Stopped
+  /// on every end path (see [_stopIncomingCallAlert]); never used for
+  /// outgoing calls.
+  final CallRingtone ringtone = CallRingtone();
+
+  /// The offer SDP (and type) this side sent as caller, kept so a
+  /// callee who answered a call push can ask for the offer to be
+  /// re-sent ([_handleRequestOffer]). Cleared with the call.
+  String? _outgoingOfferSdp;
+  String? _outgoingOfferType;
+
+  /// Completes when the re-sent offer arrives while [acceptCall] is
+  /// waiting for it (push-triggered accept with no SDP yet). Null when
+  /// no accept is waiting.
+  Completer<CallSignal>? _pendingOfferCompleter;
+
+  /// True once [startListening] has subscribed to the call-push
+  /// notifier (see [_onPendingCallPush]); cleared in [stopListening].
+  bool _listeningToCallPush = false;
+
   bool get isVideoCall => currentCallType == 'video';
 
   RTCPeerConnection? _pc;
@@ -242,15 +361,34 @@ class CallService {
     await stopListening();
     _listeningUserId = uid;
     final channel = _client.channel('call:user:$uid');
-    for (final event in ['offer', 'answer', 'ice', 'hangup', 'decline']) {
+    for (final event in [
+      'offer',
+      'answer',
+      'ice',
+      'hangup',
+      'decline',
+      'requestOffer',
+    ]) {
       channel.onBroadcast(
           event: event, callback: (payload) => _handleBroadcast(payload));
     }
     channel.subscribe();
     _myChannel = channel;
+    // A call push tap may have arrived before sign-in (or before this
+    // listener existed): subscribe to the notifier and pick up a queued
+    // value now, the same pattern AuthGate uses for pendingChatId.
+    if (!_listeningToCallPush) {
+      _listeningToCallPush = true;
+      pendingIncomingCallPush.addListener(_onPendingCallPush);
+    }
+    if (pendingIncomingCallPush.value != null) _onPendingCallPush();
   }
 
   Future<void> stopListening() async {
+    if (_listeningToCallPush) {
+      _listeningToCallPush = false;
+      pendingIncomingCallPush.removeListener(_onPendingCallPush);
+    }
     final channel = _myChannel;
     _myChannel = null;
     _listeningUserId = null;
@@ -262,6 +400,15 @@ class CallService {
     // Peer channels are created per call in [_sendSignal] and must not
     // outlive sign-out either (finding #12).
     await _closeAllPeerChannels();
+  }
+
+  /// A call push was tapped (or arrived in the foreground): consume the
+  /// queued payload exactly once and run the incoming-call flow for it.
+  void _onPendingCallPush() {
+    final payload = pendingIncomingCallPush.value;
+    if (payload == null) return;
+    pendingIncomingCallPush.value = null;
+    unawaited(handlePushIncomingCall(payload).catchError((_) {}));
   }
 
   /// Removes and unsubscribes every peer signalling channel.
@@ -307,6 +454,9 @@ class CallService {
       case CallSignalType.decline:
         unawaited(_handleDecline(signal).catchError((_) {}));
         break;
+      case CallSignalType.requestOffer:
+        unawaited(_handleRequestOffer(signal).catchError((_) {}));
+        break;
     }
   }
 
@@ -333,6 +483,20 @@ class CallService {
   // -- Incoming call ---------------------------------------------------------
 
   Future<void> _handleOffer(CallSignal signal) async {
+    // Re-sent offer for the incoming call already showing (the callee
+    // answered a call push and asked for the SDP): deliver it to the
+    // waiting accept and to the dialog, instead of treating it as a
+    // second call. The ring timer keeps running from the first offer.
+    if (state.value == CallState.incoming &&
+        currentCallId == signal.callId &&
+        signal.sdp != null) {
+      incomingCall.value = signal;
+      final completer = _pendingOfferCompleter;
+      if (completer != null && !completer.isCompleted) {
+        completer.complete(signal);
+      }
+      return;
+    }
     // Busy in another call: decline immediately so the caller is not left
     // ringing, and never overwrite the call already in progress.
     if (state.value != CallState.idle) {
@@ -357,6 +521,21 @@ class CallService {
           callType: signal.callType));
       return;
     }
+    await _beginIncomingCall(signal);
+  }
+
+  /// Shared incoming-call setup for a Realtime offer and for a call push
+  /// tap: ringing state, the real system ringtone (looping) plus
+  /// vibration, the ring timer, and the overlay. [callerName] is the name
+  /// the push already carried (null for a Realtime offer, where it is
+  /// loaded from profiles). [ringTimeout] is the remaining ring window
+  /// for a push-triggered call (the caller's 30s window may be partly
+  /// spent); a Realtime offer always gets the full [callRingTimeout].
+  Future<void> _beginIncomingCall(
+    CallSignal signal, {
+    String? callerName,
+    Duration? ringTimeout,
+  }) async {
     currentCallId = signal.callId;
     currentPeerId = signal.from;
     currentCallType = signal.callType;
@@ -365,13 +544,23 @@ class CallService {
     endReason = null;
     callError.value = null;
     incomingCall.value = signal;
-    incomingCallerName.value = null;
+    incomingCallerName.value =
+        callerName?.trim().isNotEmpty == true ? callerName : null;
     state.value = CallState.incoming;
-    _loadCallerName(signal.from);
-    // Tactile alert on offer. There is no ringtone mechanism in the app
-    // (no audio asset / ringtone package) — a real ringtone is still
-    // pending and is NOT faked here (findings #8/#9).
+    if (incomingCallerName.value == null) _loadCallerName(signal.from);
+    // The device's real system ringtone, looping until the call is
+    // answered / declined / ends / times out. A failed playback falls
+    // back to vibration only — the call itself never depends on sound.
+    // Outgoing calls never ring.
+    unawaited(ringtone.start().catchError((_) {}));
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
+    // Tell push.dart a call is already ringing, so a foreground call
+    // push for the same call does not duplicate this overlay with a
+    // second notification.
+    callRinging.value = true;
+    // The tray notification (if one was shown for this push) is
+    // redundant once the overlay is up.
+    unawaited(cancelCallNotification(signal.callId).catchError((_) {}));
     _armRingTimer(() async {
       // Unanswered: the callee marks it missed, then dismisses the overlay.
       await _updateCallRow('missed', end: true);
@@ -380,8 +569,67 @@ class CallService {
       _pendingIncomingCall = null;
       _pendingOverlayTimer?.cancel();
       _resetCall();
-    });
+    }, timeout: ringTimeout);
     _showIncomingOverlay(signal);
+  }
+
+  /// Stops everything an incoming call started: the looping ringtone,
+  /// the "already ringing" flag, and the tray notification for this
+  /// call (if one was shown). Idempotent: every end path calls it.
+  Future<void> _stopIncomingCallAlert() async {
+    final callId = currentCallId;
+    callRinging.value = false;
+    await ringtone.stop();
+    if (callId != null) {
+      await cancelCallNotification(callId);
+    }
+  }
+
+  /// Handles an incoming call that arrived as a push (the app was closed
+  /// or backgrounded, so the Realtime offer never reached it). Verifies
+  /// the call is still ringing in the `calls` table — a stale push is
+  /// ignored — then shows the same overlay as a Realtime offer, with
+  /// the remaining ring window from the row's `started_at`. The offer
+  /// SDP is fetched on accept (see [acceptCall] / [_handleRequestOffer]).
+  Future<void> handlePushIncomingCall(CallPushPayload payload) async {
+    if (state.value != CallState.idle) return;
+    final myId = _client.auth.currentUser?.id;
+    if (myId == null || payload.callerId == myId) return;
+    Map<String, dynamic>? row;
+    try {
+      row = await _client
+          .from('calls')
+          .select('status,caller_id,callee_id,type,started_at')
+          .eq('id', payload.callId)
+          .maybeSingle();
+    } catch (_) {
+      return;
+    }
+    if (row == null) return;
+    if (row['status']?.toString() != 'ringing') return;
+    if (row['callee_id']?.toString() != myId) return;
+    if (row['caller_id']?.toString() != payload.callerId) return;
+    final type = row['type']?.toString() == 'video' ? 'video' : 'voice';
+    final signal = CallSignal(
+      type: CallSignalType.offer,
+      from: payload.callerId,
+      to: myId,
+      callId: payload.callId,
+      callType: type,
+    );
+    var ringTimeout = callRingTimeout;
+    final startedAt = DateTime.tryParse(row['started_at']?.toString() ?? '');
+    if (startedAt != null) {
+      final remaining =
+          callRingTimeout - DateTime.now().difference(startedAt);
+      if (remaining <= Duration.zero) return;
+      ringTimeout = remaining;
+    }
+    await _beginIncomingCall(
+      signal,
+      callerName: payload.callerName,
+      ringTimeout: ringTimeout,
+    );
   }
 
   Future<void> _loadCallerName(String userId) async {
@@ -468,7 +716,9 @@ class CallService {
 
   /// Accepts a ringing incoming call. Returns false when the microphone
   /// (or camera, for video) permission is denied — the call is declined
-  /// automatically in that case. On success the caller opens [CallPage].
+  /// automatically in that case — or when the offer never arrives (a
+  /// push-triggered accept whose caller is gone). On success the caller
+  /// opens [CallPage].
   Future<bool> acceptCall(CallSignal signal) async {
     final myId = _client.auth.currentUser?.id;
     if (myId == null) return false;
@@ -476,26 +726,64 @@ class CallService {
     _pendingIncomingCall = null;
     _pendingOverlayTimer?.cancel();
     callError.value = null;
-    final video = signal.callType == 'video';
+    // The call is being answered: stop the ringtone immediately.
+    unawaited(_stopIncomingCallAlert());
+    // Resolve the latest offer: a push-triggered dialog may hold a
+    // signal without SDP (the offer never arrived over Realtime), while
+    // a re-sent offer already updated [incomingCall] with one.
+    var effective = signal;
+    final current = incomingCall.value;
+    if (current != null &&
+        current.callId == signal.callId &&
+        current.sdp != null) {
+      effective = current;
+    }
+    if (effective.sdp == null) {
+      // No SDP yet: ask the caller to resend the stored offer and wait
+      // for it (bounded). The caller is still ringing, so the offer
+      // should arrive immediately; a timeout means they are gone.
+      final completer = _pendingOfferCompleter = Completer<CallSignal>();
+      try {
+        await _sendSignal(CallSignal(
+            type: CallSignalType.requestOffer,
+            from: myId,
+            to: signal.from,
+            callId: signal.callId,
+            callType: signal.callType));
+        effective =
+            await completer.future.timeout(const Duration(seconds: 10));
+      } catch (_) {
+        _pendingOfferCompleter = null;
+        await declineCall(signal);
+        return false;
+      } finally {
+        _pendingOfferCompleter = null;
+      }
+      if (effective.sdp == null) {
+        await declineCall(signal);
+        return false;
+      }
+    }
+    final video = effective.callType == 'video';
     if (!await _ensurePermissions(video: video)) {
       await declineCall(signal);
       return false;
     }
     try {
       await _setupPeerConnection(
-          peerId: signal.from, callType: signal.callType);
-      final sdp = signal.sdp;
+          peerId: effective.from, callType: effective.callType);
+      final sdp = effective.sdp;
       if (sdp == null) throw StateError('Missing offer SDP');
       await _pc!.setRemoteDescription(
-          RTCSessionDescription(sdp, signal.sdpType ?? 'offer'));
+          RTCSessionDescription(sdp, effective.sdpType ?? 'offer'));
       final answer = await _pc!.createAnswer();
       await _pc!.setLocalDescription(answer);
       await _sendSignal(CallSignal(
           type: CallSignalType.answer,
           from: myId,
-          to: signal.from,
-          callId: signal.callId,
-          callType: signal.callType,
+          to: effective.from,
+          callId: effective.callId,
+          callType: effective.callType,
           payload: {'sdp': answer.sdp, 'type': answer.type}));
       await _updateCallRow('ongoing');
       _answered = true;
@@ -517,6 +805,7 @@ class CallService {
     _ringTimer?.cancel();
     _pendingIncomingCall = null;
     _pendingOverlayTimer?.cancel();
+    unawaited(_stopIncomingCallAlert());
     final myId = _client.auth.currentUser?.id;
     if (myId != null) {
       try {
@@ -582,6 +871,10 @@ class CallService {
         await _setupPeerConnection(peerId: calleeId, callType: callType);
         final offer = await _pc!.createOffer();
         await _pc!.setLocalDescription(offer);
+        // Keep the offer so a callee who answered a call push can ask
+        // for it to be re-sent (their Realtime offer never arrived).
+        _outgoingOfferSdp = offer.sdp;
+        _outgoingOfferType = offer.type;
         await _sendSignal(CallSignal(
             type: CallSignalType.offer,
             from: myId,
@@ -589,6 +882,15 @@ class CallService {
             callId: callId,
             callType: callType,
             payload: {'sdp': offer.sdp, 'type': offer.type}));
+        // Wake the callee if their app is closed or backgrounded: the
+        // Realtime offer only reaches a connected client. Best-effort
+        // and fire-and-forget — a failed push never breaks the ringing
+        // call, and the push must not delay the ring timer.
+        unawaited(_sendCallPush(
+          calleeId: calleeId,
+          callId: callId,
+          callType: callType,
+        ).catchError((_) {}));
       } catch (_) {
         await _closePeerConnection();
         await _updateCallRow('cancelled', end: true);
@@ -680,8 +982,33 @@ class CallService {
     }
   }
 
+  /// The callee asked for the offer again (they answered a call push
+  /// whose SDP never arrived over Realtime). Re-sends the stored offer
+  /// while this side is still ringing them; ignored otherwise.
+  Future<void> _handleRequestOffer(CallSignal signal) async {
+    if (state.value != CallState.outgoing ||
+        signal.callId != currentCallId) {
+      return;
+    }
+    final sdp = _outgoingOfferSdp;
+    if (sdp == null) return;
+    final myId = _client.auth.currentUser?.id;
+    if (myId == null) return;
+    await _sendSignal(CallSignal(
+        type: CallSignalType.offer,
+        from: myId,
+        to: signal.from,
+        callId: signal.callId,
+        callType: currentCallType ?? signal.callType,
+        payload: {'sdp': sdp, 'type': _outgoingOfferType ?? 'offer'}));
+  }
+
   /// The other side hung up. They already wrote the final history status,
-  /// so this side only cleans up locally and ends its screen.
+  /// so this side only cleans up locally and ends its screen — but the
+  /// peer's write is best-effort, so this side also finalizes the row
+  /// when it is still open (see [_finalizeCallRowIfOpen]); the
+  /// transition trigger rejects the write when the peer already
+  /// finalized it, so this can never overwrite their final status.
   Future<void> _handleRemoteHangup(CallSignal signal) async {
     if (signal.callId != currentCallId &&
         signal.callId != incomingCall.value?.callId) {
@@ -693,6 +1020,8 @@ class CallService {
     incomingCall.value = null;
     _pendingIncomingCall = null;
     _pendingOverlayTimer?.cancel();
+    unawaited(_stopIncomingCallAlert());
+    await _finalizeCallRowIfOpen(_answered ? 'completed' : 'missed');
     await _closePeerConnection();
     state.value = CallState.ended;
     _scheduleIdleReset();
@@ -700,7 +1029,8 @@ class CallService {
   }
 
   /// The callee declined our outgoing call. They already marked the row
-  /// declined; this side only ends its screen.
+  /// declined; this side only ends its screen — but it also finalizes
+  /// the row when it is still open, in case the callee's write failed.
   Future<void> _handleDecline(CallSignal signal) async {
     if (state.value != CallState.outgoing ||
         signal.callId != currentCallId) {
@@ -708,10 +1038,63 @@ class CallService {
     }
     _ringTimer?.cancel();
     endReason = 'declined';
+    unawaited(_stopIncomingCallAlert());
+    await _finalizeCallRowIfOpen('declined');
     await _closePeerConnection();
     state.value = CallState.ended;
     _scheduleIdleReset();
     _clearCurrentCall();
+  }
+
+  /// Writes a terminal status only when the row is still open (not
+  /// already terminal) and the transition is valid per migration 017.
+  /// The peer usually finalizes the row first; this is the safety net
+  /// for a failed or missing peer write on remote hangup / decline, so
+  /// no end path leaves a row stuck at 'ringing' or 'ongoing' without
+  /// `ended_at`. Best-effort: never throws. (The pg_cron job
+  /// helba-mark-ringing-calls-missed is the server-side backstop.)
+  Future<void> _finalizeCallRowIfOpen(String status) async {
+    final rowId = currentCallRowId;
+    if (rowId == null || _rowFinalized) return;
+    try {
+      final row = await _client
+          .from('calls')
+          .select('status')
+          .eq('id', rowId)
+          .maybeSingle();
+      final current = row?['status']?.toString();
+      if (current == null || current == status) return;
+      if (!isValidCallTransition(current, status)) return;
+      await _updateCallRow(status, end: true);
+    } catch (_) {}
+  }
+
+  /// Asks the `send-call-push` Edge Function to wake the callee with a
+  /// high-priority incoming-call push. Best-effort: the Realtime offer
+  /// is the primary path, so a failure here (no function deployed yet,
+  /// no network) never throws and never breaks the call. The app
+  /// authenticates with its own Supabase session (JWT) — it never holds
+  /// the trigger secret.
+  Future<void> _sendCallPush({
+    required String calleeId,
+    required String callId,
+    required String callType,
+  }) async {
+    final myId = _client.auth.currentUser?.id;
+    if (myId == null) return;
+    try {
+      await _client.functions.invoke(
+        'send-call-push',
+        body: buildCallPushBody(
+          callId: callId,
+          calleeId: calleeId,
+          callerId: myId,
+          callType: callType,
+        ),
+      );
+    } catch (_) {
+      // Best-effort: the ringing call continues over Realtime.
+    }
   }
 
   // -- Ending a call -----------------------------------------------------------
@@ -725,6 +1108,7 @@ class CallService {
     _connectionTimer?.cancel();
     _pendingIncomingCall = null;
     _pendingOverlayTimer?.cancel();
+    unawaited(_stopIncomingCallAlert());
     final peerId = currentPeerId;
     final callId = currentCallId;
     final myId = _client.auth.currentUser?.id;
@@ -954,9 +1338,10 @@ class CallService {
     if (peerId != null) await _removePeerChannel(peerId);
   }
 
-  void _armRingTimer(Future<void> Function() onTimeout) {
+  void _armRingTimer(Future<void> Function() onTimeout,
+      {Duration? timeout}) {
     _ringTimer?.cancel();
-    _ringTimer = Timer(callRingTimeout, () {
+    _ringTimer = Timer(timeout ?? callRingTimeout, () {
       // Guard the fire-and-forget timeout so an error in it cannot
       // become an unhandled async error (#2).
       unawaited(onTimeout().catchError((_) {}));
@@ -982,6 +1367,9 @@ class CallService {
     _connectionTimer?.cancel();
     _pendingOverlayTimer?.cancel();
     _pendingIncomingCall = null;
+    // Safety net: any end path that forgot to stop the ringtone or clear
+    // the tray notification is covered here.
+    unawaited(_stopIncomingCallAlert());
     _clearCurrentCall();
     state.value = CallState.idle;
   }
@@ -994,6 +1382,15 @@ class CallService {
     currentCallRowId = null;
     _answered = false;
     _rowFinalized = false;
+    _outgoingOfferSdp = null;
+    _outgoingOfferType = null;
+    // A waiting accept must not hang when the call ends underneath it
+    // (remote hangup while it waits for the re-sent offer).
+    final completer = _pendingOfferCompleter;
+    _pendingOfferCompleter = null;
+    if (completer != null && !completer.isCompleted) {
+      completer.completeError(StateError('Call ended'));
+    }
   }
 }
 
@@ -1034,24 +1431,29 @@ class _IncomingCallDialogState extends State<IncomingCallDialog> {
   Future<void> _accept() async {
     if (_busy) return;
     setState(() => _busy = true);
-    // Capture the app navigator and messenger before popping: this
-    // dialog's State is unmounted by the pop, so nothing below may use
-    // `mounted` or this dialog's context.
+    // Capture the app navigator and messenger before acceptCall: the
+    // dialog is popped by the incomingCall listener when acceptCall
+    // clears it (success or failure), so nothing below may use this
+    // dialog's context. The dialog stays open with a spinner while
+    // acceptCall runs — a push-triggered accept may wait for the caller
+    // to resend the offer, and the user must see that it is connecting
+    // instead of staring at the inbox.
     final navigator = helbaNavigatorKey.currentState;
     final rootContext = helbaNavigatorKey.currentContext;
     final messenger = rootContext == null
         ? null
         : ScaffoldMessenger.of(rootContext);
-    // Close the overlay first: acceptCall clears incomingCall, which would
-    // also pop this dialog through the listener.
-    Navigator.of(context).pop();
     final accepted =
         await CallService.instance.acceptCall(widget.signal);
+    // acceptCall clears incomingCall, which pops this dialog through
+    // the listener; close it here only if it is still open.
+    if (mounted) Navigator.of(context).pop();
     if (!accepted) {
-      // Permission denied: acceptCall already declined the call.
+      // Permission denied, or the offer never arrived (caller gone):
+      // acceptCall already declined the call.
       messenger?.showSnackBar(
         const SnackBar(
-            content: Text('تعذّر الوصول إلى الميكروفون أو الكاميرا.')),
+            content: Text('تعذّر الرد على المكالمة. تحقق من الأذونات والاتصال.')),
       );
       return;
     }
@@ -1094,35 +1496,41 @@ class _IncomingCallDialogState extends State<IncomingCallDialog> {
           Text(callTypeLabel(widget.signal.callType),
               style: const TextStyle(color: Colors.black54)),
           const SizedBox(height: 20),
-          Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
-            Column(children: [
-              FloatingActionButton(
-                heroTag: 'decline_call',
-                backgroundColor: Colors.red,
-                foregroundColor: Colors.white,
-                onPressed: _busy
-                    ? null
-                    : () {
-                        Navigator.of(context).pop();
-                        unawaited(service.declineCall(widget.signal));
-                      },
-                child: const Icon(Icons.call_end),
-              ),
-              const SizedBox(height: 6),
-              const Text('رفض'),
+          if (_busy)
+            const Column(children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 8),
+              Text('جارٍ الاتصال…',
+                  style: TextStyle(color: Colors.black54)),
+            ])
+          else
+            Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+              Column(children: [
+                FloatingActionButton(
+                  heroTag: 'decline_call',
+                  backgroundColor: Colors.red,
+                  foregroundColor: Colors.white,
+                  onPressed: () {
+                    Navigator.of(context).pop();
+                    unawaited(service.declineCall(widget.signal));
+                  },
+                  child: const Icon(Icons.call_end),
+                ),
+                const SizedBox(height: 6),
+                const Text('رفض'),
+              ]),
+              Column(children: [
+                FloatingActionButton(
+                  heroTag: 'accept_call',
+                  backgroundColor: Colors.green,
+                  foregroundColor: Colors.white,
+                  onPressed: _accept,
+                  child: const Icon(Icons.call),
+                ),
+                const SizedBox(height: 6),
+                const Text('قبول'),
+              ]),
             ]),
-            Column(children: [
-              FloatingActionButton(
-                heroTag: 'accept_call',
-                backgroundColor: Colors.green,
-                foregroundColor: Colors.white,
-                onPressed: _busy ? null : _accept,
-                child: const Icon(Icons.call),
-              ),
-              const SizedBox(height: 6),
-              const Text('قبول'),
-            ]),
-          ]),
         ]),
       ),
     );
