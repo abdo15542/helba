@@ -1,9 +1,13 @@
 import 'dart:async';
+import 'dart:io' as io;
 
 import 'package:flutter/material.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'admin_panel.dart';
+import 'app_update.dart';
 import 'call_history.dart';
 import 'chat.dart';
 import 'channels.dart';
@@ -83,6 +87,12 @@ class _InboxPageState extends State<InboxPage> {
   RealtimeChannel? _realtimeChannel;
   Timer? _realtimeDebounce;
   bool _pushDeniedPromptShown = false;
+  // In-app update (app_update.dart): a newer published build, when the
+  // daily check finds one and the user has not dismissed that build.
+  final _updateChecker = AppUpdateChecker();
+  UpdateInfo? _availableUpdate;
+  bool _updateDownloading = false;
+  double? _updateProgress;
 
   @override
   void initState() {
@@ -90,6 +100,163 @@ class _InboxPageState extends State<InboxPage> {
     _chatsFuture = loadChats();
     _subscribeInboxRealtime();
     pushNotificationsPermanentlyDenied.addListener(_onPushDeniedChanged);
+    // Best-effort update check, off the startup path: never blocks the
+    // inbox and never shows an error when it fails.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _checkForUpdate());
+  }
+
+  /// Checks once per launch (throttled to once per day inside the
+  /// checker) whether a newer build is published. On first sighting of
+  /// a new version shows the banner + a dialog; a version the user
+  /// dismissed with [لاحقاً] is never shown again.
+  Future<void> _checkForUpdate() async {
+    try {
+      final installed =
+          int.tryParse((await PackageInfo.fromPlatform()).buildNumber) ?? 0;
+      final dismissed = await _updateChecker.store.dismissedBuild();
+      final update =
+          await _updateChecker.checkForUpdate(installedBuild: installed);
+      if (!mounted || update == null) return;
+      if (!shouldPromptForUpdate(update: update, dismissedBuild: dismissed)) {
+        return;
+      }
+      setState(() => _availableUpdate = update);
+      _showUpdateDialog(update);
+    } catch (_) {
+      // Best-effort: an update-check failure is always silent.
+    }
+  }
+
+  /// The update dialog, shown once on first sighting of a new version.
+  /// The banner below stays as the persistent affordance.
+  void _showUpdateDialog(UpdateInfo update) {
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('تحديث جديد متاح'),
+        content: Text(
+            'الإصدار ${update.buildNumber} من هلبة جاهز. سيتم تثبيت النسخة الجديدة دون حذف التطبيق أو بياناتك.'),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _dismissUpdate();
+            },
+            child: const Text('لاحقاً'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _startUpdateDownload();
+            },
+            child: const Text('تحديث الآن'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Remembers the dismissed build so this version is never nagged
+  /// about again (a newer version will still prompt).
+  Future<void> _dismissUpdate() async {
+    final update = _availableUpdate;
+    if (update == null) return;
+    setState(() => _availableUpdate = null);
+    try {
+      await _updateChecker.store.saveDismissedBuild(update.buildNumber);
+    } catch (_) {
+      // Best-effort: dismissing in memory is enough for this session.
+    }
+  }
+
+  /// Downloads the update APK with visible progress, then hands it to
+  /// the system installer.
+  Future<void> _startUpdateDownload() async {
+    final update = _availableUpdate;
+    if (update == null || _updateDownloading) return;
+    setState(() {
+      _updateDownloading = true;
+      _updateProgress = 0;
+    });
+    try {
+      final file = await _updateChecker.downloadApk(
+        update,
+        onProgress: (p) {
+          if (mounted) setState(() => _updateProgress = p);
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _updateDownloading = false;
+        _updateProgress = null;
+      });
+      await _installDownloadedApk(file);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _updateDownloading = false;
+        _updateProgress = null;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text(
+                'تعذّر تنزيل التحديث. تحقق من الاتصال وحاول مجدداً.')),
+      );
+    }
+  }
+
+  /// Installs a downloaded APK. When the app may not install packages
+  /// from itself yet (Android 8+ "Install unknown apps"), explains the
+  /// step in Arabic and opens the system settings page for Helba; the
+  /// install only proceeds after the user allows it there.
+  Future<void> _installDownloadedApk(io.File apk) async {
+    if (!await _updateChecker.hasInstallPermission()) {
+      if (!mounted) return;
+      final openSettings = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('السماح بتثبيت التحديث'),
+          content: const Text(
+              'لتثبيت التحديث من داخل التطبيق، فعّل «السماح من هذا المصدر» في صفحة الإعدادات التي ستفتح الآن، ثم عُد إلى هنا لإكمال التثبيت.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('إلغاء'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('فتح الإعدادات'),
+            ),
+          ],
+        ),
+      );
+      if (openSettings != true || !mounted) return;
+      final granted = await _updateChecker.requestInstallPermission();
+      if (!mounted) return;
+      if (!granted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text(
+                'لم يتم السماح بتثبيت التطبيقات من هلبة. يمكنك تفعيله لاحقاً من إعدادات التطبيق.'),
+            action: SnackBarAction(
+              label: 'الإعدادات',
+              onPressed: () => unawaited(openAppSettings()),
+            ),
+          ),
+        );
+        return;
+      }
+    }
+    final result = await _updateChecker.openInstaller(apk);
+    if (!mounted) return;
+    if (result.outcome == UpdateInstallOutcome.failed) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+            content: Text(result.message ?? 'تعذّر بدء التثبيت.')),
+      );
+    }
+    // opened: the system installer takes over; nothing more to do here.
   }
 
   /// One-time prompt when system notifications are permanently denied:
@@ -339,6 +506,14 @@ class _InboxPageState extends State<InboxPage> {
           label: const Text('محادثة جديدة'),
         ),
         body: Column(children: [
+          if (_availableUpdate != null)
+            _UpdateBanner(
+              update: _availableUpdate!,
+              downloading: _updateDownloading,
+              progress: _updateProgress,
+              onUpdate: _startUpdateDownload,
+              onLater: _dismissUpdate,
+            ),
           StoryRingsRow(refreshTick: _storiesTick),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
@@ -512,6 +687,81 @@ class _InboxPageState extends State<InboxPage> {
                   ))),
         ]),
       );
+}
+
+/// Persistent in-app update banner: shown at the top of the inbox while
+/// a newer build is available, with visible download progress once the
+/// user taps [تحديث الآن].
+class _UpdateBanner extends StatelessWidget {
+  final UpdateInfo update;
+  final bool downloading;
+  final double? progress;
+  final VoidCallback onUpdate;
+  final VoidCallback onLater;
+
+  const _UpdateBanner({
+    required this.update,
+    required this.downloading,
+    required this.progress,
+    required this.onUpdate,
+    required this.onLater,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final percent =
+        progress == null ? null : (progress! * 100).round().clamp(0, 100);
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFFE1F1E8),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            const Icon(Icons.system_update, color: green),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'تحديث جديد متاح — الإصدار ${update.buildNumber}',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+          ]),
+          const SizedBox(height: 4),
+          Text(
+            downloading
+                ? (percent == null
+                    ? 'جارٍ تنزيل التحديث…'
+                    : 'جارٍ تنزيل التحديث… $percent٪')
+                : 'سيتم تثبيت النسخة الجديدة دون حذف التطبيق.',
+            style: const TextStyle(fontSize: 13),
+          ),
+          if (downloading) ...[
+            const SizedBox(height: 8),
+            LinearProgressIndicator(value: progress, color: green),
+          ] else ...[
+            const SizedBox(height: 8),
+            Row(children: [
+              FilledButton(
+                onPressed: onUpdate,
+                child: const Text('تحديث الآن'),
+              ),
+              const SizedBox(width: 8),
+              TextButton(
+                onPressed: onLater,
+                child: const Text('لاحقاً'),
+              ),
+            ]),
+          ],
+        ],
+      ),
+    );
+  }
 }
 
 class _EmptyInbox extends StatelessWidget {
