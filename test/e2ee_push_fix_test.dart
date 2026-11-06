@@ -149,6 +149,92 @@ void main() {
         throwsA(isA<SecretBoxAuthenticationError>()),
       );
     });
+
+    test('unwrapWrappedKeyWithFallback reports the legacy origin', () async {
+      final alice = await newPair();
+      final bob = await newPair();
+      final convKey = generateConversationKey();
+      // Wrapped WITHOUT a conversation id (pre-fix code): the bound
+      // attempt fails, the legacy attempt succeeds and says so.
+      final legacyWrapped = await wrapConversationKey(
+          convKey, await privOf(alice), await pubOf(bob));
+      final legacyLoaded = await unwrapWrappedKeyWithFallback(
+        legacyWrapped,
+        await privOf(bob),
+        await pubOf(alice),
+        'conv-abc',
+      );
+      expect(legacyLoaded.key, convKey);
+      expect(legacyLoaded.fromLegacy, isTrue);
+      // Wrapped WITH a conversation id: the bound attempt succeeds.
+      final boundWrapped = await wrapConversationKey(
+        convKey,
+        await privOf(alice),
+        await pubOf(bob),
+        conversationId: 'conv-abc',
+      );
+      final boundLoaded = await unwrapWrappedKeyWithFallback(
+        boundWrapped,
+        await privOf(bob),
+        await pubOf(alice),
+        'conv-abc',
+      );
+      expect(boundLoaded.key, convKey);
+      expect(boundLoaded.fromLegacy, isFalse);
+    });
+
+    test('unwrapWrappedKeyWithFallback throws when neither KEK works',
+        () async {
+      final alice = await newPair();
+      final bob = await newPair();
+      final carol = await newPair();
+      final wrapped = await wrapConversationKey(
+        generateConversationKey(),
+        await privOf(alice),
+        await pubOf(bob),
+        conversationId: 'conv-abc',
+      );
+      // Carol holds a different private key: the bound KEK and the
+      // legacy KEK both fail — at the _loadMyWrappedKey level this
+      // becomes the definitive "blocked" outcome.
+      await expectLater(
+        unwrapWrappedKeyWithFallback(
+          wrapped,
+          await privOf(carol),
+          await pubOf(alice),
+          'conv-abc',
+        ),
+        throwsA(isA<SecretBoxAuthenticationError>()),
+      );
+    });
+  });
+
+  group('key creation guard (afterReset)', () {
+    test('shouldCreateKey refuses a competing key when messages exist',
+        () {
+      expect(
+          shouldCreateKey(
+              hasEncryptedMessages: true, afterReset: false),
+          isFalse);
+    });
+
+    test('shouldCreateKey allows creation after an explicit reset', () {
+      expect(
+          shouldCreateKey(
+              hasEncryptedMessages: true, afterReset: true),
+          isTrue);
+    });
+
+    test('shouldCreateKey allows creation when nothing is encrypted', () {
+      expect(
+          shouldCreateKey(
+              hasEncryptedMessages: false, afterReset: false),
+          isTrue);
+      expect(
+          shouldCreateKey(
+              hasEncryptedMessages: false, afterReset: true),
+          isTrue);
+    });
   });
 
   group('malformed messages (finding #30)', () {

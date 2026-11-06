@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:helba/src/chat.dart';
@@ -37,6 +38,23 @@ void main() {
       expect(asUuidOrNull(''), isNull);
       expect(asUuidOrNull('123e4567-e89b-12d3-a456-426614174000'),
           '123e4567-e89b-12d3-a456-426614174000');
+    });
+
+    test('plaintextBannerMessage names the real cause', () {
+      // A 32-byte base64 key is valid; anything else means "no key".
+      final validKey = base64Encode(List<int>.filled(32, 7));
+      // Every member has a key but the conversation key failed to
+      // load: blame the key load, not a member key.
+      expect(
+          plaintextBannerMessage({'a': validKey, 'b': validKey}),
+          '🔓 غير مشفّرة — تعذّر تحميل مفتاح التشفير');
+      // A member without a key: blame the missing member key.
+      expect(plaintextBannerMessage({'a': validKey, 'b': null}),
+          '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح');
+      expect(plaintextBannerMessage({'a': validKey, 'b': 'key-a'}),
+          '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح');
+      expect(plaintextBannerMessage({}),
+          '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح');
     });
   });
 
