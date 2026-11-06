@@ -135,6 +135,10 @@ jobs:
           # Bluetooth routing needs BLUETOOTH_CONNECT on Android 12+
           # (BLUETOOTH covers older versions); ACCESS_NETWORK_STATE is
           # what the WebRTC stack checks for connectivity changes.
+          # USE_FULL_SCREEN_INTENT is what lets the incoming-call
+          # notification (helba_calls channel) show full-screen on
+          # Android 14+; without it the notification is demoted to a
+          # heads-up banner instead.
           python3 - <<'PY'
           from pathlib import Path
           path = Path("android/app/src/main/AndroidManifest.xml")
@@ -146,6 +150,7 @@ jobs:
               "android.permission.BLUETOOTH_CONNECT",
               "android.permission.BLUETOOTH",
               "android.permission.ACCESS_NETWORK_STATE",
+              "android.permission.USE_FULL_SCREEN_INTENT",
           ]
           missing = [p for p in wanted if p not in source]
           if not missing:
@@ -174,6 +179,7 @@ jobs:
           grep -q 'android.permission.BLUETOOTH_CONNECT' android/app/src/main/AndroidManifest.xml || (echo "BLUETOOTH_CONNECT permission missing from AndroidManifest.xml" && exit 1)
           grep -q 'android.permission.BLUETOOTH' android/app/src/main/AndroidManifest.xml || (echo "BLUETOOTH permission missing from AndroidManifest.xml" && exit 1)
           grep -q 'android.permission.ACCESS_NETWORK_STATE' android/app/src/main/AndroidManifest.xml || (echo "ACCESS_NETWORK_STATE permission missing from AndroidManifest.xml" && exit 1)
+          grep -q 'android.permission.USE_FULL_SCREEN_INTENT' android/app/src/main/AndroidManifest.xml || (echo "USE_FULL_SCREEN_INTENT permission missing from AndroidManifest.xml" && exit 1)
 
       - name: Add FCM Installation ID opt-in to the main manifest
         shell: bash
@@ -435,6 +441,7 @@ jobs:
           fi
           DUMP=$("$AAPT2" dump xmltree --file AndroidManifest.xml "$APK")
           echo "$DUMP" | grep -q 'android.permission.INTERNET' || (echo "Built APK is missing the INTERNET permission" && exit 1)
+          echo "$DUMP" | grep -q 'android.permission.USE_FULL_SCREEN_INTENT' || (echo "Built APK is missing the USE_FULL_SCREEN_INTENT permission (incoming-call full-screen on Android 14+)" && exit 1)
           echo "$DUMP" | grep -q 'android:scheme.*helba' || (echo "Built APK is missing the helba deep-link scheme" && exit 1)
           echo "$DUMP" | grep -q 'android:host.*auth' || (echo "Built APK is missing the auth deep-link host" && exit 1)
           echo "$DUMP" | grep -q 'android:host.*chat' || (echo "Built APK is missing the chat deep-link host" && exit 1)
