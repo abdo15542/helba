@@ -1,5 +1,9 @@
 -- HELBA schema v1: email auth + profiles + direct messaging.
 -- Run in Supabase SQL Editor. Never expose service_role in the mobile app.
+--
+-- NOTE (2026-11-06): this file is NOT a standalone baseline. Apply
+-- migrations 001-0xx in order; do not run standalone (it lacks the
+-- profile trigger, the locked RPCs, and later hardening).
 create extension if not exists pgcrypto;
 
 create table if not exists public.profiles (
