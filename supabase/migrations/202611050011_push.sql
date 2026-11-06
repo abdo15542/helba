@@ -43,9 +43,10 @@ for update to authenticated
 using (user_id = (select auth.uid()))
 with check (user_id = (select auth.uid()));
 
--- No DELETE policy: stale tokens are pruned by the Edge Function when
--- FCM reports them invalid, not from the client.
-grant select, insert, update on public.push_tokens to authenticated;
+-- Stale tokens are pruned BOTH ways: the Edge Function deletes FIDs
+-- FCM reports invalid, and (since migration 018) the client can
+-- delete its own token on sign-out (push_tokens_delete_own).
+grant select, insert, update, delete on public.push_tokens to authenticated;
 
 -- pg_net is the only way for a trigger to call the Edge Function. The
 -- extension may not exist on every project, so install it best-effort:

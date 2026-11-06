@@ -97,14 +97,51 @@ revoke all on function public.create_direct_conversation(uuid) from public, anon
 grant execute on function public.create_direct_conversation(uuid) to authenticated;
 
 -- Existing auth users may not yet have a profile; backfill them safely.
-insert into public.profiles (id, display_name, username)
-select
-  u.id,
-  coalesce(
-    nullif(trim(u.raw_user_meta_data ->> 'display_name'), ''),
-    nullif(split_part(coalesce(u.email, ''), '@', 1), ''),
-    'مستخدم هلبة'
-  ),
-  'user_' || substr(replace(u.id::text, '-', ''), 1, 12)
-from auth.users u
-on conflict (id) do nothing;
+-- NOTE (2026-11-06): this backfill already ran live; the DO block
+-- below only matters for fresh databases. It loops per user and
+-- retries with a fresh md5-suffixed username (same retry loop as
+-- migration 005's trigger), so one username collision no longer
+-- aborts the whole backfill.
+do $$
+declare
+  u record;
+  chosen_name text;
+  chosen_username text;
+  attempt integer;
+  inserted_ok boolean;
+begin
+  for u in
+    select au.id, au.email, au.raw_user_meta_data
+    from auth.users au
+    where not exists (select 1 from public.profiles p where p.id = au.id)
+  loop
+    chosen_name := coalesce(
+      nullif(trim(u.raw_user_meta_data ->> 'display_name'), ''),
+      nullif(split_part(coalesce(u.email, ''), '@', 1), ''),
+      'مستخدم هلبة'
+    );
+    attempt := 0;
+    inserted_ok := false;
+    while attempt < 5 and not inserted_ok loop
+      attempt := attempt + 1;
+      if attempt = 1 then
+        chosen_username := 'user_' || substr(replace(u.id::text, '-', ''), 1, 12);
+      else
+        chosen_username := 'user_' || substr(md5(u.id::text || attempt::text || clock_timestamp()::text), 1, 12);
+      end if;
+      begin
+        insert into public.profiles (id, display_name, username)
+        values (u.id, chosen_name, chosen_username)
+        on conflict (id) do nothing;
+        inserted_ok := true;
+      exception when unique_violation then
+        -- Username collided; retry with a fresh generated username.
+        inserted_ok := false;
+      end;
+    end loop;
+    if not inserted_ok then
+      raise notice 'helba backfill: could not create profile for user % after 5 attempts (username collisions); skipping', u.id;
+    end if;
+  end loop;
+end
+$$;

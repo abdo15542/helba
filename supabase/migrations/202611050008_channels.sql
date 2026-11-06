@@ -8,8 +8,13 @@ revoke all on schema private from public, anon;
 grant usage on schema private to authenticated;
 
 -- 1. Allow 'channel' as a conversation kind.
--- The live DB may name the check constraint differently, so drop whatever
--- check constraint exists on conversations.kind, then add the new one.
+-- Drop the old kind check constraint (by its known name), then add
+-- the new one including 'channel'.
+-- NOTE (2026-11-06): the constraint-drop loop below used to drop
+-- EVERY check constraint whose definition contains 'kind'. It now
+-- targets only the known constraint name
+-- 'conversations_kind_check'. This file already ran live; the change
+-- only matters for fresh databases.
 do $$
 declare
   r record;
@@ -19,7 +24,7 @@ begin
     from pg_constraint
     where conrelid = 'public.conversations'::regclass
       and contype = 'c'
-      and pg_get_constraintdef(oid) like '%kind%'
+      and conname = 'conversations_kind_check'
   loop
     execute 'alter table public.conversations drop constraint '
       || quote_ident(r.conname);

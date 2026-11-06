@@ -1,0 +1,53 @@
+-- HELBA: defence in depth (migration 020) — INTENTIONALLY NOT APPLIED.
+-- This file is a placeholder and performs NO change. It exists so the
+-- 014-021 numbering stays gapless and so nobody later "fills in" 020
+-- with the dangerous version of finding F64 (child-D report #20).
+--
+-- F64 as specified was: convert the public RPC wrappers from SECURITY
+-- INVOKER to SECURITY DEFINER, then
+--   revoke execute on all functions in schema private from authenticated;
+-- The pairing is load-bearing and was checked statically against the
+-- migrations in this repo. As specified it is UNSAFE and was left out,
+-- for two independent reasons:
+--
+-- 1. RLS policies call private.is_banned() directly. Migration 014
+--    adds `and not private.is_banned()` to the WITH CHECK of
+--    messages_insert_members, stories_insert_own, reports_insert_self
+--    and calls_insert_caller. A SECURITY DEFINER function still
+--    requires the CALLER to hold EXECUTE on it; the policy is
+--    evaluated as the authenticated user, so a blanket revoke on
+--    private.* would make every message/story/report/call insert
+--    fail with "permission denied for function private.is_banned".
+--
+-- 2. public.is_conversation_member(uuid, uuid) is SECURITY INVOKER
+--    (004) and calls private.is_conversation_member. It is itself
+--    called from RLS policies (messages_insert_members,
+--    conversations_read_members, members_read_same_conversation,
+--    messages_read_members, and the tightened
+--    conversation_keys_insert_member in 016). It was NOT in the F64
+--    conversion list, so after a blanket revoke on private.* it
+--    would fail inside every policy evaluation — breaking reads and
+--    writes across the app. (Converting the listed RPC wrappers to
+--    DEFINER only fixes the RPC path, because a DEFINER function
+--    calls private functions as its owner; the RLS path stays
+--    invoker.)
+--
+-- THE CORRECTED PAIRING (for a future attempt, NOT applied here):
+--   * Convert public.is_conversation_member to SECURITY DEFINER too
+--     (it is a public wrapper around a private function, same as
+--     the listed RPC wrappers).
+--   * Route the ban check through a public SECURITY DEFINER wrapper
+--     (e.g. public.is_banned() calling private.is_banned()) and
+--     have the 014 policies call THAT — or keep EXECUTE on
+--     private.is_banned() granted to authenticated — instead of a
+--     blanket revoke on all of private.*.
+--   * Only then revoke execute on the remaining private.* functions
+--     from authenticated.
+--   * Then smoke-test live: one RPC call from the app (create a
+--     direct conversation) AND one message insert AND one read, to
+--     prove both the RPC path and the RLS path still work.
+-- Until that corrected pairing is written and live-tested, the
+-- current state stands: private.* functions re-check auth.uid() /
+-- admin inside (004/008/009 pattern), PostgREST only exposes the
+-- public schema by default, and the defence-in-depth benefit of the
+-- revoke does not justify breaking every write.
