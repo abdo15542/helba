@@ -507,6 +507,12 @@ jobs:
           # XML layout. The package must be com.example.helba: the
           # explicit FirebaseOptions in lib/src/push.dart hardcode that
           # package, and a drift would silently disable push.
+          # NOTE (run 107): the dump is written to a file and grepped there.
+          # Piping it through `echo "$DUMP" | grep -q` is a false-failure
+          # trap: grep -q exits as soon as it finds a match, the echo then
+          # dies with SIGPIPE ("Broken pipe"), and with pipefail the
+          # pipeline reports failure even though the permission IS present.
+          # That is exactly what killed run 107 on USE_FULL_SCREEN_INTENT.
           APK=build/app/outputs/flutter-apk/app-release.apk
           SDK_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
           AAPT2="$SDK_HOME/build-tools/36.0.0/aapt2"
@@ -516,16 +522,18 @@ jobs:
           if [ -z "$AAPT2" ] || [ ! -x "$AAPT2" ]; then
             echo "aapt2 not found under \$ANDROID_HOME/build-tools (build-tools 36.0.0 is installed by the 'Install Android compile SDK' step)" && exit 1
           fi
-          DUMP=$("$AAPT2" dump xmltree --file AndroidManifest.xml "$APK")
-          echo "$DUMP" | grep -q 'android.permission.INTERNET' || (echo "Built APK is missing the INTERNET permission" && exit 1)
-          echo "$DUMP" | grep -q 'android.permission.USE_FULL_SCREEN_INTENT' || (echo "Built APK is missing the USE_FULL_SCREEN_INTENT permission (incoming-call full-screen on Android 14+)" && exit 1)
-          echo "$DUMP" | grep -q 'android.permission.REQUEST_INSTALL_PACKAGES' || (echo "Built APK is missing the REQUEST_INSTALL_PACKAGES permission (in-app updater cannot install the downloaded APK)" && exit 1)
-          echo "$DUMP" | grep -q 'android:scheme.*helba' || (echo "Built APK is missing the helba deep-link scheme" && exit 1)
-          echo "$DUMP" | grep -q 'android:host.*auth' || (echo "Built APK is missing the auth deep-link host" && exit 1)
-          echo "$DUMP" | grep -q 'android:host.*chat' || (echo "Built APK is missing the chat deep-link host" && exit 1)
-          echo "$DUMP" | grep -q 'firebase_messaging_installation_id_enabled' || (echo "Built APK is missing the FCM Installation ID opt-in meta-data" && exit 1)
-          echo "$DUMP" | grep -q 'package="com.example.helba"' || (echo "Built APK package is not com.example.helba (FirebaseOptions in lib/src/push.dart hardcode that package)" && exit 1)
+          DUMP_FILE=$(mktemp)
+          "$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" > "$DUMP_FILE"
+          grep -q 'android.permission.INTERNET' "$DUMP_FILE" || (echo "Built APK is missing the INTERNET permission" && exit 1)
+          grep -q 'android.permission.USE_FULL_SCREEN_INTENT' "$DUMP_FILE" || (echo "Built APK is missing the USE_FULL_SCREEN_INTENT permission (incoming-call full-screen on Android 14+)" && exit 1)
+          grep -q 'android.permission.REQUEST_INSTALL_PACKAGES' "$DUMP_FILE" || (echo "Built APK is missing the REQUEST_INSTALL_PACKAGES permission (in-app updater cannot install the downloaded APK)" && exit 1)
+          grep -q 'android:scheme.*helba' "$DUMP_FILE" || (echo "Built APK is missing the helba deep-link scheme" && exit 1)
+          grep -q 'android:host.*auth' "$DUMP_FILE" || (echo "Built APK is missing the auth deep-link host" && exit 1)
+          grep -q 'android:host.*chat' "$DUMP_FILE" || (echo "Built APK is missing the chat deep-link host" && exit 1)
+          grep -q 'firebase_messaging_installation_id_enabled' "$DUMP_FILE" || (echo "Built APK is missing the FCM Installation ID opt-in meta-data" && exit 1)
+          grep -q 'package="com.example.helba"' "$DUMP_FILE" || (echo "Built APK package is not com.example.helba (FirebaseOptions in lib/src/push.dart hardcode that package)" && exit 1)
           echo "Built APK verified: INTERNET, helba deep links (auth + chat), FID opt-in meta-data, package com.example.helba"
+          rm -f "$DUMP_FILE"
 
       - name: Verify stable signing certificate
         shell: bash
