@@ -66,6 +66,98 @@ String plaintextBannerMessage(
         ? '🔓 غير مشفّرة — تعذّر تحميل مفتاح التشفير'
         : '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح';
 
+/// Maximum Signal decrypt attempts for one row before it is marked
+/// failed (tap-to-retry) instead of left pending. A Signal row that
+/// fails once is usually a transient race (the session was still
+/// converging when the message arrived), not a lost key — so it gets
+/// a bounded retry budget, never the permanent label on first
+/// failure. Pure (unit-tested via [signalDecryptShouldRetry]).
+const maxSignalDecryptAttempts = 3;
+
+/// True when [row] is a Signal row sent by the current user.
+///
+/// A Signal sender cannot decrypt their own outgoing ciphertext
+/// (the sending ratchet has moved on; the session holds the receiving
+/// chain for the peer, not the sender's own outgoing message keys),
+/// so such rows must never enter the decrypt pipeline — they are
+/// shown from the plaintext stored on this device at send time
+/// ([SentSignalPlaintextStore]). Old-E2E rows are NOT affected: their
+/// conversation key is shared, so the sender can decrypt those.
+/// Pure (unit-tested).
+bool isOwnSignalRow(Map<String, dynamic> row, String? currentUserId) {
+  if (currentUserId == null || currentUserId.isEmpty) return false;
+  if (!isSignalMessageRow(row)) return false;
+  return row['sender_id']?.toString() == currentUserId;
+}
+
+/// True when a Signal row that failed to decrypt should be retried
+/// (left pending for the next decrypt pass) instead of marked failed.
+/// Pure (unit-tested).
+bool signalDecryptShouldRetry(int attempts) =>
+    attempts < maxSignalDecryptAttempts;
+
+/// What an encrypted message row should show. Pure (unit-tested via
+/// [encryptedRowBody]) — the widget only renders the decision.
+enum EncryptedRowBody {
+  /// Decrypted (peer message, or an old-E2E own message): show the
+  /// plaintext with the encrypted label.
+  decrypted,
+
+  /// Own Signal message with a locally stored plaintext: show it
+  /// with the encrypted label (never re-decrypted).
+  ownPlaintext,
+
+  /// Own Signal message with no stored plaintext (sent from another
+  /// device / local storage cleared): show the encrypted placeholder
+  /// with the encrypted label — never a decryption failure.
+  ownPlaceholder,
+
+  /// Malformed row (missing ciphertext/type): "رسالة تالفة".
+  malformed,
+
+  /// Ciphertext encrypted under a key that is gone for good (old-E2E
+  /// only; Signal rows never reach this state): permanent label, no
+  /// retry.
+  permanentlyUnreadable,
+
+  /// Failed after the bounded Signal retry budget (or a definitive
+  /// old-E2E key failure): failure label with tap-to-retry.
+  failed,
+
+  /// Still pending: placeholder with the "decrypting…" spinner.
+  decrypting,
+}
+
+/// Decides what an encrypted row shows, from the decrypt state.
+///
+/// The own-Signal case is checked FIRST, before every failure set:
+/// an own Signal row is never decrypted and must never show a
+/// failure label, even if it somehow landed in a failure set. Pure
+/// (unit-tested).
+EncryptedRowBody encryptedRowBody({
+  required Map<String, dynamic> row,
+  required String? currentUserId,
+  required Map<String, String> decrypted,
+  required Map<String, String> ownSentPlaintext,
+  required Set<String> malformedIds,
+  required Set<String> permanentlyUnreadable,
+  required Set<String> decryptFailed,
+}) {
+  final id = row['id']?.toString() ?? '';
+  if (isOwnSignalRow(row, currentUserId)) {
+    return ownSentPlaintext.containsKey(id)
+        ? EncryptedRowBody.ownPlaintext
+        : EncryptedRowBody.ownPlaceholder;
+  }
+  if (decrypted.containsKey(id)) return EncryptedRowBody.decrypted;
+  if (malformedIds.contains(id)) return EncryptedRowBody.malformed;
+  if (permanentlyUnreadable.contains(id)) {
+    return EncryptedRowBody.permanentlyUnreadable;
+  }
+  if (decryptFailed.contains(id)) return EncryptedRowBody.failed;
+  return EncryptedRowBody.decrypting;
+}
+
 /// Empty key loads after which pending encrypted rows stop spinning on
 /// "جارٍ فك التشفير…" and are marked failed (retryable) instead
 /// (fix 5). A load counts as empty when it returns no key without a
@@ -138,6 +230,20 @@ class _ChatPageState extends State<ChatPage> {
   // missing/blocked — a reset may heal it), these never leave this set
   // except on a reset, which re-evaluates them against the fresh key.
   final Set<String> _permanentlyUnreadable = {};
+  // Plaintexts of Signal messages THIS device sent, keyed by message
+  // id (see [SentSignalPlaintextStore]): a Signal sender cannot
+  // decrypt their own outgoing ciphertext, so own sent Signal rows
+  // are shown from this map (loaded from on-device storage when rows
+  // arrive, populated immediately at send time). Deliberately NOT
+  // cleared on reset — the plaintexts do not depend on any key or
+  // session.
+  final Map<String, String> _ownSentPlaintext = {};
+  // Signal decrypt attempts per row id. A Signal row that fails is
+  // left pending while attempts remain (see [signalDecryptShouldRetry])
+  // and only moves to [_decryptFailed] once the budget is spent —
+  // never to [_permanentlyUnreadable]. Cleared on reset and on manual
+  // retry, so a fresh session gets a fresh budget.
+  final Map<String, int> _signalDecryptAttempts = {};
   List<int>? _conversationKey;
   // True ONLY once a non-null key has actually been loaded. A null key
   // must not set this, otherwise the key load never retries.
@@ -288,6 +394,10 @@ class _ChatPageState extends State<ChatPage> {
       try {
         if (await sync.ensureSessionFor(otherId, deviceUuid)) {
           if (mounted) setState(() => _signalSessionReady = true);
+          // The session just healed: retry any Signal rows that
+          // failed while it was being established (bounded retry in
+          // _decryptSignalRows).
+          unawaited(_decryptPendingRows(_lastRows));
           return;
         }
       } catch (_) {
@@ -621,6 +731,10 @@ class _ChatPageState extends State<ChatPage> {
   /// for good, so it goes to [_permanentlyUnreadable] (no retry — the
   /// retry can never succeed) instead of [_decryptFailed].
   Future<void> _decryptPendingRows(List<Map<String, dynamic>> rows) async {
+    // Own sent Signal rows are displayed from the locally stored
+    // plaintext (never decrypted); load it in the background even
+    // when a decrypt run is already in flight.
+    unawaited(_loadOwnSentPlaintexts(rows));
     if (_decryptRunning) return;
     final malformed = <String>[];
     final signalPending = <Map<String, dynamic>>[];
@@ -629,6 +743,10 @@ class _ChatPageState extends State<ChatPage> {
       if (!isEncryptedMessage(row)) continue;
       final id = row['id']?.toString() ?? '';
       if (id.isEmpty) continue;
+      // Own Signal rows never enter the decrypt pipeline (the sender
+      // cannot decrypt their own outgoing ciphertext) and never land
+      // in _permanentlyUnreadable/_decryptFailed — see _messageBody.
+      if (isOwnSignalRow(row, client.auth.currentUser?.id)) continue;
       if (isMalformedEncryptedRow(row)) {
         malformed.add(id);
         continue;
@@ -715,16 +833,54 @@ class _ChatPageState extends State<ChatPage> {
     if (changed && mounted) setState(() {});
   }
 
+  /// Loads the locally stored plaintexts of this device's own sent
+  /// Signal rows into [_ownSentPlaintext] (on-device storage only).
+  /// Best-effort, never throws: a missing plaintext just shows the
+  /// encrypted placeholder for that row.
+  Future<void> _loadOwnSentPlaintexts(
+    List<Map<String, dynamic>> rows,
+  ) async {
+    final sync = _signalSync;
+    final myId = client.auth.currentUser?.id;
+    if (sync == null || myId == null) return;
+    var changed = false;
+    for (final row in rows) {
+      if (!isOwnSignalRow(row, myId)) continue;
+      final id = row['id']?.toString() ?? '';
+      if (id.isEmpty || _ownSentPlaintext.containsKey(id)) continue;
+      try {
+        final plain = await sync.sentPlaintexts.read(id);
+        if (plain != null && plain.isNotEmpty) {
+          _ownSentPlaintext[id] = plain;
+          changed = true;
+        }
+      } catch (_) {
+        // Best-effort: the placeholder covers a missing plaintext.
+      }
+    }
+    if (changed && mounted) setState(() {});
+  }
+
   /// Decrypts Signal Protocol rows (1:1 chats) with the Signal session
   /// for the sender's device. No old conversation key is needed. The
   /// sender's device is not stored on the row, so every device uuid
   /// known for the sender is tried in order — the one the sender
-  /// actually used is the one whose session decrypts. A row that
-  /// decrypts with none of them is permanently unreadable (same label
-  /// as old-E2E, no retry link, never a spinner). Rows are left
-  /// pending (not failed) when Signal is not initialised yet or the
-  /// sender's devices are unknown, so a later retry can still heal
-  /// them. Never throws.
+  /// actually used is the one whose session decrypts.
+  ///
+  /// A row that fails to decrypt is NOT permanently unreadable on a
+  /// single attempt: the first message of a session can fail while
+  /// both sides are still building sessions at the same moment
+  /// (simultaneous initiation), and the one-time pre-key is only
+  /// consumed on a successful decrypt, so a later retry still
+  /// succeeds (verified by test). Failed rows therefore stay pending
+  /// while their bounded retry budget remains ([signalDecryptShouldRetry])
+  /// and only then move to [_decryptFailed] (tap-to-retry) — never to
+  /// [_permanentlyUnreadable]. Rows are left pending (not failed) when
+  /// Signal is not initialised yet or the sender's devices are
+  /// unknown, so a later retry can still heal them. A second pass runs
+  /// when the first pass decrypted something (the session healed
+  /// mid-batch), so a race-failed first message is retried at once.
+  /// Never throws.
   Future<void> _decryptSignalRows(
     List<Map<String, dynamic>> rows,
   ) async {
@@ -738,56 +894,92 @@ class _ChatPageState extends State<ChatPage> {
       await _loadMembers(silent: true);
       if (!mounted) return;
     }
+    final myId = client.auth.currentUser?.id;
     _decryptRunning = true;
     var changed = false;
-    for (final row in rows) {
-      final id = row['id']?.toString() ?? '';
-      if (id.isEmpty) continue;
-      _decrypting.add(id);
-      try {
+    var pending = rows;
+    for (var pass = 0; pass < 2 && pending.isNotEmpty; pass++) {
+      final nextPending = <Map<String, dynamic>>[];
+      var anySuccess = false;
+      for (final row in pending) {
+        final id = row['id']?.toString() ?? '';
+        if (id.isEmpty) continue;
+        // Own Signal rows are never decrypted (the sender cannot
+        // decrypt their own outgoing ciphertext) — belt and braces
+        // alongside the routing skip in _decryptPendingRows.
         final senderId = row['sender_id']?.toString() ?? '';
-        final ciphertext = row['ciphertext']?.toString() ?? '';
-        final type = parseSignalMsgType(
-          row['signal_msg_type']?.toString(),
-        );
-        if (senderId.isEmpty || ciphertext.isEmpty || type == null) {
-          _permanentlyUnreadable.add(id);
-          changed = true;
-          continue;
-        }
-        final isPreKey = type == CiphertextMessageType.preKey;
-        String? plain;
-        var triedAnyDevice = false;
-        for (final deviceUuid in _memberDeviceUuids(senderId)) {
-          triedAnyDevice = true;
-          plain = await sync.decryptFrom(
-            senderId,
-            deviceUuid,
-            ciphertext,
-            isPreKey,
+        if (myId != null && senderId == myId) continue;
+        _decrypting.add(id);
+        try {
+          final ciphertext = row['ciphertext']?.toString() ?? '';
+          final type = parseSignalMsgType(
+            row['signal_msg_type']?.toString(),
           );
-          if (plain != null) break;
-        }
-        if (plain != null) {
-          _decrypted[id] = plain;
+          if (senderId.isEmpty || ciphertext.isEmpty || type == null) {
+            // Missing data in the row itself, not a transient
+            // failure: it can never decrypt.
+            _permanentlyUnreadable.add(id);
+            changed = true;
+            continue;
+          }
+          final isPreKey = type == CiphertextMessageType.preKey;
+          String? plain;
+          var triedAnyDevice = false;
+          for (final deviceUuid in _memberDeviceUuids(senderId)) {
+            triedAnyDevice = true;
+            plain = await sync.decryptFrom(
+              senderId,
+              deviceUuid,
+              ciphertext,
+              isPreKey,
+            );
+            if (plain != null) break;
+          }
+          if (plain != null) {
+            _decrypted[id] = plain;
+            _signalDecryptAttempts.remove(id);
+            anySuccess = true;
+            changed = true;
+          } else if (triedAnyDevice) {
+            // Every known sender device failed: usually a transient
+            // race (session still converging). Bounded retry — leave
+            // pending while attempts remain, then failed (retryable).
+            _recordSignalDecryptFailure(id, nextPending, row);
+            changed = true;
+          }
+          // No known sender device at all: leave the row pending (do
+          // not mark it) — a later members load may still heal it.
+        } catch (_) {
+          _recordSignalDecryptFailure(id, nextPending, row);
           changed = true;
-        } else if (triedAnyDevice) {
-          // Every known sender device failed: the ciphertext cannot
-          // be decrypted with any session available now.
-          _permanentlyUnreadable.add(id);
-          changed = true;
+        } finally {
+          _decrypting.remove(id);
         }
-        // No known sender device at all: leave the row pending (do
-        // not mark it) — a later members load may still heal it.
-      } catch (_) {
-        _permanentlyUnreadable.add(id);
-        changed = true;
-      } finally {
-        _decrypting.remove(id);
       }
+      if (!anySuccess) break;
+      pending = nextPending;
     }
     _decryptRunning = false;
     if (changed && mounted) setState(() {});
+  }
+
+  /// Records one failed Signal decrypt attempt for [id]: increments
+  /// the attempt budget and either leaves the row pending for the
+  /// next decrypt pass (added to [nextPending]) or, once the budget
+  /// is spent, marks it failed (tap-to-retry). Never permanently
+  /// unreadable.
+  void _recordSignalDecryptFailure(
+    String id,
+    List<Map<String, dynamic>> nextPending,
+    Map<String, dynamic> row,
+  ) {
+    final attempts = (_signalDecryptAttempts[id] ?? 0) + 1;
+    _signalDecryptAttempts[id] = attempts;
+    if (signalDecryptShouldRetry(attempts)) {
+      nextPending.add(row);
+    } else {
+      _decryptFailed.add(id);
+    }
   }
 
   /// Tap-to-retry for rows that definitively failed to decrypt: clears
@@ -802,6 +994,7 @@ class _ChatPageState extends State<ChatPage> {
     if (!mounted) return;
     setState(() {
       _decryptFailed.clear();
+      _signalDecryptAttempts.clear();
       _keyDefinitivelyBlocked = false;
       _keyLoadNullCount = 0;
     });
@@ -1337,6 +1530,7 @@ class _ChatPageState extends State<ChatPage> {
       _lastWrapUncovered = {};
       _decrypted.clear();
       _decryptFailed.clear();
+      _signalDecryptAttempts.clear();
       _permanentlyUnreadable.clear();
     });
     // (3) Await the fresh key load — never fire-and-forget it.
@@ -1558,64 +1752,95 @@ class _ChatPageState extends State<ChatPage> {
 
   /// Renders a text message body with its encryption state.
   /// Attachments are handled by the caller (files are NOT E2E-encrypted).
+  /// The branch is decided by the pure [encryptedRowBody] helper; this
+  /// widget only renders the decision.
   Widget _messageBody(Map<String, dynamic> row) {
     const labelStyle = TextStyle(fontSize: 10, color: Colors.black54);
     if (isEncryptedMessage(row)) {
       final id = row['id']?.toString() ?? '';
-      final plain = _decrypted[id];
-      if (plain != null) {
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(plain),
-            const Text('🔒 مشفّرة', style: labelStyle),
-          ],
-        );
-      }
-      if (_malformedIds.contains(id)) {
-        return const Text('رسالة تالفة');
-      }
-      if (_permanentlyUnreadable.contains(id)) {
-        // Fix 5: the ciphertext was encrypted under a key that is gone
-        // for good (lost on reinstall / deleted by a reset). Label it
-        // permanently unreadable — with NO retry link, because no
-        // retry can ever succeed — and never show the "جارٍ فك
-        // التشفير…" spinner for it again.
-        return const Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('تعذّر فك تشفير هذه الرسالة نهائياً'),
-            Text('فُقد مفتاح تشفيرها ولا يمكن استرجاعها.',
-                style: labelStyle),
-          ],
-        );
-      }
-      if (_decryptFailed.contains(id)) {
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('تعذّر فك تشفير هذه الرسالة'),
-            const SizedBox(height: 2),
-            GestureDetector(
-              onTap: _retryDecryption,
-              child: const Text(
-                'إعادة المحاولة',
-                style: TextStyle(
-                    fontSize: 10,
-                    color: Colors.blue,
-                    decoration: TextDecoration.underline),
+      switch (encryptedRowBody(
+        row: row,
+        currentUserId: client.auth.currentUser?.id,
+        decrypted: _decrypted,
+        ownSentPlaintext: _ownSentPlaintext,
+        malformedIds: _malformedIds,
+        permanentlyUnreadable: _permanentlyUnreadable,
+        decryptFailed: _decryptFailed,
+      )) {
+        case EncryptedRowBody.decrypted:
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(_decrypted[id]!),
+              const Text('🔒 مشفّرة', style: labelStyle),
+            ],
+          );
+        case EncryptedRowBody.ownPlaintext:
+          // Own sent Signal message: shown from the plaintext stored
+          // on this device at send time — never re-decrypted.
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(_ownSentPlaintext[id]!),
+              const Text('🔒 مشفّرة', style: labelStyle),
+            ],
+          );
+        case EncryptedRowBody.ownPlaceholder:
+          // Own sent Signal message with no stored plaintext (sent
+          // from another device / local storage cleared): the
+          // placeholder, still with the encrypted label — never a
+          // decryption failure.
+          return const Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(encryptedMessagePlaceholder),
+              Text('🔒 مشفّرة', style: labelStyle),
+            ],
+          );
+        case EncryptedRowBody.malformed:
+          return const Text('رسالة تالفة');
+        case EncryptedRowBody.permanentlyUnreadable:
+          // Fix 5: the ciphertext was encrypted under a key that is
+          // gone for good (lost on reinstall / deleted by a reset).
+          // Label it permanently unreadable — with NO retry link,
+          // because no retry can ever succeed — and never show the
+          // "جارٍ فك التشفير…" spinner for it again. Signal rows
+          // never reach this state (bounded retry, then failed).
+          return const Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('تعذّر فك تشفير هذه الرسالة نهائياً'),
+              Text('فُقد مفتاح تشفيرها ولا يمكن استرجاعها.',
+                  style: labelStyle),
+            ],
+          );
+        case EncryptedRowBody.failed:
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('تعذّر فك تشفير هذه الرسالة'),
+              const SizedBox(height: 2),
+              GestureDetector(
+                onTap: _retryDecryption,
+                child: const Text(
+                  'إعادة المحاولة',
+                  style: TextStyle(
+                      fontSize: 10,
+                      color: Colors.blue,
+                      decoration: TextDecoration.underline),
+                ),
               ),
-            ),
-          ],
-        );
+            ],
+          );
+        case EncryptedRowBody.decrypting:
+          return const Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(encryptedMessagePlaceholder),
+              Text('جارٍ فك التشفير…', style: labelStyle),
+            ],
+          );
       }
-      return const Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(encryptedMessagePlaceholder),
-          Text('جارٍ فك التشفير…', style: labelStyle),
-        ],
-      );
     }
     // Plaintext message: show the body with a visible "not encrypted"
     // note, so the fallback is never silent. (System messages excluded.)
@@ -1643,6 +1868,12 @@ class _ChatPageState extends State<ChatPage> {
   /// false when no session could be established (no bundle, no
   /// devices, Signal unavailable) — the caller then falls back to
   /// plaintext. Never throws.
+  ///
+  /// The plaintext is also stored ON-DEVICE ONLY (see
+  /// [SentSignalPlaintextStore]) under the inserted row's id, so this
+  /// device can show its own sent message: a Signal sender cannot
+  /// decrypt their own outgoing ciphertext. The server only ever
+  /// holds the placeholder body + ciphertext.
   Future<bool> _trySendViaSignal(String body, String uid) async {
     final sync = _signalSync;
     final otherId = _otherUserId;
@@ -1652,17 +1883,31 @@ class _ChatPageState extends State<ChatPage> {
       for (final deviceUuid in _memberDeviceUuids(otherId)) {
         final result = await sync.encryptFor(otherId, deviceUuid, body);
         if (result == null) continue;
-        await client.from('messages').insert({
-          'conversation_id': widget.conversationId,
-          'sender_id': uid,
-          'body': encryptedMessagePlaceholder,
-          'message_type': 'text',
-          'is_encrypted': true,
-          'ciphertext': result.ciphertextBase64,
-          'signal_msg_type': result.isPreKeyMessage
-              ? signalMsgTypePreKey
-              : signalMsgTypeSignal,
-        });
+        final inserted = await client
+            .from('messages')
+            .insert({
+              'conversation_id': widget.conversationId,
+              'sender_id': uid,
+              'body': encryptedMessagePlaceholder,
+              'message_type': 'text',
+              'is_encrypted': true,
+              'ciphertext': result.ciphertextBase64,
+              'signal_msg_type': result.isPreKeyMessage
+                  ? signalMsgTypePreKey
+                  : signalMsgTypeSignal,
+            })
+            .select('id')
+            .single();
+        final messageId = inserted['id']?.toString() ?? '';
+        if (messageId.isNotEmpty) {
+          _ownSentPlaintext[messageId] = body;
+          try {
+            await sync.sentPlaintexts.save(messageId, body);
+          } catch (_) {
+            // Best-effort: the in-memory copy still shows it this
+            // session; the next reload falls back to the placeholder.
+          }
+        }
         if (mounted) {
           setState(() => _signalSessionReady = true);
         }

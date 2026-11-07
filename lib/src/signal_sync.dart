@@ -29,6 +29,7 @@
 ///   part of a bundle.
 library;
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -38,6 +39,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'e2ee.dart' show getDeviceId;
 import 'signal_service.dart';
+import 'signal_stores.dart';
 
 /// Deterministic Signal device number (1..127) for a Helba device uuid.
 ///
@@ -87,6 +89,38 @@ CiphertextMessageType? parseSignalMsgType(String? value) {
     signalMsgTypeSignal => CiphertextMessageType.signal,
     _ => null,
   };
+}
+
+/// Key for the locally stored plaintext of a Signal message this
+/// device sent.
+///
+/// The sender is the only party that can ever show its own sent
+/// messages: a Signal sender cannot decrypt their own outgoing
+/// ciphertext (the sending ratchet has moved on; the session holds
+/// the receiving chain for the peer, not the sender's own outgoing
+/// message keys). So the plaintext is kept ON-DEVICE ONLY, under a
+/// key namespaced away from the protocol stores (`signal:<uid>:...`).
+/// It is never sent to the server — the server only ever holds the
+/// ciphertext. Pure: unit-tested.
+String sentSignalPlaintextKey(String messageId) =>
+    'helba:sent-signal:$messageId';
+
+/// On-device-only store for the plaintext of Signal messages this
+/// device sent, backed by a [SignalKvStore] (secure storage in
+/// production, in-memory in tests). The chat shows an own sent Signal
+/// message from this store (see `isOwnSignalRow`); without a stored
+/// plaintext it shows the encrypted placeholder, never a decryption
+/// failure. Never touches the server.
+class SentSignalPlaintextStore {
+  SentSignalPlaintextStore(this._backend);
+
+  final SignalKvStore _backend;
+
+  Future<void> save(String messageId, String plaintext) =>
+      _backend.write(sentSignalPlaintextKey(messageId), plaintext);
+
+  Future<String?> read(String messageId) =>
+      _backend.read(sentSignalPlaintextKey(messageId));
 }
 
 /// Server-side bundle storage for one Signal device.
@@ -301,12 +335,56 @@ class SignalSync {
     required this.store,
     required this.userId,
     required this.deviceUuid,
+    required this.sentPlaintexts,
   });
 
   final SignalService service;
   final SignalBundleStore store;
   final String userId;
   final String deviceUuid;
+
+  /// On-device-only plaintexts of Signal messages this device sent.
+  final SentSignalPlaintextStore sentPlaintexts;
+
+  /// Serializes Signal operations per peer address: a session build
+  /// (claim + `processPreKeyBundle`) and a decrypt (`decryptPreKey`
+  /// / `decryptSignal`) for the SAME peer must not interleave, or the
+  /// session store can be left mid-write and the first pre-key
+  /// message fails to decrypt on arrival (the 13:27 race: both phones
+  /// built sessions at the same moment). The protocol itself handles
+  /// simultaneous initiation fine when operations are sequential
+  /// (verified by test); this lock keeps them sequential on-device.
+  /// Each operation waits only for the previous one for that peer to
+  /// finish (success or failure) — a failure never blocks the queue.
+  final Map<String, Future<void>> _peerQueues = {};
+
+  String _peerKey(String peerUserId, String peerDeviceUuid) =>
+      '$peerUserId::$peerDeviceUuid';
+
+  Future<T> _withPeerLock<T>(
+    String peerKey,
+    Future<T> Function() task,
+  ) async {
+    final previous = _peerQueues[peerKey];
+    final done = Completer<void>();
+    _peerQueues[peerKey] = done.future;
+    if (previous != null) {
+      try {
+        await previous;
+      } catch (_) {
+        // The previous operation's own caller saw its error; the
+        // queue itself always completes normally.
+      }
+    }
+    try {
+      return await task();
+    } finally {
+      if (identical(_peerQueues[peerKey], done.future)) {
+        _peerQueues.remove(peerKey);
+      }
+      done.complete();
+    }
+  }
 
   static bool _libSignalReady = false;
 
@@ -335,8 +413,9 @@ class SignalSync {
     if (uid == null) return null;
     if (!await _ensureLibSignalInit()) return null;
     final deviceUuid = await getDeviceId();
+    final secureStorage = storage ?? const FlutterSecureStorage();
     final service = SignalService.fromSecureStorage(
-      storage: storage ?? const FlutterSecureStorage(),
+      storage: secureStorage,
       prefix: 'signal:$uid',
       localName: uid,
       localDeviceId: signalDeviceNumber(deviceUuid),
@@ -346,6 +425,9 @@ class SignalSync {
       store: SupabaseSignalBundleStore(supabase),
       userId: uid,
       deviceUuid: deviceUuid,
+      sentPlaintexts: SentSignalPlaintextStore(
+        FlutterSecureStorageKvStore(secureStorage),
+      ),
     );
   }
 
@@ -515,8 +597,26 @@ class SignalSync {
   /// bundle and builds a session from it (X3DH + PQXDH). Returns
   /// false when the peer never published a bundle or on any error —
   /// never throws. A sender can therefore encrypt for a recipient who
-  /// is OFFLINE, with no manual reset.
+  /// is OFFLINE, with no manual reset. Serialized per peer (see
+  /// [_withPeerLock]) so it cannot interleave with a decrypt for the
+  /// same peer.
   Future<bool> ensureSessionFor(
+    String recipientUserId,
+    String recipientDeviceUuid,
+  ) {
+    return _withPeerLock(
+      _peerKey(recipientUserId, recipientDeviceUuid),
+      () => _ensureSessionForInternal(
+        recipientUserId,
+        recipientDeviceUuid,
+      ),
+    );
+  }
+
+  /// The unlocked session-ensure logic. Called directly only by
+  /// [ensureSessionFor] and [encryptFor], which already hold the
+  /// peer lock — never call it from outside the lock.
+  Future<bool> _ensureSessionForInternal(
     String recipientUserId,
     String recipientDeviceUuid,
   ) async {
@@ -538,62 +638,84 @@ class SignalSync {
   /// Encrypts [plaintext] for the peer device. Returns the base64
   /// Signal ciphertext plus whether it is a pre-key message (the
   /// first message on a fresh session), or null when no session can
-  /// be established. Never throws.
+  /// be established. Never throws. The ensure + encrypt run under
+  /// one peer lock so a concurrent decrypt cannot interleave with
+  /// the session ratchet.
   Future<({String ciphertextBase64, bool isPreKeyMessage})?> encryptFor(
     String recipientUserId,
     String recipientDeviceUuid,
     String plaintext,
-  ) async {
-    try {
-      final ready =
-          await ensureSessionFor(recipientUserId, recipientDeviceUuid);
-      if (!ready) return null;
-      final address = addressFor(recipientUserId, recipientDeviceUuid);
-      final message = await service.encryptText(address, plaintext);
-      return (
-        ciphertextBase64: base64Encode(message.ciphertext),
-        isPreKeyMessage: message.isPreKeyMessage,
-      );
-    } catch (_) {
-      return null;
-    }
+  ) {
+    return _withPeerLock(
+      _peerKey(recipientUserId, recipientDeviceUuid),
+      () async {
+        try {
+          final ready = await _ensureSessionForInternal(
+            recipientUserId,
+            recipientDeviceUuid,
+          );
+          if (!ready) return null;
+          final address =
+              addressFor(recipientUserId, recipientDeviceUuid);
+          final message = await service.encryptText(address, plaintext);
+          return (
+            ciphertextBase64: base64Encode(message.ciphertext),
+            isPreKeyMessage: message.isPreKeyMessage,
+          );
+        } catch (_) {
+          return null;
+        }
+      },
+    );
   }
 
   /// Decrypts a Signal message from the peer device. [isPreKeyMessage]
   /// selects the pre-key vs regular Signal decryption; when that
   /// fails, the other type is tried once (a stored type can be stale).
   /// Returns the plaintext, or null on failure. Never throws to the UI.
+  /// Serialized per peer (see [_withPeerLock]) so it cannot interleave
+  /// with a session build for the same peer.
+  ///
+  /// A failed attempt does NOT poison a later retry: the one-time
+  /// pre-key is only consumed on a successful decrypt, so a transient
+  /// failure (e.g. the simultaneous-initiation race) can be retried
+  /// and still succeeds — verified by test.
   Future<String?> decryptFrom(
     String senderUserId,
     String senderDeviceUuid,
     String ciphertextBase64,
     bool isPreKeyMessage,
-  ) async {
-    try {
-      final bytes = base64Decode(ciphertextBase64);
-      final address = addressFor(senderUserId, senderDeviceUuid);
-      final firstType = isPreKeyMessage
-          ? CiphertextMessageType.preKey
-          : CiphertextMessageType.signal;
-      final secondType = isPreKeyMessage
-          ? CiphertextMessageType.signal
-          : CiphertextMessageType.preKey;
-      try {
-        final plain = await service.decrypt(
-          address,
-          CiphertextMessage(type: firstType, ciphertext: bytes),
-        );
-        return utf8.decode(plain);
-      } catch (_) {
-        final plain = await service.decrypt(
-          address,
-          CiphertextMessage(type: secondType, ciphertext: bytes),
-        );
-        return utf8.decode(plain);
-      }
-    } catch (_) {
-      return null;
-    }
+  ) {
+    return _withPeerLock(
+      _peerKey(senderUserId, senderDeviceUuid),
+      () async {
+        try {
+          final bytes = base64Decode(ciphertextBase64);
+          final address = addressFor(senderUserId, senderDeviceUuid);
+          final firstType = isPreKeyMessage
+              ? CiphertextMessageType.preKey
+              : CiphertextMessageType.signal;
+          final secondType = isPreKeyMessage
+              ? CiphertextMessageType.signal
+              : CiphertextMessageType.preKey;
+          try {
+            final plain = await service.decrypt(
+              address,
+              CiphertextMessage(type: firstType, ciphertext: bytes),
+            );
+            return utf8.decode(plain);
+          } catch (_) {
+            final plain = await service.decrypt(
+              address,
+              CiphertextMessage(type: secondType, ciphertext: bytes),
+            );
+            return utf8.decode(plain);
+          }
+        } catch (_) {
+          return null;
+        }
+      },
+    );
   }
 
   /// Deletes the session for a peer device (the reset action for a
@@ -602,12 +724,17 @@ class SignalSync {
   Future<void> resetSessionFor(
     String recipientUserId,
     String recipientDeviceUuid,
-  ) async {
-    try {
-      await service.stores.session.deleteSession(
-        addressFor(recipientUserId, recipientDeviceUuid),
-      );
-    } catch (_) {}
+  ) {
+    return _withPeerLock(
+      _peerKey(recipientUserId, recipientDeviceUuid),
+      () async {
+        try {
+          await service.stores.session.deleteSession(
+            addressFor(recipientUserId, recipientDeviceUuid),
+          );
+        } catch (_) {}
+      },
+    );
   }
 }
 
