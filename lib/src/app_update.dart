@@ -21,8 +21,13 @@ import 'config.dart';
 // - Best-effort only: every failure (no network, API error, rate limit,
 //   malformed payload) is swallowed silently. The check never throws,
 //   never blocks startup, and never shows an error to the user.
-// - The check runs at most once per launch and at most once per day
-//   (last-check time persisted in secure storage).
+// - The check runs at most once per launch and at most once per hour
+//   (last-check time persisted in secure storage). A release push
+//   (GitHub webhook → github-release-notify Edge Function → FCM
+//   `app_update` message) bypasses the throttle: tapping it records
+//   the build as pending (see [AppUpdateStore.pendingBuild]) and the
+//   inbox shows the update dialog for it without waiting for the
+//   next hourly check.
 // - GitHub is reached DIRECTLY: the app installs a global HttpOverrides
 //   (network.dart) that routes traffic through the DoH fallback + system
 //   proxy for Supabase. That layer must not touch the update check, so
@@ -56,12 +61,23 @@ Future<T> _runDirect<T>(Future<T> Function() body) =>
 const latestReleaseUrl =
     'https://api.github.com/repos/abdo15542/helba/releases/latest';
 
-/// How often the app may check for an update (at most once per day).
-const updateCheckInterval = Duration(hours: 24);
+/// How often the app may check for an update (at most once per hour).
+/// One hour — not one day — so a build published the same day an
+/// earlier check already ran (e.g. build 136, hours after 135) is still
+/// picked up promptly when the inbox opens. The GitHub API is public
+/// and unauthenticated here, and one small call per hour per device is
+/// far inside its rate limit.
+const updateCheckInterval = Duration(hours: 1);
 
 /// Secure-storage keys (see config.dart secureStore).
 const _lastCheckKey = 'helba_update_last_check_ms';
 const _dismissedBuildKey = 'helba_update_dismissed_build';
+
+/// Build number recorded when the user taps an update push
+/// notification (FCM data type `app_update`, see push.dart). The inbox
+/// reads it first in `_checkForUpdate` and shows the update dialog for
+/// it without waiting for the hourly check.
+const _pendingBuildKey = 'helba_update_pending_build';
 
 /// A published build the app can update to.
 class UpdateInfo {
@@ -102,6 +118,51 @@ bool shouldPromptForUpdate({
   required int? dismissedBuild,
 }) =>
     dismissedBuild == null || dismissedBuild < update.buildNumber;
+
+/// The direct download URL for a build's APK on its GitHub release.
+/// This is the URL the workflow publishes: tag `build-<N>` with the
+/// single asset `helba-build-<N>.apk` (see .github/workflows/android.yml).
+/// Used for a pending update from a notification tap, where there is no
+/// release payload to pick the asset URL from (see [pendingUpdateInfo]).
+String releaseDownloadUrl(int build) =>
+    'https://github.com/abdo15542/helba/releases/download/build-$build/helba-build-$build.apk';
+
+/// The [UpdateInfo] for a pending build recorded from an update push
+/// notification tap: the tag and download URL follow the release
+/// naming, so the existing download/install flow works unchanged.
+UpdateInfo pendingUpdateInfo(int build) => UpdateInfo(
+      buildNumber: build,
+      tag: 'build-$build',
+      downloadUrl: releaseDownloadUrl(build),
+    );
+
+/// What the inbox should do with a pending update build recorded from
+/// a notification tap.
+enum PendingUpdateAction {
+  /// The pending build is newer than the installed one: show the
+  /// update dialog for it (bypassing the hourly throttle).
+  show,
+
+  /// The pending build is already installed (or older): clear it and
+  /// fall through to the normal hourly check.
+  clearAndSkip,
+
+  /// No pending build was recorded: run the normal hourly check.
+  none,
+}
+
+/// Decides what to do with a pending update build: [show] when it is
+/// newer than the installed build, [clearAndSkip] when it is not, and
+/// [none] when nothing was recorded. Pure (unit-tested).
+PendingUpdateAction pendingUpdateAction({
+  required int? pendingBuild,
+  required int installedBuild,
+}) {
+  if (pendingBuild == null) return PendingUpdateAction.none;
+  return pendingBuild > installedBuild
+      ? PendingUpdateAction.show
+      : PendingUpdateAction.clearAndSkip;
+}
 
 /// Picks the APK download URL from a GitHub release payload: the first
 /// asset whose name ends in `.apk` (browser_download_url, public, no
@@ -173,6 +234,20 @@ class AppUpdateStore {
 
   Future<void> saveDismissedBuild(int build) =>
       _write(_dismissedBuildKey, build.toString());
+
+  /// The build recorded from an update push notification tap, or null
+  /// when none was recorded. Written by push.dart when the app opens
+  /// via an `app_update` FCM message; read (and cleared) by the inbox
+  /// before the throttled check.
+  Future<int?> pendingBuild() async {
+    final raw = await _read(_pendingBuildKey);
+    return raw == null ? null : int.tryParse(raw);
+  }
+
+  Future<void> savePendingBuild(int build) =>
+      _write(_pendingBuildKey, build.toString());
+
+  Future<void> clearPendingBuild() => _write(_pendingBuildKey, '');
 }
 
 /// Outcome of handing a downloaded APK to the system installer.
@@ -228,7 +303,7 @@ class AppUpdateChecker {
 
   /// Checks the latest GitHub release for a build newer than
   /// [installedBuild]. Returns the [UpdateInfo] when one exists, else
-  /// null. Never throws. Runs at most once per day unless [force] is
+  /// null. Never throws. Runs at most once per hour unless [force] is
   /// true; the last-check time is only persisted when the API actually
   /// answered (a failed check retries on the next launch).
   Future<UpdateInfo?> checkForUpdate({

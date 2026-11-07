@@ -91,7 +91,8 @@ class _InboxPageState extends State<InboxPage> {
   // pattern as the denied-permission prompt above.
   bool _pushRegistrationPromptShown = false;
   // In-app update (app_update.dart): a newer published build, when the
-  // daily check finds one and the user has not dismissed that build.
+  // hourly check (or a tapped update push notification) finds one and
+  // the user has not dismissed that build.
   final _updateChecker = AppUpdateChecker();
   UpdateInfo? _availableUpdate;
   bool _updateDownloading = false;
@@ -104,6 +105,7 @@ class _InboxPageState extends State<InboxPage> {
     _subscribeInboxRealtime();
     pushNotificationsPermanentlyDenied.addListener(_onPushDeniedChanged);
     pushRegistrationWarning.addListener(_onPushRegistrationChanged);
+    pendingAppUpdateBuild.addListener(_onPendingAppUpdate);
     // The warning may already be set (registration failed before this
     // page was built): pick it up now, after the first frame.
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -114,15 +116,45 @@ class _InboxPageState extends State<InboxPage> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _checkForUpdate());
   }
 
-  /// Checks once per launch (throttled to once per day inside the
+  /// Checks once per launch (throttled to once per hour inside the
   /// checker) whether a newer build is published. On first sighting of
   /// a new version shows the banner + a dialog; a version the user
   /// dismissed with [لاحقاً] is never shown again.
+  ///
+  /// A build recorded from an update push notification tap is handled
+  /// FIRST, before the throttled check: if it is newer than the
+  /// installed build the dialog is shown for it right away (the tap is
+  /// user-initiated, so the throttle does not apply); if it is not
+  /// newer it is cleared and the normal check runs.
   Future<void> _checkForUpdate() async {
     try {
       final installed =
           int.tryParse((await PackageInfo.fromPlatform()).buildNumber) ?? 0;
       final dismissed = await _updateChecker.store.dismissedBuild();
+      final pending = await _updateChecker.store.pendingBuild();
+      if (pending != null) {
+        // The pending record is consumed either way: it must not be
+        // shown again on the next inbox open.
+        await _updateChecker.store.clearPendingBuild();
+        if (pendingUpdateAction(
+              pendingBuild: pending,
+              installedBuild: installed,
+            ) ==
+            PendingUpdateAction.show) {
+          final update = pendingUpdateInfo(pending);
+          if (!mounted) return;
+          if (shouldPromptForUpdate(
+            update: update,
+            dismissedBuild: dismissed,
+          )) {
+            setState(() => _availableUpdate = update);
+            _showUpdateDialog(update);
+          }
+          return;
+        }
+        // Pending build is already installed (or older): fall through
+        // to the normal check below.
+      }
       final update =
           await _updateChecker.checkForUpdate(installedBuild: installed);
       if (!mounted || update == null) return;
@@ -268,6 +300,17 @@ class _InboxPageState extends State<InboxPage> {
     // opened: the system installer takes over; nothing more to do here.
   }
 
+  /// An update push notification was tapped (or arrived in the
+  /// foreground) while this page is open: re-run the update check so
+  /// the dialog for the recorded build shows without waiting for the
+  /// next inbox open. The check reads the pending build first and
+  /// bypasses the hourly throttle.
+  void _onPendingAppUpdate() {
+    if (pendingAppUpdateBuild.value != null && mounted) {
+      unawaited(_checkForUpdate());
+    }
+  }
+
   /// One-time prompt when system notifications are permanently denied:
   /// without them, no alerts arrive while the app is closed. Offers a
   /// shortcut to the app's notification settings.
@@ -369,6 +412,7 @@ class _InboxPageState extends State<InboxPage> {
   void dispose() {
     pushNotificationsPermanentlyDenied.removeListener(_onPushDeniedChanged);
     pushRegistrationWarning.removeListener(_onPushRegistrationChanged);
+    pendingAppUpdateBuild.removeListener(_onPendingAppUpdate);
     _searchDebounce?.cancel();
     _realtimeDebounce?.cancel();
     final channel = _realtimeChannel;

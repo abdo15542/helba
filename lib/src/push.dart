@@ -9,6 +9,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'app_update.dart';
 import 'deeplink.dart';
 
 // ---------------------------------------------------------------------------
@@ -208,6 +209,52 @@ CallPushPayload? decodeCallPushPayload(String? payload) {
     return null;
   }
 }
+
+/// Parses an FCM data payload into a pending app-update build number,
+/// or null when it is not an update message (any other `type`, or a
+/// missing / non-numeric / non-positive `build`). The build must be a
+/// positive integer: a tap or a forged payload must never queue an
+/// update for a build that does not exist. Pure (no Firebase):
+/// unit-tested.
+int? parseAppUpdatePushData(Map<String, dynamic> data) {
+  if (data['type']?.toString() != 'app_update') return null;
+  final build = int.tryParse(data['build']?.toString().trim() ?? '');
+  if (build == null || build <= 0) return null;
+  return build;
+}
+
+/// Encodes an app-update build as the `payload` string of a local
+/// notification, so a tap can reconstruct it. JSON, mirroring
+/// [encodeCallPushPayload].
+String encodeAppUpdatePushPayload(int build) =>
+    jsonEncode({'type': 'app_update', 'build': build});
+
+/// Decodes a local-notification payload string into an app-update
+/// build number, or null when it is not one (e.g. a chat payload,
+/// which is a bare conversation id, or a call payload). Pure:
+/// unit-tested.
+int? decodeAppUpdatePushPayload(String? payload) {
+  if (payload == null || payload.isEmpty) return null;
+  try {
+    final decoded = jsonDecode(payload);
+    if (decoded is! Map<String, dynamic>) return null;
+    return parseAppUpdatePushData(decoded);
+  } catch (_) {
+    return null;
+  }
+}
+
+/// A build the user was notified about (FCM `app_update` message),
+/// waiting to be shown as an update dialog: set when the app opens via
+/// an update notification tap (background / cold start) or when one
+/// arrives in the foreground. The inbox observes this (see
+/// `_onPendingAppUpdate` in inbox.dart) and shows the dialog for the
+/// recorded build, then the stored pending build is cleared. Same
+/// pattern as [pendingChatId] / [pendingIncomingCallPush]: a
+/// ValueNotifier so any entry point can set it without a BuildContext.
+/// The durable record lives in [AppUpdateStore] (secure storage); this
+/// notifier is only the in-memory trigger.
+final ValueNotifier<int?> pendingAppUpdateBuild = ValueNotifier(null);
 
 /// An incoming call announced by a push, waiting to be handled: set when
 /// an FCM call message arrives (foreground) or is tapped (background /
@@ -513,6 +560,14 @@ Future<void> _setupLocalNotifications() async {
         pendingIncomingCallPush.value = call;
         return;
       }
+      final updateBuild = decodeAppUpdatePushPayload(payload);
+      if (updateBuild != null) {
+        // Tapping an update notification (shown as a local banner
+        // while the app was in the foreground) records the build; the
+        // inbox shows the update dialog for it.
+        unawaited(_recordPendingAppUpdate(updateBuild));
+        return;
+      }
       final conversationId = payload;
       if (isValidPushConversationId(conversationId)) {
         pendingChatId.value = conversationId;
@@ -699,6 +754,34 @@ Future<void> _showForegroundMessage(RemoteMessage message) async {
       );
       return;
     }
+    final updateBuild = parseAppUpdatePushData(data);
+    if (updateBuild != null) {
+      // An update push while the app is in the foreground: record the
+      // build (the inbox shows the dialog for it) and show the
+      // notification as a local banner, since FCM does not display one
+      // for foreground messages. Tapping it records the build again
+      // (idempotent) via the payload below.
+      unawaited(_recordPendingAppUpdate(updateBuild));
+      final title = message.notification?.title?.trim() ?? '';
+      final body = message.notification?.body?.trim() ?? '';
+      await _localNotifications.show(
+        id: stableNotificationId('helba-app-update'),
+        title: title.isNotEmpty ? title : 'تحديث جديد متاح',
+        body: body.isNotEmpty
+            ? body
+            : 'الإصدار $updateBuild من هلبة جاهز — اضغط للتحميل',
+        notificationDetails: const NotificationDetails(
+          android: AndroidNotificationDetails(
+            pushMessagesChannelId,
+            'رسائل هلبة',
+            importance: Importance.high,
+            priority: Priority.high,
+          ),
+        ),
+        payload: encodeAppUpdatePushPayload(updateBuild),
+      );
+      return;
+    }
     final conversationId = data['conversation_id']?.toString().trim() ?? '';
     if (!isValidPushConversationId(conversationId)) return;
     final senderId = data['sender_id']?.toString().trim() ?? '';
@@ -736,6 +819,23 @@ Future<void> _showForegroundMessage(RemoteMessage message) async {
   }
 }
 
+/// Records a build the user was notified about, so the inbox shows the
+/// update dialog for it: persists it in [AppUpdateStore] (secure
+/// storage — the durable record the inbox reads) and sets
+/// [pendingAppUpdateBuild] (the in-memory trigger the inbox observes).
+/// Best-effort and never throws: if the store write fails, the inbox's
+/// hourly check is the fallback. The store write completes before the
+/// notifier is set, so the inbox never observes a build the store does
+/// not hold yet.
+Future<void> _recordPendingAppUpdate(int build) async {
+  try {
+    await AppUpdateStore().savePendingBuild(build);
+    pendingAppUpdateBuild.value = build;
+  } catch (e) {
+    debugPrint('Helba push: failed to record pending update build: $e');
+  }
+}
+
 /// A notification tap (or a cold start from one) opens the chat. This
 /// only sets pendingChatId; AuthGate owns the actual navigation (see
 /// auth.dart), so the tap path and the `helba://chat/<id>` link share one
@@ -745,7 +845,16 @@ Future<void> _showForegroundMessage(RemoteMessage message) async {
 /// A call message tap instead queues [pendingIncomingCallPush]:
 /// CallService opens the incoming call screen once the user is signed
 /// in (see startListening in calls.dart).
+///
+/// An update message tap instead records the build
+/// ([_recordPendingAppUpdate]): the inbox shows the update dialog for
+/// it, bypassing the hourly throttle.
 void _openChatFromMessage(RemoteMessage message) {
+  final updateBuild = parseAppUpdatePushData(message.data);
+  if (updateBuild != null) {
+    unawaited(_recordPendingAppUpdate(updateBuild));
+    return;
+  }
   final call = parseCallPushData(message.data);
   if (call != null) {
     final currentUserId = Supabase.instance.client.auth.currentUser?.id;
