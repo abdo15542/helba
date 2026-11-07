@@ -163,6 +163,79 @@ void main() {
           isFalse);
     });
 
+    test('shouldPollFallbackMessages: only when fallback active and foregrounded',
+        () {
+      // The fallback poll keeps the list fresh while the Realtime
+      // stream is down; it must not run when the stream is healthy
+      // (no fallback) or while the app is in the background.
+      expect(fallbackPollInterval, const Duration(seconds: 5));
+      expect(
+          shouldPollFallbackMessages(
+              fallbackActive: true, isForeground: true),
+          isTrue);
+      expect(
+          shouldPollFallbackMessages(
+              fallbackActive: false, isForeground: true),
+          isFalse);
+      expect(
+          shouldPollFallbackMessages(
+              fallbackActive: true, isForeground: false),
+          isFalse);
+      expect(
+          shouldPollFallbackMessages(
+              fallbackActive: false, isForeground: false),
+          isFalse);
+    });
+
+    test('shouldRunFallbackPollTick: skips while a fetch is in flight', () {
+      // A second tick while one fetch is loading is skipped — no
+      // overlapping fetches.
+      expect(
+          shouldRunFallbackPollTick(
+              fallbackActive: true,
+              validConversationId: true,
+              fallbackLoading: false),
+          isTrue);
+      expect(
+          shouldRunFallbackPollTick(
+              fallbackActive: true,
+              validConversationId: true,
+              fallbackLoading: true),
+          isFalse);
+      // No fallback active (stream healthy) or bad conversation id:
+      // no tick.
+      expect(
+          shouldRunFallbackPollTick(
+              fallbackActive: false,
+              validConversationId: true,
+              fallbackLoading: false),
+          isFalse);
+      expect(
+          shouldRunFallbackPollTick(
+              fallbackActive: true,
+              validConversationId: false,
+              fallbackLoading: false),
+          isFalse);
+    });
+
+    test('fallbackRowsChanged: ids and count only', () {
+      Map<String, dynamic> row(String id) => {'id': id};
+      final a = [row('m1'), row('m2')];
+      // Identical rows: no update (no rebuild, no decryption re-run).
+      expect(fallbackRowsChanged(a, [row('m1'), row('m2')]), isFalse);
+      expect(fallbackRowsChanged(<Map<String, dynamic>>[], []), isFalse);
+      // A new row appended: update.
+      expect(fallbackRowsChanged(a, [row('m1'), row('m2'), row('m3')]),
+          isTrue);
+      // A row removed: update.
+      expect(fallbackRowsChanged(a, [row('m1')]), isTrue);
+      // Same count but a different id (row replaced): update.
+      expect(fallbackRowsChanged(a, [row('m1'), row('m9')]), isTrue);
+      // Same ids in a different order: update (order is by
+      // created_at; a reorder means the list changed).
+      expect(fallbackRowsChanged(a, [row('m2'), row('m1')]), isTrue);
+    });
+
     test('encryptedRowBody: own Signal rows never show a failure', () {
       const me = 'user-me';
       const peer = 'user-peer';
