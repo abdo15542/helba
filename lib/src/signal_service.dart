@@ -256,6 +256,110 @@ class SignalService {
     return utf8.decode(await decrypt(remote, message));
   }
 
+  /// Generates [count] fresh one-time pre-keys and [count] fresh
+  /// one-time Kyber pre-keys, stores the private parts, and returns
+  /// the public material to publish (to the server, so senders can
+  /// claim them). Ids come from the same monotonic counters as
+  /// [generateBundle], so a batch never overwrites keys already
+  /// published. Used by the sync layer to top the server up to a
+  /// healthy one-time pre-key count without minting a new signed
+  /// pre-key for every key.
+  Future<({
+    List<({int id, Uint8List publicKey})> preKeys,
+    List<({int id, Uint8List publicKey, List<int> signature})>
+        kyberPreKeys,
+  })> generateOneTimePreKeyBatch({required int count}) async {
+    final identity = await stores.identity.getIdentityKeyPair();
+    final now = BigInt.from(DateTime.now().millisecondsSinceEpoch);
+    final preKeys = <({int id, Uint8List publicKey})>[];
+    for (var i = 0; i < count; i++) {
+      final id = await _nextId('prekey');
+      final private = PrivateKey.generate();
+      await stores.preKey.storePreKey(
+        id,
+        PreKeyRecord(
+          id: id,
+          publicKey: private.getPublicKey(),
+          privateKey: private,
+        ),
+      );
+      preKeys.add((id: id, publicKey: private.getPublicKey().serialize()));
+    }
+    final kyberPreKeys =
+        <({int id, Uint8List publicKey, List<int> signature})>[];
+    for (var i = 0; i < count; i++) {
+      final id = await _nextId('kyberprekey');
+      final pair = KyberKeyPair.generate();
+      final signature = identity.sign(
+        message: pair.getPublicKey().serialize().toList(),
+      );
+      await stores.kyberPreKey.storeKyberPreKey(
+        id,
+        KyberPreKeyRecord.create(
+          id: id,
+          timestamp: now,
+          keyPair: pair,
+          signature: signature,
+        ),
+      );
+      await stores.kyberPreKey.setKyberPreKeyKind(id, isLastResort: false);
+      await stores.kyberPreKey.storeSignature(id, signature);
+      kyberPreKeys.add((
+        id: id,
+        publicKey: pair.getPublicKey().serialize(),
+        signature: signature,
+      ));
+    }
+    return (preKeys: preKeys, kyberPreKeys: kyberPreKeys);
+  }
+
+  /// Ensures a last-resort Kyber pre-key exists and returns its public
+  /// material: a Kyber key that is never consumed, so a bundle always
+  /// carries a Kyber pre-key even after every one-time Kyber key is
+  /// claimed (libsignal rejects a bundle without one). Returns the
+  /// existing last-resort key when one is already stored instead of
+  /// minting a second one.
+  Future<({int id, Uint8List publicKey, List<int> signature})>
+      ensureLastResortKyberPreKey() async {
+    final ids = await stores.kyberPreKey.getAllKyberPreKeyIds();
+    ids.sort();
+    for (final id in ids) {
+      if (!await stores.kyberPreKey.isLastResortKyberPreKey(id)) continue;
+      final record = await stores.kyberPreKey.loadKyberPreKey(id);
+      final signature = await stores.kyberPreKey.loadSignature(id);
+      if (record != null && signature != null) {
+        return (
+          id: id,
+          publicKey: record.getPublicKey().serialize(),
+          signature: signature,
+        );
+      }
+    }
+    final identity = await stores.identity.getIdentityKeyPair();
+    final now = BigInt.from(DateTime.now().millisecondsSinceEpoch);
+    final id = await _nextId('kyberprekey');
+    final pair = KyberKeyPair.generate();
+    final signature = identity.sign(
+      message: pair.getPublicKey().serialize().toList(),
+    );
+    await stores.kyberPreKey.storeKyberPreKey(
+      id,
+      KyberPreKeyRecord.create(
+        id: id,
+        timestamp: now,
+        keyPair: pair,
+        signature: signature,
+      ),
+    );
+    await stores.kyberPreKey.setKyberPreKeyKind(id, isLastResort: true);
+    await stores.kyberPreKey.storeSignature(id, signature);
+    return (
+      id: id,
+      publicKey: pair.getPublicKey().serialize(),
+      signature: signature,
+    );
+  }
+
   /// Next id for a pre-key kind: one past the highest id already
   /// stored, so a fresh bundle mints new keys instead of overwriting
   /// the published ones. Starts at 1.
