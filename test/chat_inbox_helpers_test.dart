@@ -33,6 +33,40 @@ void main() {
       expect(isMalformedEncryptedRow({'ciphertext': ''}), isFalse);
     });
 
+    test('isMalformedEncryptedRow: Signal rows need no nonce', () {
+      // Signal rows carry the nonce inside the serialized ciphertext,
+      // so their nonce column is NULL by design — that is not
+      // malformed. Only an empty ciphertext (or a missing/invalid
+      // signal_msg_type) is malformed for a Signal row.
+      expect(
+          isMalformedEncryptedRow({
+            'is_encrypted': true,
+            'ciphertext': 'abc',
+            'signal_msg_type': 'prekey',
+          }),
+          isFalse);
+      expect(
+          isMalformedEncryptedRow({
+            'is_encrypted': true,
+            'ciphertext': 'abc',
+            'signal_msg_type': 'signal',
+          }),
+          isFalse);
+      expect(
+          isMalformedEncryptedRow({
+            'is_encrypted': true,
+            'ciphertext': '',
+            'signal_msg_type': 'prekey',
+          }),
+          isTrue);
+      // An encrypted row with no signal type and no nonce is an old
+      // E2E row missing its nonce — still malformed.
+      expect(
+          isMalformedEncryptedRow(
+              {'is_encrypted': true, 'ciphertext': 'abc'}),
+          isTrue);
+    });
+
     test('asUuidOrNull rejects null and the literal string "null"', () {
       expect(asUuidOrNull(null), isNull);
       expect(asUuidOrNull('null'), isNull);
