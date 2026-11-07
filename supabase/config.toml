@@ -12,19 +12,28 @@
 # rejected 401 at the gateway and no closed-app message push ever
 # arrived, while the function's own secret check never even ran.
 #
-# So: verify_jwt is OFF for send-message-push ONLY. The function's own
-# `x-helba-push-secret` check (fail-closed 401 when PUSH_TRIGGER_SECRET
-# is unset or the header mismatches) is the authentication — anyone who
-# knows the URL can reach the handler, but without the secret they get
-# 401 and no push is sent. Do NOT turn verify_jwt off for
-# send-call-push: the app calls it with the caller's user JWT, and its
-# handler verifies that JWT against the calls row.
+# So: verify_jwt is OFF for send-message-push AND github-release-notify
+# ONLY. The first is called by the database trigger (no user JWT — it
+# authenticates with the shared `x-helba-push-secret` header instead);
+# the second is called by a GitHub webhook (no user JWT either — it
+# authenticates with the HMAC signature in `X-Hub-Signature-256`,
+# checked against GITHUB_WEBHOOK_SECRET). Each function's own check
+# (fail-closed 401 when its secret is unset or the credential
+# mismatches) is the authentication — anyone who knows the URL can
+# reach the handler, but without the credential they get 401 and no
+# push is sent. Do NOT turn verify_jwt off for send-call-push: the app
+# calls it with the caller's user JWT, and its handler verifies that
+# JWT against the calls row.
 #
 # After adding or changing this file, the affected function MUST be
 # redeployed for the setting to take effect:
 #   supabase functions deploy send-message-push
+#   supabase functions deploy github-release-notify
 # (Deploying without this file — or with `--no-verify-jwt` only on one
 # deploy — silently re-enables the 401s on the next deploy.)
 
 [functions.send-message-push]
+verify_jwt = false
+
+[functions.github-release-notify]
 verify_jwt = false
