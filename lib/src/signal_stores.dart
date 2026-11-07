@@ -477,6 +477,12 @@ class SignalKyberPreKeyStore implements KyberPreKeyStore {
     );
   }
 
+  /// True when the Kyber pre-key was recorded as the last-resort key
+  /// (never consumed). A key with no kind recorded is one-time.
+  Future<bool> isLastResortKyberPreKey(int kyberPreKeyId) async {
+    return await _backend.read(_kindKey(kyberPreKeyId)) == 'lastresort';
+  }
+
   /// Stores the identity signature for a Kyber pre-key, so a
   /// [PreKeyBundle] can be rebuilt from stored keys (the record
   /// itself exposes no signature getter).
