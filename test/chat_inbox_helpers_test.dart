@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:helba/src/chat.dart';
@@ -143,6 +144,22 @@ void main() {
           isTrue);
       expect(signalDecryptShouldRetry(maxSignalDecryptAttempts), isFalse);
       expect(signalDecryptShouldRetry(maxSignalDecryptAttempts + 5),
+          isFalse);
+    });
+
+    test('shouldRefreshMessagesOnResume: only resumed refreshes', () {
+      // A silently disconnected Realtime stream freezes the list
+      // (rows that arrived while away never appear); rebuilding it on
+      // resume re-runs the initial query so the list catches up.
+      expect(shouldRefreshMessagesOnResume(AppLifecycleState.resumed),
+          isTrue);
+      expect(shouldRefreshMessagesOnResume(AppLifecycleState.inactive),
+          isFalse);
+      expect(shouldRefreshMessagesOnResume(AppLifecycleState.paused),
+          isFalse);
+      expect(shouldRefreshMessagesOnResume(AppLifecycleState.hidden),
+          isFalse);
+      expect(shouldRefreshMessagesOnResume(AppLifecycleState.detached),
           isFalse);
     });
 
