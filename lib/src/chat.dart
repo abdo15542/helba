@@ -2260,8 +2260,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// The message list for a set of rows, with the decrypt/scroll
   /// post-frame work scheduled ONLY when the row count or the set of
   /// encrypted ids actually changed (M-9: not on every build).
-  Widget _buildMessageList(List<Map<String, dynamic>> rows,
-      {bool showLiveHint = false}) {
+  Widget _buildMessageList(List<Map<String, dynamic>> rows) {
     _lastRows = rows;
     final encryptedIds = rows
         .where((row) => isEncryptedMessage(row))
@@ -2366,17 +2365,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       },
       ),
     );
-    if (!showLiveHint) return list;
-    return Column(children: [
-      Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        color: const Color(0xFFFFF3CD),
-        child: const Text('التحديثات الحية غير متصلة — تُعرض الرسائل المحفوظة.',
-            style: TextStyle(fontSize: 12)),
-      ),
-      Expanded(child: list),
-    ]);
+    return list;
   }
 
   @override
@@ -2521,8 +2510,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
             }
             if (snap.hasError) {
               if (_fallbackRows != null) {
-                return _buildMessageList(_fallbackRows!,
-                    showLiveHint: true);
+                return _buildMessageList(_fallbackRows!);
               }
               if (!_fallbackLoading) {
                 WidgetsBinding.instance.addPostFrameCallback(
