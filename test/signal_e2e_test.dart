@@ -276,6 +276,7 @@ SignalSync _makeSync(
     store: store,
     userId: userId,
     deviceUuid: deviceUuid,
+    sentPlaintexts: SentSignalPlaintextStore(backend),
   );
 }
 
@@ -810,6 +811,207 @@ void main() {
         ),
         'signal msg',
       );
+    });
+  });
+
+  group('sent plaintext store', () {
+    test('save/read round-trip; missing id is null', () async {
+      final backend = MemoryKvStore();
+      final store = SentSignalPlaintextStore(backend);
+      expect(await store.read('msg-1'), isNull);
+      await store.save('msg-1', 'hello from me');
+      expect(await store.read('msg-1'), 'hello from me');
+      // A different id is unaffected.
+      expect(await store.read('msg-2'), isNull);
+      await store.save('msg-2', 'second');
+      expect(await store.read('msg-1'), 'hello from me');
+      expect(await store.read('msg-2'), 'second');
+    });
+
+    test('keys are namespaced away from the protocol stores', () {
+      expect(sentSignalPlaintextKey('abc'), 'helba:sent-signal:abc');
+      expect(sentSignalPlaintextKey('abc'),
+          isNot(sentSignalPlaintextKey('def')));
+      expect(sentSignalPlaintextKey('abc'), isNot(startsWith('signal:')));
+    });
+  });
+
+  group('simultaneous initiation (13:27 race)', () {
+    test('both sides claim first, then cross messages all decrypt',
+        timeout: const Timeout(Duration(minutes: 2)), () async {
+      await LibSignal.init();
+
+      final store = FakeSignalBundleStore();
+      const aliceDevice = 'alice-race-device-uuid-0001';
+      const bobDevice = 'bob-race-device-uuid-0001';
+      final alice = _makeSync(MemoryKvStore(),
+          userId: 'alice', deviceUuid: aliceDevice, store: store);
+      final bob = _makeSync(MemoryKvStore(),
+          userId: 'bob', deviceUuid: bobDevice, store: store);
+      await alice.ensurePublished(minOneTimePreKeys: 5, minKyberPreKeys: 2);
+      await bob.ensurePublished(minOneTimePreKeys: 5, minKyberPreKeys: 2);
+
+      // 13:27:37 — Alice claims Bob's bundle (initiator session).
+      expect(await alice.ensureSessionFor('bob', bobDevice), isTrue);
+      // 13:27:43 — Bob claims Alice's bundle (initiator session).
+      expect(await bob.ensureSessionFor('alice', aliceDevice), isTrue);
+
+      // 13:27:46 — Bob's first (pre-key) message decrypts on Alice.
+      final bobFirst =
+          await bob.encryptFor('alice', aliceDevice, 'first from bob');
+      expect(bobFirst, isNotNull);
+      expect(
+        await alice.decryptFrom('bob', bobDevice, bobFirst!.ciphertextBase64,
+            bobFirst.isPreKeyMessage),
+        'first from bob',
+      );
+
+      // 13:27:57 — Alice's message decrypts on Bob.
+      final aliceFirst =
+          await alice.encryptFor('bob', bobDevice, 'first from alice');
+      expect(aliceFirst, isNotNull);
+      expect(
+        await bob.decryptFrom('alice', aliceDevice,
+            aliceFirst!.ciphertextBase64, aliceFirst.isPreKeyMessage),
+        'first from alice',
+      );
+
+      // 13:51 — follow-ups both ways still decrypt.
+      final bobSecond =
+          await bob.encryptFor('alice', aliceDevice, 'second from bob');
+      expect(
+        await alice.decryptFrom('bob', bobDevice,
+            bobSecond!.ciphertextBase64, bobSecond.isPreKeyMessage),
+        'second from bob',
+      );
+      final aliceSecond =
+          await alice.encryptFor('bob', bobDevice, 'second from alice');
+      expect(
+        await bob.decryptFrom('alice', aliceDevice,
+            aliceSecond!.ciphertextBase64, aliceSecond.isPreKeyMessage),
+        'second from alice',
+      );
+    });
+
+    test('a never-decrypted pre-key message is still recoverable later',
+        timeout: const Timeout(Duration(minutes: 2)), () async {
+      await LibSignal.init();
+
+      final store = FakeSignalBundleStore();
+      const aliceDevice = 'alice-rec-device-uuid-0001';
+      const bobDevice = 'bob-rec-device-uuid-0001';
+      final alice = _makeSync(MemoryKvStore(),
+          userId: 'alice', deviceUuid: aliceDevice, store: store);
+      final bob = _makeSync(MemoryKvStore(),
+          userId: 'bob', deviceUuid: bobDevice, store: store);
+      await alice.ensurePublished(minOneTimePreKeys: 5, minKyberPreKeys: 2);
+      await bob.ensurePublished(minOneTimePreKeys: 5, minKyberPreKeys: 2);
+
+      // Bob initiates; Alice does NOT decrypt M1 yet (the transient
+      // on-device failure).
+      final m1 = await bob.encryptFor('alice', aliceDevice, 'M1 prekey');
+      expect(m1, isNotNull);
+
+      // Meanwhile Alice builds an initiator session and sends; Bob
+      // decrypts it; Bob sends M2 and Alice decrypts it (the session
+      // ratchets forward).
+      expect(await alice.ensureSessionFor('bob', bobDevice), isTrue);
+      final a1 = await alice.encryptFor('bob', bobDevice, 'A1 from alice');
+      expect(
+        await bob.decryptFrom('alice', aliceDevice, a1!.ciphertextBase64,
+            a1.isPreKeyMessage),
+        'A1 from alice',
+      );
+      final m2 = await bob.encryptFor('alice', aliceDevice, 'M2 signal');
+      expect(
+        await alice.decryptFrom('bob', bobDevice, m2!.ciphertextBase64,
+            m2.isPreKeyMessage),
+        'M2 signal',
+      );
+
+      // Retrying M1 now still succeeds: a failed/deferred first
+      // decrypt does not make the message unrecoverable.
+      expect(
+        await alice.decryptFrom('bob', bobDevice, m1!.ciphertextBase64,
+            m1.isPreKeyMessage),
+        'M1 prekey',
+      );
+    });
+
+    test('a failed pre-key decrypt attempt does not poison the retry',
+        timeout: const Timeout(Duration(minutes: 2)), () async {
+      await LibSignal.init();
+
+      final store = FakeSignalBundleStore();
+      const aliceDevice = 'alice-poison-device-uuid-0001';
+      const bobDevice = 'bob-poison-device-uuid-0001';
+      final alice = _makeSync(MemoryKvStore(),
+          userId: 'alice', deviceUuid: aliceDevice, store: store);
+      final bob = _makeSync(MemoryKvStore(),
+          userId: 'bob', deviceUuid: bobDevice, store: store);
+      await alice.ensurePublished(minOneTimePreKeys: 5, minKyberPreKeys: 2);
+      await bob.ensurePublished(minOneTimePreKeys: 5, minKyberPreKeys: 2);
+
+      final m1 = await bob.encryptFor('alice', aliceDevice, 'M1 prekey');
+      expect(m1, isNotNull);
+      // Tampered ciphertext fails (both types tried, both fail).
+      final bytes = base64Decode(m1!.ciphertextBase64);
+      final tampered = Uint8List.fromList(bytes);
+      tampered[tampered.length - 1] ^= 0xFF;
+      expect(
+        await alice.decryptFrom(
+            'bob', bobDevice, base64Encode(tampered), m1.isPreKeyMessage),
+        isNull,
+      );
+      // Retrying the ORIGINAL ciphertext still succeeds: the failed
+      // attempt did not consume the one-time pre-key.
+      expect(
+        await alice.decryptFrom('bob', bobDevice, m1.ciphertextBase64,
+            m1.isPreKeyMessage),
+        'M1 prekey',
+      );
+
+      // The wrong-type flag still decrypts via the fallback attempt.
+      final m2 = await bob.encryptFor('alice', aliceDevice, 'M2 prekey');
+      expect(
+        await alice.decryptFrom(
+            'bob', bobDevice, m2!.ciphertextBase64, false),
+        'M2 prekey',
+      );
+    });
+
+    test('concurrent encrypts for the same peer all stay decryptable',
+        timeout: const Timeout(Duration(minutes: 2)), () async {
+      await LibSignal.init();
+
+      final store = FakeSignalBundleStore();
+      const aliceDevice = 'alice-conc-device-uuid-0001';
+      const bobDevice = 'bob-conc-device-uuid-0001';
+      final alice = _makeSync(MemoryKvStore(),
+          userId: 'alice', deviceUuid: aliceDevice, store: store);
+      final bob = _makeSync(MemoryKvStore(),
+          userId: 'bob', deviceUuid: bobDevice, store: store);
+      await alice.ensurePublished(minOneTimePreKeys: 5, minKyberPreKeys: 2);
+      await bob.ensurePublished(minOneTimePreKeys: 5, minKyberPreKeys: 2);
+
+      // Fire five encrypts concurrently (the per-peer lock serializes
+      // the session ratchet writes); every message must still decrypt
+      // in order on Bob.
+      final encrypted = await Future.wait([
+        for (var i = 0; i < 5; i++)
+          alice.encryptFor('bob', bobDevice, 'concurrent $i'),
+      ]);
+      for (final e in encrypted) {
+        expect(e, isNotNull);
+      }
+      for (var i = 0; i < 5; i++) {
+        final e = encrypted[i]!;
+        expect(
+          await bob.decryptFrom(
+              'alice', aliceDevice, e.ciphertextBase64, e.isPreKeyMessage),
+          'concurrent $i',
+        );
+      }
     });
   });
 }

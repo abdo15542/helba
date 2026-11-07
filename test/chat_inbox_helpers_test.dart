@@ -103,6 +103,97 @@ void main() {
       expect(plaintextBannerMessage({}),
           '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح');
     });
+
+    test('isOwnSignalRow: only own Signal rows', () {
+      const me = 'user-me';
+      const peer = 'user-peer';
+      final ownSignal = {
+        'id': 'm1',
+        'sender_id': me,
+        'is_encrypted': true,
+        'signal_msg_type': 'prekey',
+        'ciphertext': 'abc',
+      };
+      expect(isOwnSignalRow(ownSignal, me), isTrue);
+      // The peer's Signal row is not own.
+      expect(
+          isOwnSignalRow({...ownSignal, 'sender_id': peer}, me), isFalse);
+      // Own OLD-E2E row is not a Signal row (shared key: the sender
+      // CAN decrypt it), so it must still go through decryption.
+      expect(
+          isOwnSignalRow({
+            'id': 'm2',
+            'sender_id': me,
+            'is_encrypted': true,
+            'ciphertext': 'abc',
+            'nonce': 'xyz',
+          }, me),
+          isFalse);
+      // Plaintext and no-user cases are not own Signal rows.
+      expect(isOwnSignalRow({'sender_id': me}, me), isFalse);
+      expect(isOwnSignalRow(ownSignal, null), isFalse);
+      expect(isOwnSignalRow(ownSignal, ''), isFalse);
+      expect(isOwnSignalRow(ownSignal, peer), isFalse);
+    });
+
+    test('signalDecryptShouldRetry: bounded budget', () {
+      expect(signalDecryptShouldRetry(0), isTrue);
+      expect(signalDecryptShouldRetry(1), isTrue);
+      expect(signalDecryptShouldRetry(maxSignalDecryptAttempts - 1),
+          isTrue);
+      expect(signalDecryptShouldRetry(maxSignalDecryptAttempts), isFalse);
+      expect(signalDecryptShouldRetry(maxSignalDecryptAttempts + 5),
+          isFalse);
+    });
+
+    test('encryptedRowBody: own Signal rows never show a failure', () {
+      const me = 'user-me';
+      const peer = 'user-peer';
+      final ownSignal = {
+        'id': 'm1',
+        'sender_id': me,
+        'is_encrypted': true,
+        'signal_msg_type': 'signal',
+        'ciphertext': 'abc',
+      };
+      EncryptedRowBody body(Map<String, dynamic> row,
+              {Map<String, String> own = const {},
+              Set<String> permanent = const {},
+              Set<String> failed = const {},
+              Map<String, String> decrypted = const {}}) =>
+          encryptedRowBody(
+            row: row,
+            currentUserId: me,
+            decrypted: decrypted,
+            ownSentPlaintext: own,
+            malformedIds: const {},
+            permanentlyUnreadable: permanent,
+            decryptFailed: failed,
+          );
+
+      // Own Signal row WITH a stored plaintext: show it.
+      expect(body(ownSignal, own: {'m1': 'hello'}),
+          EncryptedRowBody.ownPlaintext);
+      // Own Signal row WITHOUT a stored plaintext: placeholder, not a
+      // failure — even if it somehow landed in a failure set.
+      expect(body(ownSignal), EncryptedRowBody.ownPlaceholder);
+      expect(body(ownSignal, permanent: {'m1'}),
+          EncryptedRowBody.ownPlaceholder);
+      expect(body(ownSignal, failed: {'m1'}),
+          EncryptedRowBody.ownPlaceholder);
+      // A peer Signal row with a decrypted body shows it.
+      final peerSignal = {...ownSignal, 'sender_id': peer};
+      expect(body(peerSignal, decrypted: {'m1': 'hi'}),
+          EncryptedRowBody.decrypted);
+      // A peer Signal row with no decrypted body is still decrypting
+      // (pending), not permanently unreadable.
+      expect(body(peerSignal), EncryptedRowBody.decrypting);
+      // ...unless it is in a failure set: failed (retryable) or, for
+      // old-E2E rows, permanently unreadable.
+      expect(body(peerSignal, failed: {'m1'}), EncryptedRowBody.failed);
+      expect(body(peerSignal, permanent: {'m1'}),
+          EncryptedRowBody.permanentlyUnreadable);
+    });
   });
 
   group('inbox helpers', () {
