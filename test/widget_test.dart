@@ -299,6 +299,59 @@ void main() {
       expect(isValidPushToken(null), isFalse);
       expect(isValidPushToken('eXaMpLeToKeN:APA91b...'), isTrue);
     });
+
+    test('parseAppUpdatePushData accepts only app_update with a build',
+        () {
+      expect(
+        parseAppUpdatePushData({'type': 'app_update', 'build': '137'}),
+        137,
+      );
+      expect(
+        parseAppUpdatePushData({'type': 'app_update', 'build': 137}),
+        137,
+      );
+      expect(parseAppUpdatePushData({'type': 'app_update'}), isNull);
+      expect(
+        parseAppUpdatePushData({'type': 'app_update', 'build': 'x'}),
+        isNull,
+      );
+      expect(
+        parseAppUpdatePushData({'type': 'app_update', 'build': '0'}),
+        isNull,
+      );
+      expect(
+        parseAppUpdatePushData({'type': 'app_update', 'build': '-3'}),
+        isNull,
+      );
+      expect(
+        parseAppUpdatePushData(
+            {'type': 'message', 'build': '137', 'conversation_id': 'x'}),
+        isNull,
+      );
+      expect(parseAppUpdatePushData({}), isNull);
+    });
+
+    test('app_update local-notification payload round-trips', () {
+      final payload = encodeAppUpdatePushPayload(137);
+      expect(decodeAppUpdatePushPayload(payload), 137);
+      expect(decodeAppUpdatePushPayload(null), isNull);
+      expect(decodeAppUpdatePushPayload(''), isNull);
+      expect(decodeAppUpdatePushPayload('not json'), isNull);
+      // A chat payload (a bare conversation id) is not an update.
+      expect(
+        decodeAppUpdatePushPayload('123e4567-e89b-12d3-a456-426614174000'),
+        isNull,
+      );
+      // A call payload is not an update either.
+      expect(
+        decodeAppUpdatePushPayload(jsonEncode({
+          'type': 'call',
+          'call_id': '123e4567-e89b-12d3-a456-426614174000',
+          'caller_id': '123e4567-e89b-12d3-a456-426614174001',
+        })),
+        isNull,
+      );
+    });
   });
 
   group('stories helpers', () {

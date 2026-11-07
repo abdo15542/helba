@@ -33,6 +33,7 @@ void main() {
       expect(parseBuildTag('build-0'), 0);
       expect(parseBuildTag('build-1000000'), 1000000);
       expect(parseBuildTag('  build-99  '), 99);
+      expect(parseBuildTag('build-137'), 137);
     });
 
     test('rejects malformed tags', () {
@@ -41,9 +42,63 @@ void main() {
       expect(parseBuildTag('v1.0'), isNull);
       expect(parseBuildTag('build-'), isNull);
       expect(parseBuildTag('build-abc'), isNull);
+      expect(parseBuildTag('build-x'), isNull);
       expect(parseBuildTag('build-9a'), isNull);
       expect(parseBuildTag('Build-99'), isNull);
       expect(parseBuildTag('build-99-extra'), isNull);
+    });
+  });
+
+  group('pendingUpdateAction', () {
+    test('pending build newer than installed -> show', () {
+      expect(
+        pendingUpdateAction(pendingBuild: 137, installedBuild: 136),
+        PendingUpdateAction.show,
+      );
+    });
+
+    test('pending build same or older than installed -> clear and skip',
+        () {
+      expect(
+        pendingUpdateAction(pendingBuild: 136, installedBuild: 136),
+        PendingUpdateAction.clearAndSkip,
+      );
+      expect(
+        pendingUpdateAction(pendingBuild: 135, installedBuild: 136),
+        PendingUpdateAction.clearAndSkip,
+      );
+    });
+
+    test('no pending build -> normal check', () {
+      expect(
+        pendingUpdateAction(pendingBuild: null, installedBuild: 136),
+        PendingUpdateAction.none,
+      );
+    });
+  });
+
+  group('releaseDownloadUrl / pendingUpdateInfo', () {
+    test('builds the release asset URL for the build', () {
+      expect(
+        releaseDownloadUrl(137),
+        'https://github.com/abdo15542/helba/releases/download/build-137/helba-build-137.apk',
+      );
+    });
+
+    test('pendingUpdateInfo carries the tag and download URL', () {
+      final info = pendingUpdateInfo(137);
+      expect(info.buildNumber, 137);
+      expect(info.tag, 'build-137');
+      expect(
+        info.downloadUrl,
+        'https://github.com/abdo15542/helba/releases/download/build-137/helba-build-137.apk',
+      );
+    });
+  });
+
+  group('updateCheckInterval', () {
+    test('is one hour, so same-day builds are picked up promptly', () {
+      expect(updateCheckInterval, const Duration(hours: 1));
     });
   });
 
@@ -163,6 +218,17 @@ void main() {
       expect(await store.lastCheck(), when);
       expect(await store.dismissedBuild(), 99);
     });
+
+    test('round-trips the pending build, and clearing it reads null',
+        () async {
+      final backing = <String, String>{};
+      final store = AppUpdateStore.memory(backing);
+      expect(await store.pendingBuild(), isNull);
+      await store.savePendingBuild(137);
+      expect(await store.pendingBuild(), 137);
+      await store.clearPendingBuild();
+      expect(await store.pendingBuild(), isNull);
+    });
   });
 
   group('AppUpdateChecker.checkForUpdate', () {
@@ -224,7 +290,7 @@ void main() {
       );
     });
 
-    test('checks at most once per day; force bypasses the throttle',
+    test('checks at most once per hour; force bypasses the throttle',
         () async {
       var calls = 0;
       final store = AppUpdateStore.memory({});
@@ -239,7 +305,7 @@ void main() {
       expect((await make().checkForUpdate(installedBuild: 98))?.buildNumber,
           99);
       expect(calls, 1);
-      // Second check within the day is skipped silently.
+      // Second check within the hour is skipped silently.
       expect(await make().checkForUpdate(installedBuild: 98), isNull);
       expect(calls, 1);
       // Forced check goes through again.
@@ -250,7 +316,28 @@ void main() {
       expect(calls, 2);
     });
 
-    test('a failed check does not consume the daily slot', () async {
+    test('allows a check once the hourly interval has passed', () async {
+      var calls = 0;
+      final store = AppUpdateStore.memory({});
+      // Last check was two hours ago: the throttle has expired.
+      await store.saveLastCheck(
+        DateTime.now().subtract(const Duration(hours: 2)),
+      );
+      final checker = AppUpdateChecker(
+        store: store,
+        clientFactory: () => MockClient((request) async {
+          calls++;
+          return http.Response(jsonEncode(releaseJson()), 200);
+        }),
+      );
+      expect(
+        (await checker.checkForUpdate(installedBuild: 98))?.buildNumber,
+        99,
+      );
+      expect(calls, 1);
+    });
+
+    test('a failed check does not consume the hourly slot', () async {
       var calls = 0;
       final store = AppUpdateStore.memory({});
       AppUpdateChecker make() => AppUpdateChecker(
