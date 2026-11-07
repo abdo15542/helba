@@ -4,6 +4,7 @@ import 'dart:io' as io;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:libsignal/libsignal.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -13,6 +14,7 @@ import 'channels.dart';
 import 'config.dart';
 import 'e2ee.dart';
 import 'push.dart';
+import 'signal_sync.dart';
 import 'utils.dart';
 
 // ---------------------------------------------------------------------------
@@ -35,9 +37,17 @@ String formatChatTime(DateTime time, {DateTime? now}) {
 /// True when an encrypted row is missing the ciphertext or the nonce it
 /// needs to be decrypted at all. Such rows are malformed, not merely
 /// undecryptable, and must never be permanently marked "decrypt failed".
+///
+/// Signal rows are the exception: they carry their nonce inside the
+/// serialized Signal ciphertext, so their `nonce` column is NULL by
+/// design. A Signal row is malformed only when its ciphertext is empty
+/// or its `signal_msg_type` is missing/invalid.
 bool isMalformedEncryptedRow(Map<String, dynamic> row) {
   if (!isEncryptedMessage(row)) return false;
   final ciphertext = row['ciphertext']?.toString() ?? '';
+  if (isSignalMessageRow(row)) {
+    return ciphertext.isEmpty;
+  }
   final nonce = row['nonce']?.toString() ?? '';
   return ciphertext.isEmpty || nonce.isEmpty;
 }
@@ -154,6 +164,17 @@ class _ChatPageState extends State<ChatPage> {
   // Members the last key-creation wrap wrote NO row for (fix 1):
   // _resetEncryption warns when this is non-empty.
   Set<String> _lastWrapUncovered = {};
+  // Signal Protocol (1:1 chats only): the sync layer for this device.
+  // Null when there is no signed-in user or the native library cannot
+  // initialise — 1:1 sends then fall back to plaintext. [_signalSync]
+  // is created in [_initChat] (after members load) and publishes this
+  // device's pre-key bundle in the background.
+  SignalSync? _signalSync;
+  // True once a Signal session exists for the other member of a 1:1
+  // chat (so new messages go out Signal-encrypted). Drives the
+  // plaintext banner for 1:1 chats, which must not blame the old
+  // conversation key that 1:1 no longer uses.
+  bool _signalSessionReady = false;
   // One-time-per-session publish-failure warning (fix 4).
   bool _publishWarningShown = false;
   // Periodic key-load retry while the chat is open and keyless (fix 6):
@@ -223,7 +244,69 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _initChat() async {
     await _loadMembers();
     if (!mounted) return;
+    // Signal (1:1): wire the sync layer and publish this device's
+    // pre-key bundle in the background (best-effort, never blocks the
+    // chat). For a 1:1 chat, also warm the session to the other member
+    // so the first send is already encrypted.
+    await _initSignal();
+    if (!mounted) return;
+    if (_isDirectChat) await _warmSignalSession();
+    if (!mounted) return;
     await _ensureConversationKey();
+  }
+
+  /// Wires [_signalSync] for the signed-in user and publishes this
+  /// device's pre-key bundle in the background. Best-effort: a null
+  /// result (no user, native library unavailable) just means 1:1
+  /// sends fall back to plaintext.
+  Future<void> _initSignal() async {
+    if (_signalSync != null) return;
+    try {
+      final sync = await SignalSync.forCurrentUser();
+      if (!mounted) return;
+      _signalSync = sync;
+      if (sync != null) {
+        // Fire-and-forget: publishing must not delay opening the chat;
+        // it retries on the next chat open when offline.
+        unawaited(sync.ensurePublished());
+      }
+    } catch (_) {
+      // Signal unavailable; 1:1 sends fall back to plaintext.
+    }
+  }
+
+  /// Warms the Signal session to the other member of a 1:1 chat (the
+  /// recipient need not be online — the session is built from their
+  /// published bundle). Sets [_signalSessionReady] so the plaintext
+  /// banner and the send path know Signal is available. Best-effort.
+  Future<void> _warmSignalSession() async {
+    final sync = _signalSync;
+    final otherId = _otherUserId;
+    if (sync == null || otherId == null) return;
+    final deviceUuids = _memberDeviceUuids(otherId);
+    for (final deviceUuid in deviceUuids) {
+      try {
+        if (await sync.ensureSessionFor(otherId, deviceUuid)) {
+          if (mounted) setState(() => _signalSessionReady = true);
+          return;
+        }
+      } catch (_) {
+        // Try the next device.
+      }
+    }
+  }
+
+  /// The other member's device uuids (from the member device map),
+  /// sorted for determinism. Empty when members are not loaded yet.
+  List<String> _memberDeviceUuids(String userId) {
+    final devices = _memberDeviceKeys[userId] ?? const [];
+    final uuids = devices
+        .map((d) => d.deviceId)
+        .whereType<String>()
+        .where((id) => id.isNotEmpty)
+        .toList()
+      ..sort();
+    return uuids;
   }
 
   /// Recreates the message stream after a terminal stream error, and
@@ -522,6 +605,10 @@ class _ChatPageState extends State<ChatPage> {
   /// Decrypts encrypted rows that arrived in the stream and are not yet
   /// cached, failed, or in flight. Runs after the frame (never setState
   /// in a loop, never re-decrypt a cached row) and only one run at a time.
+  ///
+  /// Signal rows (1:1 chats) are decrypted first and need NO old
+  /// conversation key — they use the Signal session for the sender's
+  /// device. Old-E2E rows keep the existing key-load gate below.
   /// Malformed rows (missing ciphertext/nonce) are skipped, never marked
   /// failed. Rows that cannot be decrypted only because the key is null
   /// are NOT marked failed either — they are retried when the key loads
@@ -536,23 +623,38 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _decryptPendingRows(List<Map<String, dynamic>> rows) async {
     if (_decryptRunning) return;
     final malformed = <String>[];
-    final pending = rows.where((row) {
-      if (!isEncryptedMessage(row)) return false;
+    final signalPending = <Map<String, dynamic>>[];
+    final oldPending = <Map<String, dynamic>>[];
+    for (final row in rows) {
+      if (!isEncryptedMessage(row)) continue;
       final id = row['id']?.toString() ?? '';
-      if (id.isEmpty) return false;
+      if (id.isEmpty) continue;
       if (isMalformedEncryptedRow(row)) {
         malformed.add(id);
-        return false;
+        continue;
       }
-      return !_decrypted.containsKey(id) &&
-          !_decrypting.contains(id) &&
-          !_decryptFailed.contains(id) &&
-          !_permanentlyUnreadable.contains(id);
-    }).toList();
+      if (_decrypted.containsKey(id) ||
+          _decrypting.contains(id) ||
+          _decryptFailed.contains(id) ||
+          _permanentlyUnreadable.contains(id)) {
+        continue;
+      }
+      if (isSignalMessageRow(row)) {
+        signalPending.add(row);
+      } else {
+        oldPending.add(row);
+      }
+    }
     if (malformed.isNotEmpty && mounted) {
       setState(() => _malformedIds.addAll(malformed));
     }
-    if (pending.isEmpty) return;
+    // Signal rows first: they need no old conversation key.
+    if (signalPending.isNotEmpty) {
+      await _decryptSignalRows(signalPending);
+      if (!mounted) return;
+    }
+    if (oldPending.isEmpty) return;
+    final pending = oldPending;
     if (!_conversationKeyLoaded) {
       // No key yet. If the load already failed definitively, fall
       // through and mark the pending rows failed below — waiting
@@ -613,12 +715,89 @@ class _ChatPageState extends State<ChatPage> {
     if (changed && mounted) setState(() {});
   }
 
+  /// Decrypts Signal Protocol rows (1:1 chats) with the Signal session
+  /// for the sender's device. No old conversation key is needed. The
+  /// sender's device is not stored on the row, so every device uuid
+  /// known for the sender is tried in order — the one the sender
+  /// actually used is the one whose session decrypts. A row that
+  /// decrypts with none of them is permanently unreadable (same label
+  /// as old-E2E, no retry link, never a spinner). Rows are left
+  /// pending (not failed) when Signal is not initialised yet or the
+  /// sender's devices are unknown, so a later retry can still heal
+  /// them. Never throws.
+  Future<void> _decryptSignalRows(
+    List<Map<String, dynamic>> rows,
+  ) async {
+    var sync = _signalSync;
+    if (sync == null) {
+      await _initSignal();
+      sync = _signalSync;
+      if (sync == null || !mounted) return;
+    }
+    if (!_membersLoaded) {
+      await _loadMembers(silent: true);
+      if (!mounted) return;
+    }
+    _decryptRunning = true;
+    var changed = false;
+    for (final row in rows) {
+      final id = row['id']?.toString() ?? '';
+      if (id.isEmpty) continue;
+      _decrypting.add(id);
+      try {
+        final senderId = row['sender_id']?.toString() ?? '';
+        final ciphertext = row['ciphertext']?.toString() ?? '';
+        final type = parseSignalMsgType(
+          row['signal_msg_type']?.toString(),
+        );
+        if (senderId.isEmpty || ciphertext.isEmpty || type == null) {
+          _permanentlyUnreadable.add(id);
+          changed = true;
+          continue;
+        }
+        final isPreKey = type == CiphertextMessageType.preKey;
+        String? plain;
+        var triedAnyDevice = false;
+        for (final deviceUuid in _memberDeviceUuids(senderId)) {
+          triedAnyDevice = true;
+          plain = await sync.decryptFrom(
+            senderId,
+            deviceUuid,
+            ciphertext,
+            isPreKey,
+          );
+          if (plain != null) break;
+        }
+        if (plain != null) {
+          _decrypted[id] = plain;
+          changed = true;
+        } else if (triedAnyDevice) {
+          // Every known sender device failed: the ciphertext cannot
+          // be decrypted with any session available now.
+          _permanentlyUnreadable.add(id);
+          changed = true;
+        }
+        // No known sender device at all: leave the row pending (do
+        // not mark it) — a later members load may still heal it.
+      } catch (_) {
+        _permanentlyUnreadable.add(id);
+        changed = true;
+      } finally {
+        _decrypting.remove(id);
+      }
+    }
+    _decryptRunning = false;
+    if (changed && mounted) setState(() {});
+  }
+
   /// Tap-to-retry for rows that definitively failed to decrypt: clears
   /// the failed set and the blocked flag, then re-runs the key load
   /// (which re-runs decryption when the key arrives). If the key is
   /// still blocked, the rows fail again — the retry is honest, never a
   /// silent spin back to "جارٍ فك التشفير…". Permanently unreadable
   /// rows (fix 5) have no retry link, so they are never cleared here.
+  /// Signal rows are re-decrypted directly as well (they need no old
+  /// conversation key).
   void _retryDecryption() {
     if (!mounted) return;
     setState(() {
@@ -627,6 +806,7 @@ class _ChatPageState extends State<ChatPage> {
       _keyLoadNullCount = 0;
     });
     _ensureConversationKey();
+    unawaited(_decryptPendingRows(_lastRows));
   }
 
   void _scrollToBottom() {
@@ -744,9 +924,22 @@ class _ChatPageState extends State<ChatPage> {
   /// Persistent plaintext banner (F38): shown whenever this conversation
   /// is currently sending plaintext — no key, or not every member has a
   /// public key. Subtle and non-blocking, above the composer.
-  bool get _showPlaintextBanner =>
-      _membersLoaded &&
-      (_conversationKey == null || !canEncryptFor(_memberDeviceKeys));
+  ///
+  /// 1:1 chats use the Signal Protocol, not the old conversation key,
+  /// so their banner is driven by Signal session readiness instead:
+  /// it shows only while no Signal session exists for the other
+  /// member. Group chats keep the old-E2E condition.
+  bool get _showPlaintextBanner {
+    if (!_membersLoaded) return false;
+    if (_isDirectChat) return !_signalSessionReady;
+    return _conversationKey == null || !canEncryptFor(_memberDeviceKeys);
+  }
+
+  /// True for a 1:1 direct chat (exactly two members, direct kind):
+  /// the only chats that use the Signal Protocol. Groups and channels
+  /// keep the old E2E path.
+  bool get _isDirectChat =>
+      widget.kind == 'direct' && !_isGroup && _memberIds.length == 2;
 
   /// The banner text: names the real cause (missing member key vs.
   /// key-load failure) instead of always blaming a member key.
@@ -1066,6 +1259,18 @@ class _ChatPageState extends State<ChatPage> {
   /// conversation stay unreadable FOREVER — the dialog says so
   /// plainly — and new messages use the fresh key.
   ///
+  /// Signal (1:1 chats): the reset button is KEPT, and for a 1:1 chat
+  /// it also deletes this device's Signal session(s) for the other
+  /// member, so the next send establishes a FRESH session from the
+  /// peer's current bundle (the Signal equivalent of a reset). The old
+  /// conversation-key reset above still runs (it only affects old-E2E
+  /// rows and groups); for 1:1 chats new messages use Signal, so the
+  /// old-key part is effectively a no-op for them. Old Signal messages
+  /// stay readable (their session is gone, but the Double Ratchet
+  /// state for already-decrypted messages lives in the stores and the
+  /// rows themselves are untouched) — unlike the old path, a Signal
+  /// reset does NOT orphan history.
+  ///
   /// Fix 1: the reset NEVER silently creates a partial key again. The
   /// order matters: (1) load FRESH member keys and ABORT — before the
   /// RPC deletes anything — when a member has no usable key yet (the
@@ -1160,6 +1365,22 @@ class _ChatPageState extends State<ChatPage> {
             content: Text(
                 'تمت إعادة تعيين التشفير. الرسائل الجديدة ستُشفَّر.')),
       );
+    }
+    // Signal (1:1): also delete this device's Signal session(s) for
+    // the other member, so the next send establishes a fresh session
+    // from the peer's current bundle. Best-effort; the old-key reset
+    // above already reported its outcome.
+    if (_isDirectChat) {
+      final sync = _signalSync;
+      final otherId = _otherUserId;
+      if (sync != null && otherId != null) {
+        for (final deviceUuid in _memberDeviceUuids(otherId)) {
+          await sync.resetSessionFor(otherId, deviceUuid);
+        }
+        if (mounted) {
+          setState(() => _signalSessionReady = false);
+        }
+      }
     }
   }
 
@@ -1410,6 +1631,49 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
+  /// Sends [body] as a Signal Protocol message in a 1:1 chat. Tries
+  /// each of the other member's devices in order (the recipient need
+  /// not be online — the session is built from their published bundle)
+  /// and stores the first successful encryption as a Signal row:
+  /// `ciphertext` = base64 Signal ciphertext, `signal_msg_type` =
+  /// 'prekey' (first message on a fresh session) or 'signal',
+  /// `nonce` intentionally NULL (the nonce lives inside the serialized
+  /// Signal ciphertext — NULL is also what distinguishes Signal rows
+  /// from old-E2E rows). Returns true when a Signal row was stored,
+  /// false when no session could be established (no bundle, no
+  /// devices, Signal unavailable) — the caller then falls back to
+  /// plaintext. Never throws.
+  Future<bool> _trySendViaSignal(String body, String uid) async {
+    final sync = _signalSync;
+    final otherId = _otherUserId;
+    if (sync == null || otherId == null) return false;
+    try {
+      if (!_membersLoaded) await _loadMembers(silent: true);
+      for (final deviceUuid in _memberDeviceUuids(otherId)) {
+        final result = await sync.encryptFor(otherId, deviceUuid, body);
+        if (result == null) continue;
+        await client.from('messages').insert({
+          'conversation_id': widget.conversationId,
+          'sender_id': uid,
+          'body': encryptedMessagePlaceholder,
+          'message_type': 'text',
+          'is_encrypted': true,
+          'ciphertext': result.ciphertextBase64,
+          'signal_msg_type': result.isPreKeyMessage
+              ? signalMsgTypePreKey
+              : signalMsgTypeSignal,
+        });
+        if (mounted) {
+          setState(() => _signalSessionReady = true);
+        }
+        return true;
+      }
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> send() async {
     if (!_canPost) {
       _showReadOnlyNote();
@@ -1438,6 +1702,31 @@ class _ChatPageState extends State<ChatPage> {
     }
     setState(() => sending = true);
     try {
+      // Signal 1:1 (new): in a direct (1:1) conversation, encrypt with
+      // the Signal Protocol instead of the old conversation key. The
+      // recipient need not be online — the session is built from their
+      // published pre-key bundle. On success the message is stored as
+      // a Signal row and we return. On failure (no bundle / no
+      // session) we fall through to PLAINTEXT — never to the old E2E
+      // path, which is retired for 1:1 chats. Group chats skip this
+      // block and keep the old E2E path below.
+      if (_isDirectChat) {
+        if (await _trySendViaSignal(body, uid)) {
+          input.clear();
+          return;
+        }
+        final hadEncrypted =
+            _lastRows.any((row) => isEncryptedMessage(row));
+        if (hadEncrypted && !await _confirmPlaintextSend()) return;
+        await client.from('messages').insert({
+          'conversation_id': widget.conversationId,
+          'sender_id': uid,
+          'body': body,
+          'message_type': 'text',
+        });
+        input.clear();
+        return;
+      }
       // E2E (best-effort, never blocks sending): make sure I have a
       // keypair and a published public key, refresh members' keys, then
       // load/create the conversation key and lazily wrap it for any
