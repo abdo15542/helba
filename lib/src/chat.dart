@@ -112,6 +112,53 @@ bool signalDecryptShouldRetry(int attempts) =>
 bool shouldRefreshMessagesOnResume(AppLifecycleState state) =>
     state == AppLifecycleState.resumed;
 
+/// How often the fallback list re-fetches while the Realtime stream
+/// is down (build 134): the stream has errored, so without polling
+/// new rows would never appear until the user manually retries /
+/// pulls / reopens the chat. Five seconds keeps the list fresh
+/// without hammering the server.
+const fallbackPollInterval = Duration(seconds: 5);
+
+/// True when the fallback poll should be running: the fallback list
+/// is active (the Realtime stream errored and saved rows are being
+/// shown) AND the app is in the foreground. Polling must not run in
+/// the background. Pure (unit-tested).
+bool shouldPollFallbackMessages({
+  required bool fallbackActive,
+  required bool isForeground,
+}) =>
+    fallbackActive && isForeground;
+
+/// True when one fallback poll tick should run a fetch: the fallback
+/// list is active, the conversation id is valid, and no fetch is
+/// already in flight (a second tick while one is loading is skipped
+/// — no overlapping fetches). Pure (unit-tested).
+bool shouldRunFallbackPollTick({
+  required bool fallbackActive,
+  required bool validConversationId,
+  required bool fallbackLoading,
+}) =>
+    fallbackActive && validConversationId && !fallbackLoading;
+
+/// True when a freshly fetched fallback list differs from the one
+/// currently shown, by row count or by row-id sequence (oldest
+/// first). An unchanged fetch must not setState: it would rebuild
+/// the list every poll tick and re-run decryption needlessly. A new,
+/// removed, or replaced row changes the ids/count and must update.
+/// Pure (unit-tested).
+bool fallbackRowsChanged(
+  List<Map<String, dynamic>> oldRows,
+  List<Map<String, dynamic>> newRows,
+) {
+  if (oldRows.length != newRows.length) return true;
+  for (var i = 0; i < oldRows.length; i++) {
+    if (oldRows[i]['id']?.toString() != newRows[i]['id']?.toString()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /// What an encrypted message row should show. Pure (unit-tested via
 /// [encryptedRowBody]) — the widget only renders the decision.
 enum EncryptedRowBody {
@@ -215,6 +262,19 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   // of a full error screen.
   List<Map<String, dynamic>>? _fallbackRows;
   bool _fallbackLoading = false;
+
+  // Periodic plain-select poll while the Realtime fallback list is
+  // active (build 134): the stream has errored, so without polling
+  // new rows would never appear until the user manually retries /
+  // pulls / reopens the chat. Started when the fallback becomes
+  // active, stopped when the stream is rebuilt (retry / resume /
+  // pull), when the app leaves the foreground, and in dispose().
+  // Never runs in the background.
+  Timer? _fallbackPollTimer;
+  // True while the app is in the foreground (updated by
+  // [didChangeAppLifecycleState]). Polling only runs in the
+  // foreground (see [shouldPollFallbackMessages]).
+  bool _appInForeground = true;
 
   Map<String, String> _memberNames = {};
   final Set<String> _memberIds = {};
@@ -440,6 +500,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// clears any plain-select fallback so live updates take over again.
   void _retryMessages() {
     if (!_validConversationId) return;
+    // The stream is rebuilt, so the fallback (and its poll) go away:
+    // live updates take over again.
+    _stopFallbackPoll();
     setState(() {
       _messagesStream = _buildMessagesStream();
       _fallbackRows = null;
@@ -458,7 +521,15 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   /// [shouldRefreshMessagesOnResume]).
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (!shouldRefreshMessagesOnResume(state)) return;
+    _appInForeground = state == AppLifecycleState.resumed;
+    if (!shouldRefreshMessagesOnResume(state)) {
+      // App left the foreground: pause fallback polling — it must
+      // not run in the background. On return, the stream rebuild
+      // below takes over again; if it errors again the fallback (and
+      // its poll) restarts from _loadFallbackMessages.
+      _stopFallbackPoll();
+      return;
+    }
     if (!mounted) return;
     _retryMessages();
   }
@@ -473,6 +544,20 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     await Future<void>.delayed(const Duration(milliseconds: 400));
   }
 
+  /// The plain-select query behind the fallback list (shared by
+  /// [_loadFallbackMessages] and the fallback poll): all messages of
+  /// this conversation, oldest first, capped at 200.
+  Future<List<Map<String, dynamic>>> _fetchFallbackRows() async {
+    final rows = await client
+        .from('messages')
+        .select()
+        .eq('conversation_id', widget.conversationId)
+        .order('created_at', ascending: true)
+        .limit(200)
+        .timeout(const Duration(seconds: 15));
+    return rows.cast<Map<String, dynamic>>();
+  }
+
   /// Plain-select fallback: used only when the Realtime stream has
   /// errored. Shows the messages with a "live updates disconnected"
   /// hint instead of a full error screen.
@@ -480,19 +565,79 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     if (_fallbackLoading || !_validConversationId) return;
     _fallbackLoading = true;
     try {
-      final rows = await client
-          .from('messages')
-          .select()
-          .eq('conversation_id', widget.conversationId)
-          .order('created_at', ascending: true)
-          .limit(200)
-          .timeout(const Duration(seconds: 15));
+      final rows = await _fetchFallbackRows();
       if (!mounted) return;
       setState(() {
-        _fallbackRows = rows.cast<Map<String, dynamic>>();
+        _fallbackRows = rows;
       });
+      // The stream has errored and saved rows are being shown: start
+      // polling so new messages appear without the user having to
+      // retry / pull / reopen (build 134).
+      _startFallbackPoll();
     } catch (_) {
       // Stay on the error screen; the retry button is still there.
+    } finally {
+      _fallbackLoading = false;
+    }
+  }
+
+  /// Starts the fallback poll if it is not already running and
+  /// polling is wanted right now (fallback active + app
+  /// foregrounded — see [shouldPollFallbackMessages]). A no-op
+  /// otherwise, so repeated calls cannot stack timers.
+  void _startFallbackPoll() {
+    if (_fallbackPollTimer != null) return;
+    if (!shouldPollFallbackMessages(
+      fallbackActive: _fallbackRows != null,
+      isForeground: _appInForeground,
+    )) {
+      return;
+    }
+    _fallbackPollTimer = Timer.periodic(
+      fallbackPollInterval,
+      (_) {
+        if (mounted) _pollFallbackMessages();
+      },
+    );
+  }
+
+  /// Stops the fallback poll, if running. Called when the stream is
+  /// rebuilt (retry / resume / pull), when the app leaves the
+  /// foreground, and in dispose().
+  void _stopFallbackPoll() {
+    _fallbackPollTimer?.cancel();
+    _fallbackPollTimer = null;
+  }
+
+  /// One fallback poll tick: re-runs the plain-select fetch and
+  /// updates the list only when the rows actually changed (see
+  /// [fallbackRowsChanged]), so an unchanged fetch costs no rebuild
+  /// and no decryption re-run. Skips the tick when a fetch is
+  /// already in flight (no overlapping fetches), when the fallback
+  /// is no longer active, or when the widget is gone. A failed fetch
+  /// is silently skipped — the next tick retries, and the
+  /// stale-but-visible list beats an error screen. Never throws.
+  /// Newly arrived encrypted rows are decrypted by the existing
+  /// [_buildMessageList] path (it calls [_decryptPendingRows] when
+  /// the rows change).
+  Future<void> _pollFallbackMessages() async {
+    if (!shouldRunFallbackPollTick(
+      fallbackActive: _fallbackRows != null,
+      validConversationId: _validConversationId,
+      fallbackLoading: _fallbackLoading,
+    )) {
+      return;
+    }
+    _fallbackLoading = true;
+    try {
+      final rows = await _fetchFallbackRows();
+      if (!mounted || _fallbackRows == null) return;
+      if (!fallbackRowsChanged(_fallbackRows!, rows)) return;
+      setState(() {
+        _fallbackRows = rows;
+      });
+    } catch (_) {
+      // Next tick retries.
     } finally {
       _fallbackLoading = false;
     }
@@ -1056,6 +1201,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     currentOpenConversationId.value = null;
     _keyRetryTimer?.cancel();
+    _stopFallbackPoll();
     input.dispose();
     _scroll.dispose();
     super.dispose();
