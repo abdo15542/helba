@@ -96,6 +96,22 @@ bool isOwnSignalRow(Map<String, dynamic> row, String? currentUserId) {
 bool signalDecryptShouldRetry(int attempts) =>
     attempts < maxSignalDecryptAttempts;
 
+/// True when returning to the app should re-fetch the message list.
+///
+/// The list is fed only by the Realtime stream, built once in
+/// `initState`. If that stream silently disconnects (network blip,
+/// app backgrounded, socket drop) without emitting a terminal error,
+/// the list freezes — rows that arrived while away (including the
+/// user's own sends, which only come back via the stream) never
+/// appear until the chat is fully closed and reopened. Rebuilding
+/// the stream on `resumed` re-runs its initial query, so the list
+/// catches up when the user comes back (including the
+/// tap-a-push-notification flow). Only `resumed` refreshes —
+/// `inactive`, `paused`, `hidden` and `detached` must not, or every
+/// backgrounding would churn the subscription. Pure (unit-tested).
+bool shouldRefreshMessagesOnResume(AppLifecycleState state) =>
+    state == AppLifecycleState.resumed;
+
 /// What an encrypted message row should show. Pure (unit-tested via
 /// [encryptedRowBody]) — the widget only renders the decision.
 enum EncryptedRowBody {
@@ -179,7 +195,7 @@ class ChatPage extends StatefulWidget {
   State<ChatPage> createState() => _ChatPageState();
 }
 
-class _ChatPageState extends State<ChatPage> {
+class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   final input = TextEditingController();
   final _scroll = ScrollController();
   bool sending = false;
@@ -324,6 +340,7 @@ class _ChatPageState extends State<ChatPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     // Suppress foreground push banners for this conversation while it is
     // open (push.dart reads this; cleared in dispose()).
     currentOpenConversationId.value = widget.conversationId;
@@ -428,6 +445,32 @@ class _ChatPageState extends State<ChatPage> {
       _fallbackRows = null;
       _fallbackLoading = false;
     });
+  }
+
+  /// Re-fetch the message list when the app comes back to the
+  /// foreground. The list is fed only by the Realtime stream built
+  /// once in [initState]; a stream that silently disconnects (no
+  /// terminal error) freezes the list, so rows that arrived while
+  /// away — including the user's own sends — never appear until the
+  /// chat is reopened. Rebuilding the stream re-runs its initial
+  /// query, so the list catches up on resume (including the
+  /// tap-a-push-notification flow). Only `resumed` refreshes (see
+  /// [shouldRefreshMessagesOnResume]).
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!shouldRefreshMessagesOnResume(state)) return;
+    if (!mounted) return;
+    _retryMessages();
+  }
+
+  /// Pull-to-refresh for the message list: rebuilds the Realtime
+  /// stream (same as [_retryMessages]) so a silently disconnected
+  /// stream is re-fetched on demand. The short delay keeps the
+  /// indicator visible long enough to be seen; the stream's initial
+  /// query runs immediately on rebuild.
+  Future<void> _refreshMessages() async {
+    _retryMessages();
+    await Future<void>.delayed(const Duration(milliseconds: 400));
   }
 
   /// Plain-select fallback: used only when the Realtime stream has
@@ -1010,6 +1053,7 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     currentOpenConversationId.value = null;
     _keyRetryTimer?.cancel();
     input.dispose();
@@ -2094,11 +2138,16 @@ class _ChatPageState extends State<ChatPage> {
         }
       });
     }
-    final list = ListView.builder(
-      controller: _scroll,
-      padding: const EdgeInsets.all(14),
-      itemCount: rows.length,
-      itemBuilder: (context, i) {
+    final list = RefreshIndicator(
+      onRefresh: _refreshMessages,
+      child: ListView.builder(
+        controller: _scroll,
+        // Always scrollable so pull-to-refresh works even when the
+        // list is shorter than the viewport.
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.all(14),
+        itemCount: rows.length,
+        itemBuilder: (context, i) {
         final row = rows[i];
         final myId = client.auth.currentUser?.id;
         final mine = myId != null && row['sender_id'] == myId;
@@ -2169,6 +2218,7 @@ class _ChatPageState extends State<ChatPage> {
           ),
         );
       },
+      ),
     );
     if (!showLiveHint) return list;
     return Column(children: [
