@@ -87,22 +87,51 @@ void main() {
             'a': [(deviceId: 'd1', publicKey: validKey)],
             'b': [(deviceId: 'd2', publicKey: validKey)],
           }),
-          '🔓 غير مشفّرة — تعذّر تحميل مفتاح التشفير');
+          'لم يتم تحميل مفتاح التشفير بعد');
       // A member without a key: blame the missing member key.
       expect(
           plaintextBannerMessage({
             'a': [(deviceId: 'd1', publicKey: validKey)],
             'b': <DeviceKey>[],
           }),
-          '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح');
+          'أحد الأعضاء بلا مفتاح تشفير');
       expect(
           plaintextBannerMessage({
             'a': [(deviceId: 'd1', publicKey: validKey)],
             'b': [(deviceId: null, publicKey: 'key-a')],
           }),
-          '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح');
+          'أحد الأعضاء بلا مفتاح تشفير');
       expect(plaintextBannerMessage({}),
-          '🔓 غير مشفّرة — أحد الأعضاء بلا مفتاح');
+          'أحد الأعضاء بلا مفتاح تشفير');
+    });
+
+    test('plaintext-only display: encrypted rows show the placeholder, '
+        'plaintext rows show their body (encryption removed)', () {
+      // An old encrypted row is recognised as encrypted and renders
+      // as the placeholder only — no decrypt attempt, no spinner,
+      // no failure state.
+      final encryptedRow = <String, dynamic>{
+        'id': 'row-1',
+        'body': encryptedMessagePlaceholder,
+        'is_encrypted': true,
+        'ciphertext': 'AAAACiphertext',
+        'signal_msg_type': 'signal',
+      };
+      expect(isEncryptedMessage(encryptedRow), isTrue);
+      expect(encryptedMessagePlaceholder, '🔒 رسالة مشفّرة');
+      // A new plaintext row is not encrypted, so the chat shows its
+      // body text as-is, with no "not encrypted" label.
+      final plainRow = <String, dynamic>{
+        'id': 'row-2',
+        'body': 'مرحباً بالجميع',
+        'is_encrypted': false,
+        'message_type': 'text',
+      };
+      expect(isEncryptedMessage(plainRow), isFalse);
+      expect(plainRow['body'], 'مرحباً بالجميع');
+      // A row with no is_encrypted field at all (the plaintext
+      // insert omits it, so it defaults to false) is plaintext too.
+      expect(isEncryptedMessage({'body': 'نص عادي'}), isFalse);
     });
 
     test('isOwnSignalRow: only own Signal rows', () {
