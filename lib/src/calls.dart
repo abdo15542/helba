@@ -11,12 +11,17 @@ import 'push.dart';
 
 // ---------------------------------------------------------------------------
 // Voice/video calls: WebRTC peer-to-peer with Supabase Realtime broadcast
-// signalling on personal channels `call:user:<id>`.
+// signalling on personal channels `call:user:<id>`, plus a database
+// fallback (offer/answer SDPs on the calls row, ICE candidates in
+// call_ice_candidates) for when Realtime is down.
 //
-// HONEST LIMIT: STUN only (stun.l.google.com:19302), NO TURN server and no
-// media server. Calls work on most home/mobile networks but may fail on
-// strict symmetric-NAT or corporate networks that need a TURN relay.
-// The call screen says so in Arabic. Same limit as the sibling Lamma app.
+// TURN: a relay is fetched at call start from the `turn-credentials`
+// Edge Function (Cloudflare Realtime, short-lived 24h credentials
+// minted server-side from TURN_KEY_ID / TURN_API_TOKEN) and merged
+// into the ICE servers after STUN. Until the function is configured
+// (secrets unset) the fetch fails gracefully and calls stay STUN-only
+// — they work on most home/mobile networks but may fail on strict
+// symmetric-NAT networks that need a relay. The call screen says so.
 // ---------------------------------------------------------------------------
 
 /// How long an unanswered call rings before it is marked missed.
@@ -45,13 +50,6 @@ const callVideoMaxBitrate = 2500000;
 /// window; a longer outage means the path is dead and a restart is
 /// worth one try. Only one restart is attempted per call.
 const disconnectReconnectDelay = Duration(seconds: 10);
-
-/// TURN relay servers, empty until the user chooses a provider. STUN
-/// only (see the file header) until entries are added here; each entry
-/// is {'urls': 'turn:...', 'username': '...', 'credential': '...'}.
-/// Filled in once a TURN provider is chosen — never hardcode a
-/// credential from an untrusted source here.
-const List<Map<String, String>> turnIceServers = [];
 
 /// Constraints for an ICE-restart offer: a fresh ICE gathering on the
 /// same session. Sent as a re-offer for the current callId.
@@ -308,6 +306,51 @@ String dbAnswerSdpType(Map? row) {
   );
 }
 
+/// Parses the `turn-credentials` Edge Function response into the ICE
+/// server entries for the peer connection, or an empty list when the
+/// response carries none. Each entry keeps the provider's shape:
+/// `urls` as a single string or a list of strings (Cloudflare returns
+/// one entry whose `urls` is a list), plus `username`/`credential`
+/// when present and non-blank. Malformed entries (missing or empty
+/// `urls`, non-map entry) are skipped, never thrown. Pure:
+/// unit-tested. Used by [CallService._fetchTurnIceServers].
+List<Map<String, dynamic>> parseTurnIceServers(dynamic json) {
+  if (json is! Map) return [];
+  final servers = json['iceServers'];
+  if (servers is! List) return [];
+  final out = <Map<String, dynamic>>[];
+  for (final entry in servers) {
+    if (entry is! Map) continue;
+    final urlsRaw = entry['urls'];
+    final List<String> urls;
+    if (urlsRaw is String) {
+      urls = urlsRaw.trim().isEmpty ? <String>[] : <String>[urlsRaw];
+    } else if (urlsRaw is List) {
+      urls = urlsRaw
+          .whereType<String>()
+          .map((u) => u.trim())
+          .where((u) => u.isNotEmpty)
+          .toList();
+    } else {
+      continue;
+    }
+    if (urls.isEmpty) continue;
+    final server = <String, dynamic>{
+      'urls': urls.length == 1 ? urls.first : urls,
+    };
+    final username = entry['username'];
+    if (username is String && username.trim().isNotEmpty) {
+      server['username'] = username;
+    }
+    final credential = entry['credential'];
+    if (credential is String && credential.trim().isNotEmpty) {
+      server['credential'] = credential;
+    }
+    out.add(server);
+  }
+  return out;
+}
+
 /// True when a call that was answered should be ended because media
 /// never established: no remote stream arrived and the connection is
 /// not Connected. Pure: unit-tested. Used by the media watchdog
@@ -546,6 +589,13 @@ class CallService {
   /// and when the call ends.
   final ValueNotifier<String?> callPushWarning = ValueNotifier(null);
 
+  /// True when TURN relay servers were fetched for the current call
+  /// (see [_fetchTurnIceServers]). The call screen observes this and
+  /// hides its "no TURN server" warning while a relay is available.
+  /// False on a failed fetch — the call then stays STUN-only. Reset
+  /// per call in [_clearCurrentCall].
+  final ValueNotifier<bool> turnServersAvailable = ValueNotifier(false);
+
   /// Offer queued when the incoming-call overlay could not be shown
   /// (no navigator context yet). Retried until the call is answered,
   /// declined or times out. See [_showIncomingOverlay].
@@ -587,6 +637,14 @@ class CallService {
   String? _listeningUserId;
   Timer? _ringTimer;
   Timer? _connectionTimer;
+
+  /// TURN relay servers fetched for the current call (see
+  /// [_fetchTurnIceServers]): merged into the peer connection's ICE
+  /// servers after STUN. Empty when the fetch failed or the function
+  /// is not configured yet — the call then stays STUN-only. Fetched
+  /// once per call (startCall / acceptCall) and reused for an ICE
+  /// restart within the same call; cleared in [_clearCurrentCall].
+  List<Map<String, dynamic>> _turnIceServers = [];
 
   /// Combined database-signalling poll (answer SDP + ICE candidates +
   /// restart re-offers), every [_dbPollInterval] while a call is in
@@ -1128,6 +1186,12 @@ class CallService {
       return false;
     }
     try {
+      // Fetch TURN relay servers first (bounded 5s, best-effort):
+      // the callee's peer connection needs the same relay, or media
+      // never flows even though the signalling (offer/answer) worked.
+      // A failed fetch leaves the call STUN-only — it never blocks
+      // the accept.
+      _turnIceServers = await _fetchTurnIceServers();
       await _setupPeerConnection(
           peerId: effective.from, callType: effective.callType);
       final sdp = effective.sdp;
@@ -1239,6 +1303,11 @@ class CallService {
       _answered = false;
       endReason = null;
       try {
+        // Fetch TURN relay servers first (bounded 5s, best-effort):
+        // without a relay the two phones often cannot connect
+        // directly, so no media flows. A failed fetch leaves the call
+        // STUN-only — it never blocks the call.
+        _turnIceServers = await _fetchTurnIceServers();
         await _setupPeerConnection(peerId: calleeId, callType: callType);
         final offer = await _pc!.createOffer();
         await _pc!.setLocalDescription(offer);
@@ -1482,6 +1551,32 @@ class CallService {
     } catch (_) {}
   }
 
+  /// Fetches short-lived TURN relay servers for the current call from
+  /// the `turn-credentials` Edge Function (Cloudflare Realtime, 24h
+  /// credentials minted server-side from TURN_KEY_ID / TURN_API_TOKEN),
+  /// and records whether a relay is available (see
+  /// [turnServersAvailable]). Best-effort and bounded (5s): a missing
+  /// function, missing secrets (503 `turn_not_configured`), a provider
+  /// error, or a timeout all return an empty list and the call
+  /// proceeds STUN-only — a failed TURN fetch never blocks a call.
+  /// Never throws. Called once per call, before the peer connection
+  /// is created (startCall / acceptCall); an ICE restart within the
+  /// same call reuses the fetched list instead of refetching.
+  Future<List<Map<String, dynamic>>> _fetchTurnIceServers() async {
+    try {
+      final response = await _client.functions
+          .invoke('turn-credentials')
+          .timeout(const Duration(seconds: 5));
+      final servers = parseTurnIceServers(response.data);
+      turnServersAvailable.value = servers.isNotEmpty;
+      return servers;
+    } catch (e) {
+      debugPrint('Helba calls: TURN fetch failed, STUN-only: $e');
+      turnServersAvailable.value = false;
+      return [];
+    }
+  }
+
   /// Asks the `send-call-push` Edge Function to wake the callee with a
   /// high-priority incoming-call push. The Realtime offer is the
   /// primary path, so a failure here (no function deployed yet, no
@@ -1660,11 +1755,12 @@ class CallService {
     final pc = await createPeerConnection({
       'iceServers': [
         {'urls': 'stun:stun.l.google.com:19302'},
-        ...turnIceServers,
+        // TURN relay servers fetched at call start (see
+        // [_fetchTurnIceServers]); empty until the `turn-credentials`
+        // function is configured, in which case the call stays
+        // STUN-only and may fail on strict symmetric-NAT networks.
+        ..._turnIceServers,
       ],
-      // STUN only until TURN entries are added to [turnIceServers]:
-      // calls may fail on strict symmetric-NAT networks; that is a
-      // known, honest limit.
     });
     _pc = pc;
     pc.onIceCandidate = (candidate) {
@@ -2198,6 +2294,10 @@ class CallService {
     _lastRemoteOfferSdp = null;
     _lastStoredOfferSdp = null;
     _lastAppliedAnswerSdp = null;
+    // Fresh TURN state for the next call: the next startCall /
+    // acceptCall re-fetches relay servers (24h credentials).
+    _turnIceServers = [];
+    turnServersAvailable.value = false;
     // A stale push warning must not survive into the next call (fix 8).
     callPushWarning.value = null;
     // A waiting accept must not hang when the call ends underneath it
@@ -2727,9 +2827,18 @@ class _CallPageState extends State<CallPage> {
                       ],
                     ),
                     const SizedBox(height: 16),
-                    const Text(
-                      'جودة المكالمة قد تتأثر بدون خادم TURN',
-                      style: TextStyle(fontSize: 12, color: Colors.white54),
+                    // Shown only while no TURN relay is available for
+                    // this call (fetch failed or not configured yet):
+                    // with a relay the warning does not apply.
+                    ValueListenableBuilder<bool>(
+                      valueListenable: _service.turnServersAvailable,
+                      builder: (_, available, __) => available
+                          ? const SizedBox.shrink()
+                          : const Text(
+                              'جودة المكالمة قد تتأثر بدون خادم TURN',
+                              style: TextStyle(
+                                  fontSize: 12, color: Colors.white54),
+                            ),
                     ),
                   ]),
                 ),
