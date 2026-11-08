@@ -96,6 +96,18 @@ bool isOwnSignalRow(Map<String, dynamic> row, String? currentUserId) {
 bool signalDecryptShouldRetry(int attempts) =>
     attempts < maxSignalDecryptAttempts;
 
+/// True when a Signal row that exhausted its decrypt budget should
+/// trigger one automatic session heal: the budget is spent AND the
+/// row has not already healed once. A row whose ciphertext is gone
+/// for good must not rebuild the session on every open — one heal
+/// per message, then the row stays failed with a manual retry.
+/// Pure (unit-tested via [shouldHealSessionAfterFailure]).
+bool shouldHealSessionAfterFailure({
+  required int attempts,
+  required bool wasHealed,
+}) =>
+    attempts >= maxSignalDecryptAttempts && !wasHealed;
+
 /// True when returning to the app should re-fetch the message list.
 ///
 /// The list is fed only by the Realtime stream, built once in
@@ -314,12 +326,12 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   // cleared on reset — the plaintexts do not depend on any key or
   // session.
   final Map<String, String> _ownSentPlaintext = {};
-  // Signal decrypt attempts per row id. A Signal row that fails is
-  // left pending while attempts remain (see [signalDecryptShouldRetry])
-  // and only moves to [_decryptFailed] once the budget is spent —
-  // never to [_permanentlyUnreadable]. Cleared on reset and on manual
-  // retry, so a fresh session gets a fresh budget.
-  final Map<String, int> _signalDecryptAttempts = {};
+  // Signal decrypt attempts are NOT kept in memory here: they live
+  // in the persistent [SignalDecryptAttemptStore] on [SignalSync]
+  // (secure storage), so the bounded retry budget
+  // ([signalDecryptShouldRetry]) survives closing and reopening the
+  // chat. A row that keeps failing reaches [_decryptFailed] instead
+  // of spinning on "جارٍ فك التشفير…" forever.
   List<int>? _conversationKey;
   // True ONLY once a non-null key has actually been loaded. A null key
   // must not set this, otherwise the key load never retries.
@@ -1086,6 +1098,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     _decryptRunning = true;
     var changed = false;
     var pending = rows;
+    // Peers healed in this run (at most one heal per peer per run).
+    final healedPeers = <String>{};
     for (var pass = 0; pass < 2 && pending.isNotEmpty; pass++) {
       final nextPending = <Map<String, dynamic>>[];
       var anySuccess = false;
@@ -1125,20 +1139,35 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           }
           if (plain != null) {
             _decrypted[id] = plain;
-            _signalDecryptAttempts.remove(id);
+            // Prune the persistent attempt record: the row healed.
+            await sync.decryptAttempts.clear(id);
+            await sync.decryptAttempts.clearHealed(id);
             anySuccess = true;
             changed = true;
           } else if (triedAnyDevice) {
             // Every known sender device failed: usually a transient
             // race (session still converging). Bounded retry — leave
-            // pending while attempts remain, then failed (retryable).
-            _recordSignalDecryptFailure(id, nextPending, row);
+            // pending while attempts remain, then failed (retryable)
+            // with one automatic session heal.
+            await _recordSignalDecryptFailure(
+              id,
+              nextPending,
+              row,
+              senderId,
+              healedPeers,
+            );
             changed = true;
           }
           // No known sender device at all: leave the row pending (do
           // not mark it) — a later members load may still heal it.
         } catch (_) {
-          _recordSignalDecryptFailure(id, nextPending, row);
+          await _recordSignalDecryptFailure(
+            id,
+            nextPending,
+            row,
+            senderId,
+            healedPeers,
+          );
           changed = true;
         } finally {
           _decrypting.remove(id);
@@ -1151,41 +1180,95 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     if (changed && mounted) setState(() {});
   }
 
-  /// Records one failed Signal decrypt attempt for [id]: increments
-  /// the attempt budget and either leaves the row pending for the
+  /// Records one failed Signal decrypt attempt for [id] in the
+  /// persistent store, and either leaves the row pending for the
   /// next decrypt pass (added to [nextPending]) or, once the budget
-  /// is spent, marks it failed (tap-to-retry). Never permanently
-  /// unreadable.
-  void _recordSignalDecryptFailure(
+  /// is spent, marks it failed (tap-to-retry) and heals the session
+  /// for [senderId] once (unless this row already healed it, or a
+  /// peer in [healedPeers] was already healed in this run).
+  /// Never permanently unreadable: the row itself stays
+  /// undecryptable (it was encrypted under the lost session), but
+  /// the heal is for NEW messages.
+  Future<void> _recordSignalDecryptFailure(
     String id,
     List<Map<String, dynamic>> nextPending,
     Map<String, dynamic> row,
-  ) {
-    final attempts = (_signalDecryptAttempts[id] ?? 0) + 1;
-    _signalDecryptAttempts[id] = attempts;
+    String senderId,
+    Set<String> healedPeers,
+  ) async {
+    final sync = _signalSync;
+    if (sync == null) {
+      // No Signal sync (should not happen — the caller checked):
+      // leave pending, never failed.
+      nextPending.add(row);
+      return;
+    }
+    final attempts = await sync.decryptAttempts.recordAttempt(id);
     if (signalDecryptShouldRetry(attempts)) {
       nextPending.add(row);
-    } else {
-      _decryptFailed.add(id);
+      return;
+    }
+    _decryptFailed.add(id);
+    // Budget spent: the session is desynced, not merely converging.
+    // Heal it once (for new messages), unless this row already did.
+    final wasHealed = await sync.decryptAttempts.wasHealed(id);
+    if (!shouldHealSessionAfterFailure(
+      attempts: attempts,
+      wasHealed: wasHealed,
+    )) {
+      return;
+    }
+    var healed = false;
+    for (final deviceUuid in _memberDeviceUuids(senderId)) {
+      final peerKey = '$senderId::$deviceUuid';
+      if (healedPeers.contains(peerKey)) continue;
+      healedPeers.add(peerKey);
+      if (await sync.healSessionFor(senderId, deviceUuid)) {
+        healed = true;
+      }
+    }
+    if (healed) {
+      await sync.decryptAttempts.markHealed(id);
+      if (mounted) setState(() => _signalSessionReady = true);
     }
   }
 
-  /// Tap-to-retry for rows that definitively failed to decrypt: clears
-  /// the failed set and the blocked flag, then re-runs the key load
-  /// (which re-runs decryption when the key arrives). If the key is
-  /// still blocked, the rows fail again — the retry is honest, never a
+  /// Tap-to-retry for rows that definitively failed to decrypt:
+  /// clears the failed set and the persistent attempt/heal records,
+  /// rebuilds the Signal session for the 1:1 peer (the retry heals
+  /// the session, not just re-tries the same broken one), then
+  /// re-runs the key load and decryption. If the key is still
+  /// blocked, the rows fail again — the retry is honest, never a
   /// silent spin back to "جارٍ فك التشفير…". Permanently unreadable
   /// rows (fix 5) have no retry link, so they are never cleared here.
   /// Signal rows are re-decrypted directly as well (they need no old
   /// conversation key).
-  void _retryDecryption() {
+  Future<void> _retryDecryption() async {
     if (!mounted) return;
+    final failedIds = _decryptFailed.toList();
+    final sync = _signalSync;
+    final otherId = _otherUserId;
     setState(() {
       _decryptFailed.clear();
-      _signalDecryptAttempts.clear();
       _keyDefinitivelyBlocked = false;
       _keyLoadNullCount = 0;
     });
+    // Clear the persistent attempt/heal records so the failed rows
+    // get a fresh budget, and rebuild the session for the peer so
+    // the retry runs against a fresh session.
+    if (sync != null) {
+      for (final id in failedIds) {
+        await sync.decryptAttempts.clear(id);
+        await sync.decryptAttempts.clearHealed(id);
+      }
+      if (otherId != null) {
+        for (final deviceUuid in _memberDeviceUuids(otherId)) {
+          if (await sync.healSessionFor(otherId, deviceUuid)) {
+            if (mounted) setState(() => _signalSessionReady = true);
+          }
+        }
+      }
+    }
     _ensureConversationKey();
     unawaited(_decryptPendingRows(_lastRows));
   }
@@ -1712,6 +1795,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     // are about the row format, not the key. The generation bump makes
     // any load that started before the reset discard its result (fix 3).
     _keyLoadGeneration++;
+    // Capture the failed row ids before clearing the in-memory set,
+    // so their persistent attempt/heal records can be cleared too.
+    final failedRowIds = _decryptFailed.toList();
     setState(() {
       _conversationKey = null;
       _conversationKeyLoaded = false;
@@ -1720,9 +1806,22 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       _lastWrapUncovered = {};
       _decrypted.clear();
       _decryptFailed.clear();
-      _signalDecryptAttempts.clear();
       _permanentlyUnreadable.clear();
     });
+    // Clear the persistent decrypt-attempt/heal records for this
+    // conversation's rows, so the reset gives them a fresh budget
+    // against the rebuilt session.
+    final resetSync = _signalSync;
+    if (resetSync != null) {
+      final resetIds = <String>{
+        ...failedRowIds,
+        ..._lastRows.map((r) => r['id']?.toString() ?? ''),
+      }..remove('');
+      for (final id in resetIds) {
+        await resetSync.decryptAttempts.clear(id);
+        await resetSync.decryptAttempts.clearHealed(id);
+      }
+    }
     // (3) Await the fresh key load — never fire-and-forget it.
     await _ensureConversationKey(afterReset: true);
     if (!mounted) return;
@@ -2009,6 +2108,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text('تعذّر فك تشفير هذه الرسالة'),
+              const Text(
+                'أعد المحاولة لإعادة بناء التشفير.',
+                style: labelStyle,
+              ),
               const SizedBox(height: 2),
               GestureDetector(
                 onTap: _retryDecryption,

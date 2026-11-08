@@ -123,6 +123,88 @@ class SentSignalPlaintextStore {
       _backend.read(sentSignalPlaintextKey(messageId));
 }
 
+/// Key for the persistent per-message Signal decrypt-attempt count.
+String signalDecryptAttemptsKey(String messageId) =>
+    'helba:signal-decrypt-attempts:$messageId';
+
+/// Key marking that a message already triggered one automatic session
+/// heal. A permanently undecryptable row must not rebuild the session
+/// — consuming a one-time pre-key — on every chat open.
+String signalDecryptHealedKey(String messageId) =>
+    'helba:signal-decrypt-healed:$messageId';
+
+/// On-device-only store for Signal decrypt attempts and auto-heal
+/// markers, backed by a [SignalKvStore] (secure storage in
+/// production, in-memory in tests). The attempt count is persistent
+/// so the bounded retry budget ([maxSignalDecryptAttempts]) survives
+/// closing and reopening the chat: a row that keeps failing reaches
+/// the failed state instead of spinning on "جارٍ فك التشفير…" forever.
+/// The heal marker bounds automatic healing to once per message, so
+/// a row whose ciphertext is gone for good does not rebuild the
+/// session on every open. Never touches the server. Backend errors
+/// fall back to an in-memory map, so a storage hiccup never breaks
+/// decryption — it only loses persistence for that run.
+class SignalDecryptAttemptStore {
+  SignalDecryptAttemptStore(this._backend);
+
+  final SignalKvStore _backend;
+  final _memoryFallback = <String, String>{};
+
+  Future<String?> _read(String key) async {
+    try {
+      return await _backend.read(key);
+    } catch (_) {
+      return _memoryFallback[key];
+    }
+  }
+
+  Future<void> _write(String key, String value) async {
+    try {
+      await _backend.write(key, value);
+    } catch (_) {
+      _memoryFallback[key] = value;
+    }
+  }
+
+  Future<void> _delete(String key) async {
+    try {
+      await _backend.delete(key);
+    } catch (_) {
+      _memoryFallback.remove(key);
+    }
+  }
+
+  /// Attempts recorded so far for [messageId] (0 when none).
+  Future<int> attempts(String messageId) async {
+    final raw = await _read(signalDecryptAttemptsKey(messageId));
+    return int.tryParse(raw ?? '') ?? 0;
+  }
+
+  /// Records one more failed attempt; returns the new count.
+  Future<int> recordAttempt(String messageId) async {
+    final next = await attempts(messageId) + 1;
+    await _write(signalDecryptAttemptsKey(messageId), next.toString());
+    return next;
+  }
+
+  /// Clears the attempt count (on success, or when the session is
+  /// healed so the row gets a fresh budget against it).
+  Future<void> clear(String messageId) =>
+      _delete(signalDecryptAttemptsKey(messageId));
+
+  /// True when [messageId] already triggered one automatic heal.
+  Future<bool> wasHealed(String messageId) async =>
+      await _read(signalDecryptHealedKey(messageId)) == '1';
+
+  /// Marks [messageId] as auto-healed.
+  Future<void> markHealed(String messageId) =>
+      _write(signalDecryptHealedKey(messageId), '1');
+
+  /// Clears the heal marker (on success, or on a manual retry).
+  Future<void> clearHealed(String messageId) =>
+      _delete(signalDecryptHealedKey(messageId));
+}
+
 /// Server-side bundle storage for one Signal device.
 ///
 /// The production implementation is [SupabaseSignalBundleStore]; tests
@@ -336,6 +418,7 @@ class SignalSync {
     required this.userId,
     required this.deviceUuid,
     required this.sentPlaintexts,
+    required this.decryptAttempts,
   });
 
   final SignalService service;
@@ -345,6 +428,9 @@ class SignalSync {
 
   /// On-device-only plaintexts of Signal messages this device sent.
   final SentSignalPlaintextStore sentPlaintexts;
+
+  /// On-device-only Signal decrypt attempts and auto-heal markers.
+  final SignalDecryptAttemptStore decryptAttempts;
 
   /// Serializes Signal operations per peer address: a session build
   /// (claim + `processPreKeyBundle`) and a decrypt (`decryptPreKey`
@@ -426,6 +512,9 @@ class SignalSync {
       userId: uid,
       deviceUuid: deviceUuid,
       sentPlaintexts: SentSignalPlaintextStore(
+        FlutterSecureStorageKvStore(secureStorage),
+      ),
+      decryptAttempts: SignalDecryptAttemptStore(
         FlutterSecureStorageKvStore(secureStorage),
       ),
     );
@@ -733,6 +822,36 @@ class SignalSync {
             addressFor(recipientUserId, recipientDeviceUuid),
           );
         } catch (_) {}
+      },
+    );
+  }
+
+  /// Heals a desynced session for a peer device: deletes the current
+  /// (mismatched) session, then rebuilds it from the peer's current
+  /// bundle — all under one peer lock, so no decrypt can interleave
+  /// between the delete and the rebuild. Returns true when a session
+  /// is now stored. Best-effort, never throws.
+  ///
+  /// The already-failed messages stay undecryptable (they were
+  /// encrypted under the lost session); the heal is for NEW messages,
+  /// whose first send after the heal is a pre-key message that
+  /// re-syncs the peer.
+  Future<bool> healSessionFor(
+    String recipientUserId,
+    String recipientDeviceUuid,
+  ) {
+    return _withPeerLock(
+      _peerKey(recipientUserId, recipientDeviceUuid),
+      () async {
+        try {
+          await service.stores.session.deleteSession(
+            addressFor(recipientUserId, recipientDeviceUuid),
+          );
+        } catch (_) {}
+        return _ensureSessionForInternal(
+          recipientUserId,
+          recipientDeviceUuid,
+        );
       },
     );
   }
