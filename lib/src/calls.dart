@@ -27,6 +27,36 @@ import 'push.dart';
 /// would mark the call missed while the client is still ringing.
 const callRingTimeout = Duration(seconds: 60);
 
+/// Video capture target for a video call: 720p at 30fps (ideal values —
+/// the camera falls back to a lower resolution when the device cannot
+/// provide 720p). The sender bitrate cap ([callVideoMaxBitrate]) bounds
+/// the bandwidth regardless of the captured resolution.
+const callVideoWidth = 1280;
+const callVideoHeight = 720;
+const callVideoFrameRate = 30;
+
+/// Maximum video send bitrate in bits per second (2.5 Mbps). Caps the
+/// video sender so a video call stays usable on weak networks instead
+/// of sending unconstrained high-resolution video.
+const callVideoMaxBitrate = 2500000;
+
+/// How long the connection may stay `disconnected` before an ICE restart
+/// is attempted (10s). Brief drops recover on their own inside this
+/// window; a longer outage means the path is dead and a restart is
+/// worth one try. Only one restart is attempted per call.
+const disconnectReconnectDelay = Duration(seconds: 10);
+
+/// TURN relay servers, empty until the user chooses a provider. STUN
+/// only (see the file header) until entries are added here; each entry
+/// is {'urls': 'turn:...', 'username': '...', 'credential': '...'}.
+/// Filled in once a TURN provider is chosen — never hardcode a
+/// credential from an untrusted source here.
+const List<Map<String, String>> turnIceServers = [];
+
+/// Constraints for an ICE-restart offer: a fresh ICE gathering on the
+/// same session. Sent as a re-offer for the current callId.
+const Map<String, dynamic> iceRestartOfferConstraints = {'iceRestart': true};
+
 /// The navigator key the app's MaterialApp uses, so an incoming call can
 /// be shown from anywhere (inbox or inside a chat) without a BuildContext.
 final GlobalKey<NavigatorState> helbaNavigatorKey =
@@ -172,6 +202,42 @@ String callTypeLabel(String? callType) =>
 /// Calls are peer-to-peer and 1:1, so only direct chats can start one.
 /// Groups and channels have no single other participant.
 bool canCall(String? kind) => kind == 'direct';
+
+/// Video capture constraints for a video call: 720p at 30fps (ideal).
+/// The camera may fall back to a lower resolution when the device
+/// cannot provide 720p; the sender bitrate cap ([callVideoMaxBitrate])
+/// bounds the bandwidth regardless.
+Map<String, dynamic> callVideoConstraints() => {
+      'facingMode': 'user',
+      'width': {'ideal': callVideoWidth},
+      'height': {'ideal': callVideoHeight},
+      'frameRate': {'ideal': callVideoFrameRate},
+    };
+
+/// True when an ICE restart may be attempted: the call is active or
+/// outgoing and no restart has been attempted yet for this call. A
+/// restart is attempted at most once per call, so a restart that fails
+/// ends the call instead of looping.
+bool shouldAttemptIceRestart({
+  required bool attempted,
+  required bool isActiveCall,
+}) =>
+    !attempted && isActiveCall;
+
+/// True when an incoming offer is a renegotiation of the call already
+/// in progress (an ICE restart): the call is active or outgoing, the
+/// callId matches the current call, and the offer carries SDP. Such an
+/// offer is answered, never declined as busy.
+bool isRenegotiationOffer({
+  required CallState state,
+  required String? signalCallId,
+  required String? currentCallId,
+  required String? sdp,
+}) =>
+    (state == CallState.active || state == CallState.outgoing) &&
+    signalCallId != null &&
+    signalCallId == currentCallId &&
+    sdp != null;
 
 /// Terminal call statuses: a row in one of these never changes again
 /// (migration 017's transition trigger rejects every move out of them).
@@ -377,6 +443,11 @@ class CallService {
   final ValueNotifier<bool> isCameraOff = ValueNotifier(false);
   final ValueNotifier<bool> isSpeakerOn = ValueNotifier(false);
 
+  /// True while the connection is down and an ICE restart is being
+  /// attempted (or awaited). The call screen shows "إعادة الاتصال…".
+  /// Cleared when the connection recovers or the call ends.
+  final ValueNotifier<bool> isReconnecting = ValueNotifier(false);
+
   /// Why the last call ended ('declined', 'missed', 'ended'); read by the
   /// call screen before it pops. Null while a call is in progress.
   String? endReason;
@@ -437,6 +508,11 @@ class CallService {
   String? _listeningUserId;
   Timer? _ringTimer;
   Timer? _connectionTimer;
+
+  /// True once an ICE restart has been attempted for the current call.
+  /// At most one restart per call; a restart that fails ends the call.
+  /// Reset in [_resetCall] so the next call gets a fresh attempt.
+  bool _iceRestartAttempted = false;
   bool _answered = false;
   bool _rowFinalized = false;
   bool _overlayShowing = false;
@@ -589,6 +665,37 @@ class CallService {
       final completer = _pendingOfferCompleter;
       if (completer != null && !completer.isCompleted) {
         completer.complete(signal);
+      }
+      return;
+    }
+    // Mid-call re-offer for the call already in progress (an ICE
+    // restart): answer it as a renegotiation instead of declining as
+    // busy. The call stays active; only the session description is
+    // refreshed. A failure here leaves the existing (broken) connection
+    // alone — the initiator ends the call if it never recovers.
+    if (_pc != null &&
+        isRenegotiationOffer(
+            state: state.value,
+            signalCallId: signal.callId,
+            currentCallId: currentCallId,
+            sdp: signal.sdp)) {
+      try {
+        // isRenegotiationOffer verified sdp != null.
+        await _pc!.setRemoteDescription(
+            RTCSessionDescription(signal.sdp!, 'offer'));
+        final answer = await _pc!.createAnswer();
+        await _pc!.setLocalDescription(answer);
+        final myId = _client.auth.currentUser?.id;
+        if (myId == null) return;
+        await _sendSignal(CallSignal(
+            type: CallSignalType.answer,
+            from: myId,
+            to: signal.from,
+            callId: signal.callId,
+            callType: signal.callType,
+            payload: {'sdp': answer.sdp, 'type': answer.type}));
+      } catch (_) {
+        // Swallowed: see the comment above.
       }
       return;
     }
@@ -1047,12 +1154,22 @@ class CallService {
       }
       return;
     }
-    if (state.value != CallState.outgoing ||
-        signal.callId != currentCallId) {
+    // An answer for the current call, whether it is the first answer
+    // (outgoing -> active) or a renegotiation answer after an ICE
+    // restart (already active). Anything else is ignored.
+    if (signal.callId != currentCallId) {
+      return;
+    }
+    final isRenegotiation = state.value == CallState.active;
+    if (state.value != CallState.outgoing && !isRenegotiation) {
       return;
     }
     final sdp = signal.sdp;
     if (sdp == null || _pc == null) {
+      // A bad renegotiation answer must not hang up: the existing
+      // connection may still recover, and the connection-state
+      // handler ends the call if it does not.
+      if (isRenegotiation) return;
       // An answer without usable SDP can never connect: end the call
       // instead of stranding the caller on "جارٍ الاتصال…".
       await hangUp(sendSignal: true);
@@ -1061,6 +1178,7 @@ class CallService {
     try {
       await _pc!.setRemoteDescription(
           RTCSessionDescription(sdp, signal.sdpType ?? 'answer'));
+      if (isRenegotiation) return;
       // Cancel the ring timer only after the answer proved usable (#6):
       // cancelling before setRemoteDescription stranded the caller when
       // a bad answer threw.
@@ -1069,6 +1187,7 @@ class CallService {
       _answered = true;
       state.value = CallState.active;
     } catch (_) {
+      if (isRenegotiation) return;
       // A bad answer must not leave the caller ringing forever: end it.
       try {
         await hangUp(sendSignal: true);
@@ -1351,16 +1470,18 @@ class CallService {
         'noiseSuppression': true,
         'autoGainControl': true,
       },
-      'video': video ? {'facingMode': 'user'} : false,
+      'video': video ? callVideoConstraints() : false,
     });
     _local = stream;
     localStream.value = stream;
     final pc = await createPeerConnection({
       'iceServers': [
         {'urls': 'stun:stun.l.google.com:19302'},
+        ...turnIceServers,
       ],
-      // STUN only: no TURN server is configured for Helba. Calls may fail
-      // on strict symmetric-NAT networks; that is a known, honest limit.
+      // STUN only until TURN entries are added to [turnIceServers]:
+      // calls may fail on strict symmetric-NAT networks; that is a
+      // known, honest limit.
     });
     _pc = pc;
     pc.onIceCandidate = (candidate) {
@@ -1393,6 +1514,11 @@ class CallService {
     for (final track in stream.getTracks()) {
       await pc.addTrack(track, stream);
     }
+    // Cap the video sender at 2.5 Mbps so a video call stays usable on
+    // weak networks instead of sending unconstrained high-resolution
+    // video. Best-effort: a platform that rejects the parameters must
+    // not break the call.
+    if (video) await _capVideoBitrate(pc);
     // Voice calls default to the earpiece, video calls to the speaker.
     // Only record the route after the Helper call succeeds (#7).
     try {
@@ -1405,27 +1531,106 @@ class CallService {
     isCameraOff.value = false;
   }
 
+  /// Caps the video sender bitrate at [callVideoMaxBitrate] (2.5 Mbps).
+  /// Best-effort: any failure is swallowed so the call still proceeds
+  /// without the cap.
+  Future<void> _capVideoBitrate(RTCPeerConnection pc) async {
+    try {
+      final senders = await pc.getSenders();
+      for (final sender in senders) {
+        if (sender.track?.kind != 'video') continue;
+        final params = sender.parameters;
+        final encodings = params.encodings;
+        if (encodings == null || encodings.isEmpty) continue;
+        encodings[0].maxBitrate = callVideoMaxBitrate;
+        await sender.setParameters(params);
+      }
+    } catch (_) {
+      // Best-effort: the call works without the cap.
+    }
+  }
+
   void _onConnectionState(RTCPeerConnectionState connectionState) {
+    if (connectionState ==
+        RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+      _connectionTimer?.cancel();
+      isReconnecting.value = false;
+      return;
+    }
     if (connectionState ==
         RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
       _connectionTimer?.cancel();
-      unawaited(_endWithConnectionError().catchError((_) {}));
-    } else if (connectionState ==
+      _tryIceRestartOrEnd();
+      return;
+    }
+    if (connectionState ==
         RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
-      // Brief drops recover on their own; only end after 5s down.
+      // Brief drops recover on their own; give the connection time to
+      // come back before restarting ICE, and show "reconnecting" so
+      // the user knows the call is not dead.
+      isReconnecting.value = true;
       _connectionTimer?.cancel();
-      _connectionTimer = Timer(const Duration(seconds: 5), () {
+      _connectionTimer = Timer(disconnectReconnectDelay, () {
         if ((state.value == CallState.active ||
                 state.value == CallState.outgoing) &&
             _pc?.connectionState ==
                 RTCPeerConnectionState
                     .RTCPeerConnectionStateDisconnected) {
-          unawaited(_endWithConnectionError().catchError((_) {}));
+          _tryIceRestartOrEnd();
         }
       });
-    } else if (connectionState ==
-        RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
-      _connectionTimer?.cancel();
+    }
+  }
+
+  /// Attempts one ICE restart when the call is active or outgoing and
+  /// no restart has been tried yet for this call; otherwise ends the
+  /// call with a connection error. At most one restart per call.
+  void _tryIceRestartOrEnd() {
+    final isActiveCall =
+        state.value == CallState.active || state.value == CallState.outgoing;
+    if (shouldAttemptIceRestart(
+        attempted: _iceRestartAttempted, isActiveCall: isActiveCall)) {
+      unawaited(_restartIce().catchError((_) {}));
+      return;
+    }
+    isReconnecting.value = false;
+    unawaited(_endWithConnectionError().catchError((_) {}));
+  }
+
+  /// Restarts ICE for the current call (one attempt per call): fresh ICE
+  /// gathering plus a re-offer for the same callId, which the peer
+  /// answers as a renegotiation (see [_handleOffer]). On any failure
+  /// the call ends with a connection error.
+  Future<void> _restartIce() async {
+    final pc = _pc;
+    final callId = currentCallId;
+    final peerId = currentPeerId;
+    final callType = currentCallType;
+    if (pc == null || callId == null || peerId == null || callType == null) {
+      isReconnecting.value = false;
+      await _endWithConnectionError();
+      return;
+    }
+    _iceRestartAttempted = true;
+    isReconnecting.value = true;
+    try {
+      // Canonical WebRTC ICE restart: the offer constraint alone
+      // generates a fresh ufrag and new candidates; no separate
+      // restartIce() call is needed (and calling both is redundant).
+      final offer = await pc.createOffer(iceRestartOfferConstraints);
+      await pc.setLocalDescription(offer);
+      final myId = _client.auth.currentUser?.id;
+      if (myId == null) throw StateError('No signed-in user');
+      await _sendSignal(CallSignal(
+          type: CallSignalType.offer,
+          from: myId,
+          to: peerId,
+          callId: callId,
+          callType: callType,
+          payload: {'sdp': offer.sdp, 'type': offer.type}));
+    } catch (_) {
+      isReconnecting.value = false;
+      await _endWithConnectionError();
     }
   }
 
@@ -1500,6 +1705,10 @@ class CallService {
     _connectionTimer?.cancel();
     _pendingOverlayTimer?.cancel();
     _pendingIncomingCall = null;
+    // A fresh call gets a fresh ICE-restart attempt and a clear
+    // reconnecting indicator.
+    _iceRestartAttempted = false;
+    isReconnecting.value = false;
     // Safety net: any end path that forgot to stop the ringtone or clear
     // the tray notification is covered here.
     unawaited(_stopIncomingCallAlert());
@@ -1844,6 +2053,22 @@ class _CallPageState extends State<CallPage> {
   /// Banner shown while ringing when the call push did not reach the
   /// callee (fix 8): the caller sees why the other phone may not ring.
   /// Hidden once the push is confirmed delivered (or the call ends).
+  /// Small "reconnecting" label shown while the connection is down and
+  /// an ICE restart is being attempted. Hidden otherwise.
+  Widget _reconnectingIndicator() {
+    return ValueListenableBuilder<bool>(
+      valueListenable: _service.isReconnecting,
+      builder: (_, reconnecting, __) {
+        if (!reconnecting) return const SizedBox.shrink();
+        return const Padding(
+          padding: EdgeInsets.only(top: 4),
+          child: Text('إعادة الاتصال…',
+              style: TextStyle(fontSize: 14, color: Colors.amber)),
+        );
+      },
+    );
+  }
+
   Widget _callPushWarningBanner() {
     return ValueListenableBuilder<String?>(
       valueListenable: _service.callPushWarning,
@@ -1936,6 +2161,7 @@ class _CallPageState extends State<CallPage> {
                         Text(statusText,
                             style: const TextStyle(
                                 fontSize: 16, color: Colors.white70)),
+                        _reconnectingIndicator(),
                         _callPushWarningBanner(),
                       ],
                     ),
@@ -1955,6 +2181,7 @@ class _CallPageState extends State<CallPage> {
                       Text(statusText,
                           textAlign: TextAlign.center,
                           style: const TextStyle(color: Colors.white70)),
+                      _reconnectingIndicator(),
                       _callPushWarningBanner(),
                     ]),
                   ),
