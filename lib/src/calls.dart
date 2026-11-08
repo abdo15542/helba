@@ -260,6 +260,64 @@ String dbOfferSdpType(Map? row) {
   return 'offer';
 }
 
+/// The answer SDP stored on a calls row, or null when the row carries
+/// none (the callee has not stored it yet, or the value is blank). A
+/// non-string or blank/whitespace-only value counts as absent. Mirror
+/// of [dbOfferSdp] for the caller-side answer poll. Pure: unit-tested.
+/// Used by [CallService._pollDbSignalling] as the database fallback
+/// when the answer never arrived over Realtime broadcast.
+String? dbAnswerSdp(Map? row) {
+  if (row == null) return null;
+  final sdp = row['answer_sdp'];
+  if (sdp is! String) return null;
+  if (sdp.trim().isEmpty) return null;
+  return sdp;
+}
+
+/// The stored answer SDP type, defaulting to 'answer' when the row
+/// carries none (missing, non-string, or blank). Pure: unit-tested.
+String dbAnswerSdpType(Map? row) {
+  final type = row?['answer_sdp_type'];
+  if (type is String && type.trim().isNotEmpty) return type;
+  return 'answer';
+}
+
+/// Parses one call_ice_candidates row into the fields needed for
+/// [RTCIceCandidate], or null when the row carries no usable
+/// candidate. The `candidate` column holds the map produced by
+/// [RTCIceCandidate.toMap] (`{'candidate', 'sdpMid',
+/// 'sdpMLineIndex'}`); `sdpMLineIndex` may arrive as an int or a
+/// numeric string. Pure: unit-tested. Used by
+/// [CallService._pollDbIceCandidates].
+({String candidate, String? sdpMid, int? sdpMLineIndex})?
+    parseDbIceCandidate(Map? row) {
+  if (row == null) return null;
+  final raw = row['candidate'];
+  if (raw is! Map) return null;
+  final candidate = raw['candidate']?.toString();
+  if (candidate == null || candidate.trim().isEmpty) return null;
+  final sdpMid = raw['sdpMid']?.toString();
+  final indexRaw = raw['sdpMLineIndex'];
+  final sdpMLineIndex = indexRaw is int
+      ? indexRaw
+      : int.tryParse(indexRaw?.toString() ?? '');
+  return (
+    candidate: candidate,
+    sdpMid: sdpMid,
+    sdpMLineIndex: sdpMLineIndex,
+  );
+}
+
+/// True when a call that was answered should be ended because media
+/// never established: no remote stream arrived and the connection is
+/// not Connected. Pure: unit-tested. Used by the media watchdog
+/// ([CallService._checkMediaWatchdog]).
+bool shouldEndForNoMedia({
+  required bool hasRemoteStream,
+  required bool isConnected,
+}) =>
+    !hasRemoteStream && !isConnected;
+
 /// Terminal call statuses: a row in one of these never changes again
 /// (migration 017's transition trigger rejects every move out of them).
 bool isTerminalCallStatus(String? status) => switch (status) {
@@ -530,6 +588,45 @@ class CallService {
   Timer? _ringTimer;
   Timer? _connectionTimer;
 
+  /// Combined database-signalling poll (answer SDP + ICE candidates +
+  /// restart re-offers), every [_dbPollInterval] while a call is in
+  /// progress. Started in [startCall] (caller) and [acceptCall]
+  /// (callee); stopped in [_resetCall] / [_closePeerConnection].
+  /// See [_pollDbSignalling].
+  Timer? _dbPollTimer;
+
+  /// Re-entrancy guard for [_pollDbSignalling] (the periodic timer
+  /// can fire while a previous poll is still awaiting a select).
+  bool _dbPolling = false;
+
+  /// IDs of DB ICE candidates already fed to the peer connection, so
+  /// a poll never adds the same candidate twice. Cleared per call in
+  /// [_clearCurrentCall].
+  final Set<String> _seenIceCandidateIds = <String>{};
+
+  /// The last offer SDP applied as the remote description (the
+  /// original offer on accept, or a restart re-offer). The DB poll
+  /// only applies a row offer_sdp that differs from this AND from
+  /// [_lastStoredOfferSdp], so it never re-applies an offer it already
+  /// has or one this side stored itself. Cleared per call.
+  String? _lastRemoteOfferSdp;
+
+  /// The last offer SDP this side stored on the calls row (original
+  /// offer at call start, or a restart re-offer). See
+  /// [_lastRemoteOfferSdp]. Cleared per call.
+  String? _lastStoredOfferSdp;
+
+  /// The last answer SDP applied as the remote description (first
+  /// answer, or a renegotiation answer). The DB poll only applies a
+  /// row answer_sdp that differs from this, so a Realtime answer and
+  /// a DB answer for the same SDP never double-apply. Cleared per
+  /// call.
+  String? _lastAppliedAnswerSdp;
+
+  /// Media watchdog: ends an answered call whose media never
+  /// establishes (see [_armMediaWatchdog]).
+  Timer? _mediaWatchdogTimer;
+
   /// True once an ICE restart has been attempted for the current call.
   /// At most one restart per call; a restart that fails ends the call.
   /// Reset in [_resetCall] so the next call gets a fresh attempt.
@@ -704,6 +801,9 @@ class CallService {
         // isRenegotiationOffer verified sdp != null.
         await _pc!.setRemoteDescription(
             RTCSessionDescription(signal.sdp!, 'offer'));
+        // Remember the offer applied as remote, so the DB poll never
+        // re-applies it (see _pollDbSignalling).
+        _lastRemoteOfferSdp = signal.sdp;
         final answer = await _pc!.createAnswer();
         await _pc!.setLocalDescription(answer);
         final myId = _client.auth.currentUser?.id;
@@ -715,6 +815,10 @@ class CallService {
             callId: signal.callId,
             callType: signal.callType,
             payload: {'sdp': answer.sdp, 'type': answer.type}));
+        // Store the renegotiation answer too, so the initiator can
+        // fetch it from the row when its Realtime is down.
+        unawaited(
+            _storeAnswerSdp(signal.callId, answer.sdp, answer.type));
       } catch (_) {
         // Swallowed: see the comment above.
       }
@@ -1030,6 +1134,9 @@ class CallService {
       if (sdp == null) throw StateError('Missing offer SDP');
       await _pc!.setRemoteDescription(
           RTCSessionDescription(sdp, effective.sdpType ?? 'offer'));
+      // Remember the offer applied as remote, so the DB poll never
+      // re-applies it (see _pollDbSignalling).
+      _lastRemoteOfferSdp = sdp;
       final answer = await _pc!.createAnswer();
       await _pc!.setLocalDescription(answer);
       await _sendSignal(CallSignal(
@@ -1048,6 +1155,11 @@ class CallService {
       _answered = true;
       incomingCall.value = null;
       state.value = CallState.active;
+      // The call is answered: media must establish within the
+      // watchdog window, and the peer's ICE candidates may only be
+      // reachable via the database (their Realtime may be down).
+      _armMediaWatchdog();
+      _startDbSignallingPoll();
       return true;
     } catch (_) {
       await _closePeerConnection();
@@ -1148,6 +1260,10 @@ class CallService {
         // answer) but best-effort — a failed store never breaks the
         // call, the Realtime offer is still the primary path.
         await _storeOfferSdp(callId, offer.sdp, offer.type);
+        // Start the database signalling poll now: the callee may
+        // answer within seconds, and their answer may only be
+        // reachable via the row when our Realtime is down.
+        _startDbSignallingPoll();
         // Wake the callee if their app is closed or backgrounded: the
         // Realtime offer only reaches a connected client. Fix 8: the
         // push is AWAITED (bounded to 5s inside _sendCallPush) and its
@@ -1239,6 +1355,9 @@ class CallService {
     try {
       await _pc!.setRemoteDescription(
           RTCSessionDescription(sdp, signal.sdpType ?? 'answer'));
+      // Remember the answer applied as remote, so the DB poll never
+      // re-applies it (see _pollDbSignalling).
+      _lastAppliedAnswerSdp = sdp;
       if (isRenegotiation) return;
       // Cancel the ring timer only after the answer proved usable (#6):
       // cancelling before setRemoteDescription stranded the caller when
@@ -1247,6 +1366,9 @@ class CallService {
       await _updateCallRow('ongoing');
       _answered = true;
       state.value = CallState.active;
+      // The call is answered: media must establish within the
+      // watchdog window.
+      _armMediaWatchdog();
     } catch (_) {
       if (isRenegotiation) return;
       // A bad answer must not leave the caller ringing forever: end it.
@@ -1557,6 +1679,9 @@ class CallService {
           callId: callId,
           callType: callType,
           payload: {'candidate': candidate.toMap()})));
+      // DB fallback (F3): also store the candidate so a peer whose
+      // Realtime is down can fetch it by polling. Fire-and-forget.
+      unawaited(_storeIceCandidate(callId, myId, candidate.toMap()));
     };
     pc.onAddStream = (stream) => remoteStream.value = stream;
     pc.onTrack = (event) {
@@ -1616,6 +1741,8 @@ class CallService {
         RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
       _connectionTimer?.cancel();
       isReconnecting.value = false;
+      // Media established: the watchdog no longer applies.
+      _cancelMediaWatchdog();
       return;
     }
     if (connectionState ==
@@ -1689,6 +1816,11 @@ class CallService {
           callId: callId,
           callType: callType,
           payload: {'sdp': offer.sdp, 'type': offer.type}));
+      // Store the re-offer on the calls row too (F5): a peer whose
+      // Realtime is down fetches it from the row via the DB poll.
+      // Fire-and-forget: the Realtime re-offer above is the primary
+      // path.
+      unawaited(_storeOfferSdp(callId, offer.sdp, offer.type));
     } catch (_) {
       isReconnecting.value = false;
       await _endWithConnectionError();
@@ -1710,6 +1842,11 @@ class CallService {
     final pc = _pc;
     _pc = null;
     _connectionTimer?.cancel();
+    // The database poll and the media watchdog exist only while a
+    // peer connection is alive; stop them here as well as in
+    // _resetCall so no poll runs after the connection is gone.
+    _stopDbSignallingPoll();
+    _cancelMediaWatchdog();
     // The peer signalling channel was created for this call: remove and
     // unsubscribe it here so channels do not leak per call (#12).
     // hangUp() sends its hangup signal before calling this, so removing
@@ -1761,23 +1898,260 @@ class CallService {
     }
   }
 
+  // -- Database signalling fallback (build 150) -------------------------
+  // When a side's Realtime subscription is down it can SEND broadcasts
+  // (the REST fallback) but cannot RECEIVE them. The poll below is the
+  // receive path that does not need Realtime: the caller polls the
+  // calls row for the callee's answer SDP, both sides poll
+  // call_ice_candidates for the peer's ICE candidates, and either side
+  // polls the calls row for a restart re-offer. Realtime stays the
+  // primary (fast) route; the DB poll is the fallback that makes calls
+  // work with Realtime down. Best-effort throughout: a failed poll
+  // never breaks the call.
+
+  /// How often the DB signalling poll runs (3s). Fast enough that a
+  /// DB-routed answer/candidate arrives within a few seconds of being
+  /// stored, slow enough not to hammer the database.
+  static const _dbPollInterval = Duration(seconds: 3);
+
+  /// How long an answered call may go without media before the
+  /// watchdog ends it (20s).
+  static const _mediaWatchdogTimeout = Duration(seconds: 20);
+
+  void _startDbSignallingPoll() {
+    _dbPollTimer?.cancel();
+    _dbPollTimer = Timer.periodic(_dbPollInterval, (_) {
+      unawaited(_pollDbSignalling().catchError((_) {}));
+    });
+  }
+
+  void _stopDbSignallingPoll() {
+    _dbPollTimer?.cancel();
+    _dbPollTimer = null;
+  }
+
+  /// One DB poll tick: the callee's answer (F2), the peer's ICE
+  /// candidates (F3), and a restart re-offer stored by the peer (F5).
+  /// Re-entrant-safe (a slow select never stacks up polls) and
+  /// best-effort: any failure just means this tick found nothing.
+  Future<void> _pollDbSignalling() async {
+    if (_dbPolling) return;
+    _dbPolling = true;
+    try {
+      final callId = currentCallId;
+      final myId = _client.auth.currentUser?.id;
+      final pc = _pc;
+      if (callId == null || myId == null || pc == null) return;
+      final st = state.value;
+      if (st != CallState.outgoing && st != CallState.active) return;
+      // One select for the calls row covers the answer (F2) and the
+      // restart re-offer (F5) checks below.
+      Map? row;
+      try {
+        row = await _client
+            .from('calls')
+            .select('answer_sdp,answer_sdp_type,offer_sdp,offer_sdp_type')
+            .eq('id', callId)
+            .maybeSingle();
+      } catch (_) {
+        row = null;
+      }
+      if (row != null) {
+        // F2: the callee's answer, for a caller whose Realtime answer
+        // never arrived — or a renegotiation answer after an ICE
+        // restart, for either side.
+        final answerSdp = dbAnswerSdp(row);
+        if (answerSdp != null) {
+          if (st == CallState.outgoing) {
+            await _applyDbAnswer(answerSdp, dbAnswerSdpType(row));
+          } else if (answerSdp != _lastAppliedAnswerSdp) {
+            // Renegotiation answer: only the remote description
+            // changes; the call is already active.
+            try {
+              await pc.setRemoteDescription(
+                  RTCSessionDescription(answerSdp, dbAnswerSdpType(row)));
+              _lastAppliedAnswerSdp = answerSdp;
+            } catch (_) {}
+          }
+        }
+        // F5: a restart re-offer stored by the peer. Apply only when
+        // it differs from both the last offer applied as remote AND
+        // the last offer this side stored, so this side never applies
+        // its own re-offer or re-applies one it already has.
+        if (state.value == CallState.active) {
+          final offerSdp = dbOfferSdp(row);
+          if (offerSdp != null &&
+              offerSdp != _lastRemoteOfferSdp &&
+              offerSdp != _lastStoredOfferSdp) {
+            await _applyDbOffer(offerSdp, dbOfferSdpType(row));
+          }
+        }
+      }
+      // F3: the peer's ICE candidates, for either side whose Realtime
+      // subscription is down.
+      if (state.value == CallState.outgoing ||
+          state.value == CallState.active) {
+        await _pollDbIceCandidates(callId, myId);
+      }
+    } finally {
+      _dbPolling = false;
+    }
+  }
+
+  /// Applies the callee's answer SDP fetched from the calls row as the
+  /// first answer (caller side, state outgoing). Mirror of the
+  /// first-answer path in [_handleAnswer], but best-effort: a bad SDP
+  /// never hangs up (the Realtime answer / ring timer still apply).
+  /// Returns true when the answer was applied and the call is active.
+  Future<bool> _applyDbAnswer(String sdp, String sdpType) async {
+    if (state.value != CallState.outgoing) return false;
+    final pc = _pc;
+    if (pc == null) return false;
+    try {
+      await pc.setRemoteDescription(RTCSessionDescription(sdp, sdpType));
+    } catch (_) {
+      return false;
+    }
+    _lastAppliedAnswerSdp = sdp;
+    _ringTimer?.cancel();
+    await _updateCallRow('ongoing');
+    _answered = true;
+    state.value = CallState.active;
+    _armMediaWatchdog();
+    return true;
+  }
+
+  /// Applies a restart re-offer fetched from the calls row as a
+  /// renegotiation (mirror of the Realtime path in [_handleOffer]).
+  /// Best-effort: never throws. A failed renegotiation leaves the
+  /// existing connection alone; the connection-state handler ends the
+  /// call if it never recovers.
+  Future<void> _applyDbOffer(String sdp, String sdpType) async {
+    final pc = _pc;
+    final callId = currentCallId;
+    final peerId = currentPeerId;
+    if (pc == null || callId == null || peerId == null) return;
+    if (state.value != CallState.active) return;
+    try {
+      await pc.setRemoteDescription(RTCSessionDescription(sdp, sdpType));
+      _lastRemoteOfferSdp = sdp;
+      final answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      final myId = _client.auth.currentUser?.id;
+      if (myId == null) return;
+      await _sendSignal(CallSignal(
+          type: CallSignalType.answer,
+          from: myId,
+          to: peerId,
+          callId: callId,
+          callType: currentCallType ?? 'voice',
+          payload: {'sdp': answer.sdp, 'type': answer.type}));
+      // Store the renegotiation answer too, so the initiator can fetch
+      // it from the row when its Realtime is down.
+      unawaited(_storeAnswerSdp(callId, answer.sdp, answer.type));
+    } catch (_) {}
+  }
+
+  /// Fetches the peer's ICE candidates stored in call_ice_candidates
+  /// and feeds any not yet seen into the peer connection. Best-effort:
+  /// never throws.
+  Future<void> _pollDbIceCandidates(String callId, String myId) async {
+    final pc = _pc;
+    if (pc == null) return;
+    try {
+      final rows = await _client
+          .from('call_ice_candidates')
+          .select('id,candidate')
+          .eq('call_id', callId)
+          .neq('from_id', myId)
+          .order('created_at', ascending: true)
+          .limit(50);
+      for (final row in rows) {
+        final id = row['id']?.toString();
+        if (id == null || _seenIceCandidateIds.contains(id)) continue;
+        _seenIceCandidateIds.add(id);
+        final parsed = parseDbIceCandidate(row);
+        if (parsed == null) continue;
+        try {
+          await pc.addCandidate(RTCIceCandidate(
+              parsed.candidate, parsed.sdpMid, parsed.sdpMLineIndex));
+        } catch (_) {
+          // A stale candidate (e.g. after hangup) is harmless.
+        }
+      }
+    } catch (_) {}
+  }
+
+  /// Best-effort store of one outgoing ICE candidate in
+  /// call_ice_candidates (F3). Never throws; a failed store leaves the
+  /// Realtime candidate as the only route. A failure is logged instead
+  /// of vanishing silently.
+  Future<void> _storeIceCandidate(
+      String callId, String fromId, Map<String, dynamic> candidate) async {
+    try {
+      await _client.from('call_ice_candidates').insert({
+        'call_id': callId,
+        'from_id': fromId,
+        'candidate': candidate,
+      });
+    } catch (e) {
+      debugPrint('Helba calls: failed to store ICE candidate: $e');
+    }
+  }
+
+  /// Arms the media watchdog (F4): 20s after the call becomes active,
+  /// the call ends with «تعذّر الاتصال» when no remote stream arrived
+  /// and the connection is not Connected. Cancelled when the
+  /// connection becomes Connected (see [_onConnectionState]) or the
+  /// call ends.
+  void _armMediaWatchdog() {
+    _mediaWatchdogTimer?.cancel();
+    _mediaWatchdogTimer = Timer(_mediaWatchdogTimeout, () {
+      unawaited(_checkMediaWatchdog().catchError((_) {}));
+    });
+  }
+
+  void _cancelMediaWatchdog() {
+    _mediaWatchdogTimer?.cancel();
+    _mediaWatchdogTimer = null;
+  }
+
+  Future<void> _checkMediaWatchdog() async {
+    if (state.value != CallState.active) return;
+    final hasRemote = remoteStream.value != null;
+    final connected = _pc?.connectionState ==
+        RTCPeerConnectionState.RTCPeerConnectionStateConnected;
+    if (shouldEndForNoMedia(
+        hasRemoteStream: hasRemote, isConnected: connected)) {
+      await _endWithConnectionError();
+    }
+  }
+
   /// Best-effort store of the offer SDP on the calls row (signalling
   /// fallback for a callee whose Realtime offer never arrived). Never
   /// throws; a failed store leaves the Realtime offer as the only
-  /// route. The [callId] is the calls row id.
+  /// route. The [callId] is the calls row id. A failure is logged
+  /// (previously it vanished silently — that is how migration 017's
+  /// column grant silently disabled the whole build-149 fallback).
   Future<void> _storeOfferSdp(
       String callId, String? sdp, String? type) async {
     if (sdp == null || sdp.isEmpty) return;
+    // Remember what this side stored, so the DB poll never applies
+    // this side's own offer back to itself (see _pollDbSignalling).
+    _lastStoredOfferSdp = sdp;
     try {
       await _client.from('calls').update({
         'offer_sdp': sdp,
         'offer_sdp_type': type ?? 'offer',
       }).eq('id', callId);
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('Helba calls: failed to store offer SDP: $e');
+    }
   }
 
   /// Best-effort store of the answer SDP on the calls row (stored for
-  /// a future caller-side fallback). Never throws.
+  /// the caller-side fallback). Never throws; a failure is logged
+  /// instead of vanishing silently.
   Future<void> _storeAnswerSdp(
       String callId, String? sdp, String? type) async {
     if (sdp == null || sdp.isEmpty) return;
@@ -1786,13 +2160,17 @@ class CallService {
         'answer_sdp': sdp,
         'answer_sdp_type': type ?? 'answer',
       }).eq('id', callId);
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('Helba calls: failed to store answer SDP: $e');
+    }
   }
 
   void _resetCall() {
     _ringTimer?.cancel();
     _connectionTimer?.cancel();
     _pendingOverlayTimer?.cancel();
+    _stopDbSignallingPoll();
+    _cancelMediaWatchdog();
     _pendingIncomingCall = null;
     // A fresh call gets a fresh ICE-restart attempt and a clear
     // reconnecting indicator.
@@ -1815,6 +2193,11 @@ class CallService {
     _rowFinalized = false;
     _outgoingOfferSdp = null;
     _outgoingOfferType = null;
+    // Fresh DB-signalling state for the next call.
+    _seenIceCandidateIds.clear();
+    _lastRemoteOfferSdp = null;
+    _lastStoredOfferSdp = null;
+    _lastAppliedAnswerSdp = null;
     // A stale push warning must not survive into the next call (fix 8).
     callPushWarning.value = null;
     // A waiting accept must not hang when the call ends underneath it
