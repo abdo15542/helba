@@ -223,16 +223,21 @@ bool shouldAttemptIceRestart({
     !attempted && isActiveCall;
 
 /// True when an incoming offer is a renegotiation of the call already
-/// in progress (an ICE restart): the call is active or outgoing, the
-/// callId matches the current call, and the offer carries SDP. Such an
-/// offer is answered, never declined as busy.
+/// in progress (an ICE restart): the call is active, connecting or
+/// outgoing, the callId matches the current call, and the offer carries
+/// SDP. Such an offer is answered, never declined as busy. A
+/// `connecting` call is included: the peer may restart ICE while this
+/// side is still establishing media, and its re-offer is a
+/// renegotiation, not a new call.
 bool isRenegotiationOffer({
   required CallState state,
   required String? signalCallId,
   required String? currentCallId,
   required String? sdp,
 }) =>
-    (state == CallState.active || state == CallState.outgoing) &&
+    (state == CallState.active ||
+            state == CallState.outgoing ||
+            state == CallState.connecting) &&
     signalCallId != null &&
     signalCallId == currentCallId &&
     sdp != null;
@@ -351,6 +356,56 @@ List<Map<String, dynamic>> parseTurnIceServers(dynamic json) {
   return out;
 }
 
+/// TURN ICE-server cache: the `turn-credentials` credentials live 24h,
+/// so a fetch inside that window is reused instead of blocking the
+/// answer/offer path with a serial 5s network call on every call.
+/// When less than 1h of life remains the cache is still used for this
+/// call, but a background refresh is kicked off so the next call gets
+/// fresh servers without waiting.
+const turnCacheTtl = Duration(hours: 24);
+
+/// How close to expiry the cached TURN servers must be before a
+/// background refresh is triggered (1h of the 24h TTL remaining).
+const turnCacheRefreshThreshold = Duration(hours: 1);
+
+/// True when TURN servers fetched at [fetchedAt] are still usable at
+/// [now] (younger than [turnCacheTtl]). A null fetch time is never
+/// valid. Pure: unit-tested.
+bool isTurnCacheValid({required DateTime? fetchedAt, required DateTime now}) {
+  final at = fetchedAt;
+  if (at == null) return false;
+  return now.difference(at) < turnCacheTtl;
+}
+
+/// True when the cached TURN servers are still valid but expire within
+/// [turnCacheRefreshThreshold]: use them for this call and refresh in
+/// the background. Pure: unit-tested.
+bool shouldRefreshTurnCache(
+    {required DateTime? fetchedAt, required DateTime now}) {
+  final at = fetchedAt;
+  if (at == null) return false;
+  final age = now.difference(at);
+  return age < turnCacheTtl &&
+      age > turnCacheTtl - turnCacheRefreshThreshold;
+}
+
+/// DB signalling poll interval: 1s while the peer connection is still
+/// establishing, so a DB-routed ICE candidate (or answer) arrives fast
+/// when Realtime is down; 3s once connected, the steady-state rate
+/// that does not hammer the database. Pure: unit-tested. Used by
+/// [CallService._currentDbPollInterval].
+const dbPollIntervalConnecting = Duration(seconds: 1);
+
+/// DB signalling poll interval once the peer connection is Connected
+/// (3s). See [dbPollIntervalConnecting].
+const dbPollIntervalConnected = Duration(seconds: 3);
+
+/// The DB signalling poll interval for a connection state: the fast
+/// rate while still establishing, the steady rate once connected.
+/// Pure: unit-tested.
+Duration dbPollInterval({required bool connected}) =>
+    connected ? dbPollIntervalConnected : dbPollIntervalConnecting;
+
 /// True when a call that was answered should be ended because media
 /// never established: no remote stream arrived and the connection is
 /// not Connected. Pure: unit-tested. Used by the media watchdog
@@ -360,6 +415,22 @@ bool shouldEndForNoMedia({
   required bool isConnected,
 }) =>
     !hasRemoteStream && !isConnected;
+
+/// True when media is really flowing: the peer connection reached
+/// `Connected` AND a remote stream arrived (first remote track). Pure:
+/// unit-tested. This is the gate for promoting a `connecting` call to
+/// `active` (see [CallService._maybePromoteToActive]): the connection
+/// alone does not mean audio — ICE/DTLS can still be negotiating —
+/// and a remote stream alone does not mean the connection is up. Only
+/// both together mean the user hears the other side, so only then does
+/// the call timer start.
+bool isMediaReady({
+  required RTCPeerConnectionState connectionState,
+  required bool hasRemoteStream,
+}) =>
+    connectionState ==
+            RTCPeerConnectionState.RTCPeerConnectionStateConnected &&
+        hasRemoteStream;
 
 /// Terminal call statuses: a row in one of these never changes again
 /// (migration 017's transition trigger rejects every move out of them).
@@ -532,13 +603,36 @@ class CallRingtone {
       await _stop();
     } catch (_) {}
   }
+
+  /// Stops the platform ringtone even when this instance never started
+  /// it. The background message handler (a different isolate) may have
+  /// started the looping ringtone for a closed-app call; when the app
+  /// opens and answers / declines / ends that call, this instance's
+  /// [playing] is false — it never started in this isolate — yet the
+  /// native ringtone is still looping. This is the stop for that case:
+  /// it always calls the platform stop (a no-op when nothing is
+  /// playing) and never throws. Used by [_stopIncomingCallAlert], so
+  /// every end path stops a ringtone started from either isolate.
+  Future<void> stopAny() async {
+    _playing = false;
+    try {
+      await _stop();
+    } catch (_) {}
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Call state.
 // ---------------------------------------------------------------------------
 
-enum CallState { idle, outgoing, incoming, active, ended }
+/// `connecting` is the answered-but-not-yet-flowing state (build 156):
+/// the SDP answer was applied but the peer connection is not Connected
+/// yet and/or no remote track arrived, so there is no audio. The call
+/// only becomes `active` — and its timer only starts — once media is
+/// really flowing (see [isMediaReady] / [_maybePromoteToActive]); until
+/// then the screen shows «جارٍ الاتصال…» instead of a running timer
+/// over silence.
+enum CallState { idle, outgoing, incoming, connecting, active, ended }
 
 // ---------------------------------------------------------------------------
 // Call service: owns the peer connection, the local/remote streams and the
@@ -639,16 +733,26 @@ class CallService {
   Timer? _connectionTimer;
 
   /// TURN relay servers fetched for the current call (see
-  /// [_fetchTurnIceServers]): merged into the peer connection's ICE
+  /// [_turnIceServersForCall]): merged into the peer connection's ICE
   /// servers after STUN. Empty when the fetch failed or the function
-  /// is not configured yet — the call then stays STUN-only. Fetched
-  /// once per call (startCall / acceptCall) and reused for an ICE
-  /// restart within the same call; cleared in [_clearCurrentCall].
+  /// is not configured yet — the call then stays STUN-only. Set once
+  /// per call (startCall / acceptCall) and reused for an ICE restart
+  /// within the same call; cleared in [_clearCurrentCall].
   List<Map<String, dynamic>> _turnIceServers = [];
 
+  /// Cached TURN relay servers + when they were fetched (see
+  /// [isTurnCacheValid] / [shouldRefreshTurnCache]). Unlike
+  /// [_turnIceServers] this survives across calls: the credentials
+  /// live 24h, so consecutive calls reuse the cached list instead of
+  /// each paying a serial 5s fetch before the offer/answer. Only
+  /// replaced by a successful fetch; never cleared per call.
+  List<Map<String, dynamic>>? _cachedTurnIceServers;
+  DateTime? _cachedTurnIceServersAt;
+
   /// Combined database-signalling poll (answer SDP + ICE candidates +
-  /// restart re-offers), every [_dbPollInterval] while a call is in
-  /// progress. Started in [startCall] (caller) and [acceptCall]
+  /// restart re-offers), every [dbPollIntervalConnecting] while the
+  /// connection is establishing and every [dbPollIntervalConnected]
+  /// once connected. Started in [startCall] (caller) and [acceptCall]
   /// (callee); stopped in [_resetCall] / [_closePeerConnection].
   /// See [_pollDbSignalling].
   Timer? _dbPollTimer;
@@ -724,17 +828,23 @@ class CallService {
     // A call push tap may have arrived before sign-in (or before this
     // listener existed): subscribe to the notifier and pick up a queued
     // value now, the same pattern AuthGate uses for pendingChatId.
+    // The decline notifier is subscribed the same way: a Decline
+    // action tap on a closed-app call notification (see push.dart)
+    // must decline the call once the user is signed in.
     if (!_listeningToCallPush) {
       _listeningToCallPush = true;
       pendingIncomingCallPush.addListener(_onPendingCallPush);
+      pendingDeclinedCallPush.addListener(_onPendingDeclinedCallPush);
     }
     if (pendingIncomingCallPush.value != null) _onPendingCallPush();
+    if (pendingDeclinedCallPush.value != null) _onPendingDeclinedCallPush();
   }
 
   Future<void> stopListening() async {
     if (_listeningToCallPush) {
       _listeningToCallPush = false;
       pendingIncomingCallPush.removeListener(_onPendingCallPush);
+      pendingDeclinedCallPush.removeListener(_onPendingDeclinedCallPush);
     }
     final channel = _myChannel;
     _myChannel = null;
@@ -756,6 +866,32 @@ class CallService {
     if (payload == null) return;
     pendingIncomingCallPush.value = null;
     unawaited(handlePushIncomingCall(payload).catchError((_) {}));
+  }
+
+  /// A call was declined from its notification (Decline action) while
+  /// the app was closed or backgrounded: consume the queued payload
+  /// exactly once and decline the call. The caller is told and the row
+  /// is marked declined, even though the overlay never rang. Only
+  /// runs when idle (or when this is the ringing incoming call):
+  /// declining must never reset a different call in progress.
+  void _onPendingDeclinedCallPush() {
+    final payload = pendingDeclinedCallPush.value;
+    if (payload == null) return;
+    pendingDeclinedCallPush.value = null;
+    final myId = _client.auth.currentUser?.id;
+    if (myId == null || payload.callerId == myId) return;
+    if (state.value != CallState.idle &&
+        incomingCall.value?.callId != payload.callId) {
+      return;
+    }
+    final signal = CallSignal(
+      type: CallSignalType.offer,
+      from: payload.callerId,
+      to: myId,
+      callId: payload.callId,
+      callType: payload.callType,
+    );
+    unawaited(declineCall(signal).catchError((_) {}));
   }
 
   /// Removes and unsubscribes every peer signalling channel.
@@ -961,10 +1097,13 @@ class CallService {
   /// Stops everything an incoming call started: the looping ringtone,
   /// the "already ringing" flag, and the tray notification for this
   /// call (if one was shown). Idempotent: every end path calls it.
+  /// Uses [CallRingtone.stopAny]: the ringtone may have been started
+  /// by the background message handler (a different isolate) for a
+  /// closed-app call, and this isolate's [ringtone] never started it.
   Future<void> _stopIncomingCallAlert() async {
     final callId = currentCallId;
     callRinging.value = false;
-    await ringtone.stop();
+    await ringtone.stopAny();
     if (callId != null) {
       await cancelCallNotification(callId);
     }
@@ -1186,12 +1325,12 @@ class CallService {
       return false;
     }
     try {
-      // Fetch TURN relay servers first (bounded 5s, best-effort):
-      // the callee's peer connection needs the same relay, or media
-      // never flows even though the signalling (offer/answer) worked.
-      // A failed fetch leaves the call STUN-only — it never blocks
-      // the accept.
-      _turnIceServers = await _fetchTurnIceServers();
+      // TURN relay servers first (cached 24h, see
+      // [_turnIceServersForCall]): the callee's peer connection needs
+      // the same relay, or media never flows even though the
+      // signalling (offer/answer) worked. A failed fetch leaves the
+      // call STUN-only — it never blocks the accept.
+      _turnIceServers = await _turnIceServersForCall();
       await _setupPeerConnection(
           peerId: effective.from, callType: effective.callType);
       final sdp = effective.sdp;
@@ -1218,7 +1357,12 @@ class CallService {
       await _updateCallRow('ongoing');
       _answered = true;
       incomingCall.value = null;
-      state.value = CallState.active;
+      // Answered, not yet connected: the call is `connecting` until
+      // media really flows (Connected + remote stream, see
+      // [_maybePromoteToActive]). The timer only starts on `active`,
+      // so the user never sees a running timer over silence.
+      state.value = CallState.connecting;
+      _maybePromoteToActive();
       // The call is answered: media must establish within the
       // watchdog window, and the peer's ICE candidates may only be
       // reachable via the database (their Realtime may be down).
@@ -1303,11 +1447,11 @@ class CallService {
       _answered = false;
       endReason = null;
       try {
-        // Fetch TURN relay servers first (bounded 5s, best-effort):
-        // without a relay the two phones often cannot connect
-        // directly, so no media flows. A failed fetch leaves the call
-        // STUN-only — it never blocks the call.
-        _turnIceServers = await _fetchTurnIceServers();
+        // TURN relay servers first (cached 24h, see
+        // [_turnIceServersForCall]): without a relay the two phones
+        // often cannot connect directly, so no media flows. A failed
+        // fetch leaves the call STUN-only — it never blocks the call.
+        _turnIceServers = await _turnIceServersForCall();
         await _setupPeerConnection(peerId: calleeId, callType: callType);
         final offer = await _pc!.createOffer();
         await _pc!.setLocalDescription(offer);
@@ -1401,12 +1545,15 @@ class CallService {
       return;
     }
     // An answer for the current call, whether it is the first answer
-    // (outgoing -> active) or a renegotiation answer after an ICE
-    // restart (already active). Anything else is ignored.
+    // (outgoing -> connecting) or a renegotiation answer after an ICE
+    // restart (already active — or still connecting, when the restart
+    // was attempted while media was establishing). Anything else is
+    // ignored.
     if (signal.callId != currentCallId) {
       return;
     }
-    final isRenegotiation = state.value == CallState.active;
+    final isRenegotiation = state.value == CallState.active ||
+        state.value == CallState.connecting;
     if (state.value != CallState.outgoing && !isRenegotiation) {
       return;
     }
@@ -1434,7 +1581,12 @@ class CallService {
       _ringTimer?.cancel();
       await _updateCallRow('ongoing');
       _answered = true;
-      state.value = CallState.active;
+      // Answered, not yet connected: `connecting` until media really
+      // flows (see [_maybePromoteToActive]). The timer only starts on
+      // `active`, so the caller never sees a running timer over
+      // silence.
+      state.value = CallState.connecting;
+      _maybePromoteToActive();
       // The call is answered: media must establish within the
       // watchdog window.
       _armMediaWatchdog();
@@ -1551,6 +1703,49 @@ class CallService {
     } catch (_) {}
   }
 
+  /// TURN relay servers for the current call, from the 24h cache when
+  /// it is still valid (see [isTurnCacheValid]) instead of a serial
+  /// 5s network fetch on every call. Only fetches synchronously when
+  /// there is no valid cache. When the cache is still valid but
+  /// expires within an hour, it is used for this call and refreshed
+  /// in the background (fire-and-forget) so the next call gets fresh
+  /// servers. Never throws: a failed fetch returns an empty list and
+  /// the call proceeds STUN-only.
+  Future<List<Map<String, dynamic>>> _turnIceServersForCall() async {
+    final now = DateTime.now();
+    final cached = _cachedTurnIceServers;
+    if (cached != null &&
+        isTurnCacheValid(fetchedAt: _cachedTurnIceServersAt, now: now)) {
+      if (shouldRefreshTurnCache(
+          fetchedAt: _cachedTurnIceServersAt, now: now)) {
+        unawaited(_refreshTurnCacheInBackground());
+      }
+      turnServersAvailable.value = cached.isNotEmpty;
+      return cached;
+    }
+    final servers = await _fetchTurnIceServers();
+    if (servers.isNotEmpty) {
+      _cachedTurnIceServers = servers;
+      _cachedTurnIceServersAt = now;
+    }
+    return servers;
+  }
+
+  /// Refreshes the cached TURN servers without touching the current
+  /// call: the cache is only replaced when fresh servers actually
+  /// arrived, and [turnServersAvailable] is left alone so a failed
+  /// background refresh never flashes the "no TURN" warning mid-call.
+  /// Never throws.
+  Future<void> _refreshTurnCacheInBackground() async {
+    try {
+      final servers = await _fetchTurnIceServersRaw();
+      if (servers.isNotEmpty) {
+        _cachedTurnIceServers = servers;
+        _cachedTurnIceServersAt = DateTime.now();
+      }
+    } catch (_) {}
+  }
+
   /// Fetches short-lived TURN relay servers for the current call from
   /// the `turn-credentials` Edge Function (Cloudflare Realtime, 24h
   /// credentials minted server-side from TURN_KEY_ID / TURN_API_TOKEN),
@@ -1559,20 +1754,27 @@ class CallService {
   /// function, missing secrets (503 `turn_not_configured`), a provider
   /// error, or a timeout all return an empty list and the call
   /// proceeds STUN-only — a failed TURN fetch never blocks a call.
-  /// Never throws. Called once per call, before the peer connection
+  /// Never throws. Called via [_turnIceServersForCall] (which caches
+  /// the result for 24h) once per call, before the peer connection
   /// is created (startCall / acceptCall); an ICE restart within the
   /// same call reuses the fetched list instead of refetching.
   Future<List<Map<String, dynamic>>> _fetchTurnIceServers() async {
+    final servers = await _fetchTurnIceServersRaw();
+    turnServersAvailable.value = servers.isNotEmpty;
+    return servers;
+  }
+
+  /// The raw `turn-credentials` fetch without the availability
+  /// bookkeeping, so a background cache refresh never touches the
+  /// current call's [turnServersAvailable]. Never throws.
+  Future<List<Map<String, dynamic>>> _fetchTurnIceServersRaw() async {
     try {
       final response = await _client.functions
           .invoke('turn-credentials')
           .timeout(const Duration(seconds: 5));
-      final servers = parseTurnIceServers(response.data);
-      turnServersAvailable.value = servers.isNotEmpty;
-      return servers;
+      return parseTurnIceServers(response.data);
     } catch (e) {
       debugPrint('Helba calls: TURN fetch failed, STUN-only: $e');
-      turnServersAvailable.value = false;
       return [];
     }
   }
@@ -1779,9 +1981,17 @@ class CallService {
       // Realtime is down can fetch it by polling. Fire-and-forget.
       unawaited(_storeIceCandidate(callId, myId, candidate.toMap()));
     };
-    pc.onAddStream = (stream) => remoteStream.value = stream;
+    pc.onAddStream = (stream) {
+      remoteStream.value = stream;
+      // A remote stream arrived: if the connection is already
+      // Connected, media is flowing and the call becomes active.
+      _maybePromoteToActive();
+    };
     pc.onTrack = (event) {
-      if (event.streams.isNotEmpty) remoteStream.value = event.streams.first;
+      if (event.streams.isNotEmpty) {
+        remoteStream.value = event.streams.first;
+        _maybePromoteToActive();
+      }
     };
     // End the call (with a message) if the connection fails or stays
     // disconnected, instead of a silent black screen / silence (#11).
@@ -1832,13 +2042,40 @@ class CallService {
     }
   }
 
+  /// Promotes a `connecting` call to `active` the moment media is
+  /// really flowing (peer connection Connected AND a remote stream
+  /// arrived — see [isMediaReady]). Called from the connection-state
+  /// handler, from the remote-track callbacks, and right after the
+  /// state becomes `connecting` (the connection may already be
+  /// Connected by then). On promotion the media watchdog is cancelled
+  /// and the DB poll slows to its steady-state rate. No-op unless the
+  /// call is `connecting` and media is ready.
+  void _maybePromoteToActive() {
+    if (state.value != CallState.connecting) return;
+    final connectionState = _pc?.connectionState ??
+        RTCPeerConnectionState.RTCPeerConnectionStateNew;
+    if (!isMediaReady(
+        connectionState: connectionState,
+        hasRemoteStream: remoteStream.value != null)) {
+      return;
+    }
+    state.value = CallState.active;
+    _cancelMediaWatchdog();
+    // The connection is up: the DB poll can slow to its steady rate.
+    _restartDbPollWithConnectedInterval();
+  }
+
   void _onConnectionState(RTCPeerConnectionState connectionState) {
     if (connectionState ==
         RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
       _connectionTimer?.cancel();
       isReconnecting.value = false;
-      // Media established: the watchdog no longer applies.
-      _cancelMediaWatchdog();
+      // The connection alone does not mean audio: only promote to
+      // `active` (and cancel the watchdog) once a remote stream has
+      // arrived too (see [_maybePromoteToActive]). Until then the
+      // watchdog stays armed, so a connection that never carries
+      // media still ends with «تعذّر الاتصال».
+      _maybePromoteToActive();
       return;
     }
     if (connectionState ==
@@ -1856,7 +2093,8 @@ class CallService {
       _connectionTimer?.cancel();
       _connectionTimer = Timer(disconnectReconnectDelay, () {
         if ((state.value == CallState.active ||
-                state.value == CallState.outgoing) &&
+                state.value == CallState.outgoing ||
+                state.value == CallState.connecting) &&
             _pc?.connectionState ==
                 RTCPeerConnectionState
                     .RTCPeerConnectionStateDisconnected) {
@@ -1866,12 +2104,14 @@ class CallService {
     }
   }
 
-  /// Attempts one ICE restart when the call is active or outgoing and
-  /// no restart has been tried yet for this call; otherwise ends the
-  /// call with a connection error. At most one restart per call.
+  /// Attempts one ICE restart when the call is active, connecting or
+  /// outgoing and no restart has been tried yet for this call;
+  /// otherwise ends the call with a connection error. At most one
+  /// restart per call.
   void _tryIceRestartOrEnd() {
-    final isActiveCall =
-        state.value == CallState.active || state.value == CallState.outgoing;
+    final isActiveCall = state.value == CallState.active ||
+        state.value == CallState.outgoing ||
+        state.value == CallState.connecting;
     if (shouldAttemptIceRestart(
         attempted: _iceRestartAttempted, isActiveCall: isActiveCall)) {
       unawaited(_restartIce().catchError((_) {}));
@@ -1925,7 +2165,8 @@ class CallService {
 
   Future<void> _endWithConnectionError() async {
     if (state.value != CallState.active &&
-        state.value != CallState.outgoing) {
+        state.value != CallState.outgoing &&
+        state.value != CallState.connecting) {
       return;
     }
     callError.value = 'تعذّر الاتصال';
@@ -2003,12 +2244,10 @@ class CallService {
   // polls the calls row for a restart re-offer. Realtime stays the
   // primary (fast) route; the DB poll is the fallback that makes calls
   // work with Realtime down. Best-effort throughout: a failed poll
-  // never breaks the call.
-
-  /// How often the DB signalling poll runs (3s). Fast enough that a
-  /// DB-routed answer/candidate arrives within a few seconds of being
-  /// stored, slow enough not to hammer the database.
-  static const _dbPollInterval = Duration(seconds: 3);
+  // never breaks the call. The poll runs every
+  // [dbPollIntervalConnecting] while the connection is still
+  // establishing and every [dbPollIntervalConnected] once connected
+  // (see [_currentDbPollInterval]).
 
   /// How long an answered call may go without media before the
   /// watchdog ends it (20s).
@@ -2016,9 +2255,27 @@ class CallService {
 
   void _startDbSignallingPoll() {
     _dbPollTimer?.cancel();
-    _dbPollTimer = Timer.periodic(_dbPollInterval, (_) {
+    _dbPollTimer = Timer.periodic(_currentDbPollInterval(), (_) {
       unawaited(_pollDbSignalling().catchError((_) {}));
     });
+  }
+
+  /// The DB poll interval for the current connection state (see
+  /// [dbPollInterval]): 1s while still establishing, 3s once
+  /// connected.
+  Duration _currentDbPollInterval() {
+    final connected = _pc?.connectionState ==
+        RTCPeerConnectionState.RTCPeerConnectionStateConnected;
+    return dbPollInterval(connected: connected);
+  }
+
+  /// Restarts the DB signalling poll at the connected (3s) rate.
+  /// Called when the call becomes active; a no-op when no poll is
+  /// running. The poll started at the 1s connecting rate, so without
+  /// this it would keep polling every second for the whole call.
+  void _restartDbPollWithConnectedInterval() {
+    if (_dbPollTimer == null) return;
+    _startDbSignallingPoll();
   }
 
   void _stopDbSignallingPoll() {
@@ -2039,7 +2296,15 @@ class CallService {
       final pc = _pc;
       if (callId == null || myId == null || pc == null) return;
       final st = state.value;
-      if (st != CallState.outgoing && st != CallState.active) return;
+      // The poll runs while the call is outgoing, connecting or
+      // active: a `connecting` call still needs its answer and ICE
+      // candidates, and the poll must not stop the moment the answer
+      // is applied.
+      if (st != CallState.outgoing &&
+          st != CallState.active &&
+          st != CallState.connecting) {
+        return;
+      }
       // One select for the calls row covers the answer (F2) and the
       // restart re-offer (F5) checks below.
       Map? row;
@@ -2073,8 +2338,11 @@ class CallService {
         // F5: a restart re-offer stored by the peer. Apply only when
         // it differs from both the last offer applied as remote AND
         // the last offer this side stored, so this side never applies
-        // its own re-offer or re-applies one it already has.
-        if (state.value == CallState.active) {
+        // its own re-offer or re-applies one it already has. A
+        // `connecting` call applies it too: the peer may restart ICE
+        // while this side is still establishing media.
+        if (state.value == CallState.active ||
+            state.value == CallState.connecting) {
           final offerSdp = dbOfferSdp(row);
           if (offerSdp != null &&
               offerSdp != _lastRemoteOfferSdp &&
@@ -2086,7 +2354,8 @@ class CallService {
       // F3: the peer's ICE candidates, for either side whose Realtime
       // subscription is down.
       if (state.value == CallState.outgoing ||
-          state.value == CallState.active) {
+          state.value == CallState.active ||
+          state.value == CallState.connecting) {
         await _pollDbIceCandidates(callId, myId);
       }
     } finally {
@@ -2098,7 +2367,8 @@ class CallService {
   /// first answer (caller side, state outgoing). Mirror of the
   /// first-answer path in [_handleAnswer], but best-effort: a bad SDP
   /// never hangs up (the Realtime answer / ring timer still apply).
-  /// Returns true when the answer was applied and the call is active.
+  /// Returns true when the answer was applied and the call is
+  /// connecting (media still to establish — see [_maybePromoteToActive]).
   Future<bool> _applyDbAnswer(String sdp, String sdpType) async {
     if (state.value != CallState.outgoing) return false;
     final pc = _pc;
@@ -2112,7 +2382,8 @@ class CallService {
     _ringTimer?.cancel();
     await _updateCallRow('ongoing');
     _answered = true;
-    state.value = CallState.active;
+    state.value = CallState.connecting;
+    _maybePromoteToActive();
     _armMediaWatchdog();
     return true;
   }
@@ -2127,7 +2398,10 @@ class CallService {
     final callId = currentCallId;
     final peerId = currentPeerId;
     if (pc == null || callId == null || peerId == null) return;
-    if (state.value != CallState.active) return;
+    if (state.value != CallState.active &&
+        state.value != CallState.connecting) {
+      return;
+    }
     try {
       await pc.setRemoteDescription(RTCSessionDescription(sdp, sdpType));
       _lastRemoteOfferSdp = sdp;
@@ -2195,11 +2469,11 @@ class CallService {
     }
   }
 
-  /// Arms the media watchdog (F4): 20s after the call becomes active,
-  /// the call ends with «تعذّر الاتصال» when no remote stream arrived
-  /// and the connection is not Connected. Cancelled when the
-  /// connection becomes Connected (see [_onConnectionState]) or the
-  /// call ends.
+  /// Arms the media watchdog (F4): 20s after the call is answered
+  /// (state `connecting`), the call ends with «تعذّر الاتصال» when no
+  /// remote stream arrived and the connection is not Connected.
+  /// Cancelled when media establishes (see [_maybePromoteToActive])
+  /// or the call ends.
   void _armMediaWatchdog() {
     _mediaWatchdogTimer?.cancel();
     _mediaWatchdogTimer = Timer(_mediaWatchdogTimeout, () {
@@ -2213,7 +2487,14 @@ class CallService {
   }
 
   Future<void> _checkMediaWatchdog() async {
-    if (state.value != CallState.active) return;
+    // The watchdog guards the `connecting` state (an answered call
+    // whose media never established). An `active` call has media by
+    // definition, so the check is a no-op there — but it is kept in
+    // the guard so a promotion race cannot skip it.
+    if (state.value != CallState.connecting &&
+        state.value != CallState.active) {
+      return;
+    }
     final hasRemote = remoteStream.value != null;
     final connected = _pc?.connectionState ==
         RTCPeerConnectionState.RTCPeerConnectionStateConnected;
@@ -2294,8 +2575,10 @@ class CallService {
     _lastRemoteOfferSdp = null;
     _lastStoredOfferSdp = null;
     _lastAppliedAnswerSdp = null;
-    // Fresh TURN state for the next call: the next startCall /
-    // acceptCall re-fetches relay servers (24h credentials).
+    // Fresh TURN state for the next call: the per-call list is
+    // cleared, but the 24h credential cache ([_cachedTurnIceServers] /
+    // [_cachedTurnIceServersAt]) survives, so the next call reuses it
+    // instead of re-fetching.
     _turnIceServers = [];
     turnServersAvailable.value = false;
     // A stale push warning must not survive into the next call (fix 8).
@@ -2685,16 +2968,18 @@ class _CallPageState extends State<CallPage> {
           child: ValueListenableBuilder<CallState>(
             valueListenable: _service.state,
             builder: (_, callState, __) {
-              final statusText = callState == CallState.outgoing
-                  ? 'جارٍ الاتصال…'
-                  : callState == CallState.active
-                      ? formatCallDuration(_elapsed)
-                      : callState == CallState.ended
-                          ? (_endStatusText ?? 'انتهت المكالمة')
-                          // After `ended` the service resets to idle
-                          // (~300ms) before this page pops; keep showing
-                          // the captured end status until then.
-                          : (_endStatusText ?? 'مكالمة');
+              final statusText =
+                  callState == CallState.outgoing ||
+                          callState == CallState.connecting
+                      ? 'جارٍ الاتصال…'
+                      : callState == CallState.active
+                          ? formatCallDuration(_elapsed)
+                          : callState == CallState.ended
+                              ? (_endStatusText ?? 'انتهت المكالمة')
+                              // After `ended` the service resets to idle
+                              // (~300ms) before this page pops; keep showing
+                              // the captured end status until then.
+                              : (_endStatusText ?? 'مكالمة');
               return Stack(children: [
                 if (isVideo)
                   Positioned.fill(

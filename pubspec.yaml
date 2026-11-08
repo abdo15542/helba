@@ -33,3 +33,7 @@ dev_dependencies:
   flutter_lints: ^5.0.0
 flutter:
   uses-material-design: true
+  assets:
+    # The incoming-call ringtone (also copied to res/raw/ by the CI
+    # workflow, where the helba_calls notification channel plays it).
+    - assets/ringtones/helba_ringtone.wav

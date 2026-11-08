@@ -65,6 +65,19 @@ const pushMessagesChannelId = 'helba_messages';
 /// The `send-call-push` Edge Function sends on this channel id.
 const pushCallsChannelId = 'helba_calls';
 
+/// The explicit FirebaseOptions for the Helba project (helba-379fd).
+/// Shared by [setupPushNotifications] (main isolate) and the background
+/// message handler (see main.dart), so both isolates initialise the
+/// same Firebase app. These four values are public client identifiers
+/// (the same kind as the Supabase publishable key already in the
+/// codebase), not secrets.
+const helbaFirebaseOptions = FirebaseOptions(
+  apiKey: 'AIzaSyBsJf8p3BHjQCJHU9PkFmPy87DFScWJr3k',
+  appId: '1:1097242039750:android:d9b1cfae293fad3a3e0ec7',
+  messagingSenderId: '1097242039750',
+  projectId: 'helba-379fd',
+);
+
 /// Maximum characters of a message body shown in a notification preview.
 const pushPreviewMaxLength = 100;
 
@@ -265,6 +278,77 @@ final ValueNotifier<int?> pendingAppUpdateBuild = ValueNotifier(null);
 final ValueNotifier<CallPushPayload?> pendingIncomingCallPush =
     ValueNotifier(null);
 
+/// An incoming call the user declined from its notification (the
+/// Decline action) while the app was closed or backgrounded, waiting
+/// to be declined: set when the Decline action is tapped. CallService
+/// observes this (see startListening) and declines the call once the
+/// user is signed in, then clears it. Same pattern as
+/// [pendingIncomingCallPush].
+final ValueNotifier<CallPushPayload?> pendingDeclinedCallPush =
+    ValueNotifier(null);
+
+/// Notification action ids for the incoming-call notification (Answer
+/// / Decline). The payload is the encoded call payload (see
+/// [encodeCallPushPayload]); the action id tells the response handler
+/// which button was tapped.
+const callNotificationActionAnswer = 'answer';
+const callNotificationActionDecline = 'decline';
+
+/// The Android notification channel for incoming calls: max
+/// importance, vibration, and the bundled ringtone as its sound, so a
+/// call push rings even when the app is closed (the system plays the
+/// channel sound when the notification posts). Shared by the main
+/// isolate ([_setupLocalNotifications]) and the background handler
+/// (main.dart), so both create the same channel. The sound file is
+/// `assets/ringtones/helba_ringtone.wav`, copied to
+/// `android/app/src/main/res/raw/helba_ringtone.wav` by the CI
+/// workflow; the resource name (without extension) is what
+/// [RawResourceAndroidNotificationSound] takes.
+const helbaCallsChannel = AndroidNotificationChannel(
+  pushCallsChannelId,
+  'مكالمات هلبة',
+  description: 'إشعارات المكالمات الواردة',
+  importance: Importance.max,
+  playSound: true,
+  sound: RawResourceAndroidNotificationSound('helba_ringtone'),
+  enableVibration: true,
+);
+
+/// The Android details for an incoming-call notification: full-screen
+/// intent on the [helbaCallsChannel] (max importance, ringtone sound,
+/// vibration) with Answer / Decline actions, ongoing until the call is
+/// answered / declined / ends. Shared by the foreground path
+/// ([_showForegroundMessage]) and the background handler (main.dart),
+/// so a closed-app call rings and answers exactly like a foreground
+/// one. The payload is the encoded call payload (see
+/// [encodeCallPushPayload]).
+AndroidNotificationDetails incomingCallNotificationDetails() =>
+    const AndroidNotificationDetails(
+      pushCallsChannelId,
+      'مكالمات هلبة',
+      importance: Importance.max,
+      priority: Priority.max,
+      category: AndroidNotificationCategory.call,
+      fullScreenIntent: true,
+      ongoing: true,
+      autoCancel: false,
+      playSound: true,
+      enableVibration: true,
+      actions: <AndroidNotificationAction>[
+        AndroidNotificationAction(
+          callNotificationActionAnswer,
+          'رد',
+          showsUserInterface: true,
+        ),
+        AndroidNotificationAction(
+          callNotificationActionDecline,
+          'رفض',
+          showsUserInterface: true,
+          cancelNotification: true,
+        ),
+      ],
+    );
+
 /// True while CallService is showing a ringing incoming call. Push.dart
 /// reads it (never writes it except for this initial false) to avoid
 /// showing a second, duplicate call notification for a call the in-app
@@ -383,15 +467,9 @@ Future<void> setupPushNotifications() async {
       // google-services.json file nor the google-services Gradle plugin.
       // These four values are public client identifiers, not secrets. If
       // initialisation still fails for any reason, push stays disabled and
-      // nothing else breaks.
-      await Firebase.initializeApp(
-        options: const FirebaseOptions(
-          apiKey: 'AIzaSyBsJf8p3BHjQCJHU9PkFmPy87DFScWJr3k',
-          appId: '1:1097242039750:android:d9b1cfae293fad3a3e0ec7',
-          messagingSenderId: '1097242039750',
-          projectId: 'helba-379fd',
-        ),
-      );
+      // nothing else breaks. The options are shared with the background
+      // message handler (see [helbaFirebaseOptions] / main.dart).
+      await Firebase.initializeApp(options: helbaFirebaseOptions);
       _firebaseInitialized = true;
     }
   } catch (e) {
@@ -555,9 +633,15 @@ Future<void> _setupLocalNotifications() async {
       final payload = response.payload?.trim() ?? '';
       final call = decodeCallPushPayload(payload);
       if (call != null) {
-        // Tapping an incoming-call notification opens the app to the
-        // incoming call screen (CallService handles it, like a push).
-        pendingIncomingCallPush.value = call;
+        // A Decline action tap declines the call (CallService handles
+        // it, like a push); a tap on the notification body or the
+        // Answer action opens the app to the incoming call screen
+        // (CallService handles it, like a push).
+        if (response.actionId == callNotificationActionDecline) {
+          pendingDeclinedCallPush.value = call;
+        } else {
+          pendingIncomingCallPush.value = call;
+        }
         return;
       }
       final updateBuild = decodeAppUpdatePushPayload(payload);
@@ -590,16 +674,15 @@ Future<void> _setupLocalNotifications() async {
       importance: Importance.high,
     ),
   );
-  await android?.createNotificationChannel(
-    const AndroidNotificationChannel(
-      pushCallsChannelId,
-      'مكالمات هلبة',
-      description: 'إشعارات المكالمات الواردة',
-      importance: Importance.max,
-      playSound: true,
-      enableVibration: true,
-    ),
-  );
+  // Delete the old helba_calls channel first, then recreate it with
+  // the ringtone sound (see [helbaCallsChannel]): Android never
+  // updates an existing channel's sound, so a channel created by an
+  // older build (no sound) would keep silencing call notifications
+  // on an in-place update. Deleting + recreating applies the ringtone
+  // to existing installs. The messages channel is untouched: its
+  // settings are unchanged.
+  await android?.deleteNotificationChannel(channelId: pushCallsChannelId);
+  await android?.createNotificationChannel(helbaCallsChannel);
 }
 
 /// Cancels the tray notification for an incoming call (by call id).
@@ -736,19 +819,12 @@ Future<void> _showForegroundMessage(RemoteMessage message) async {
         id: stableNotificationId(call.callId),
         title: call.callerName ?? 'هلبة',
         body: isVideo ? 'مكالمة فيديو واردة' : 'مكالمة صوتية واردة',
-        notificationDetails: const NotificationDetails(
-          android: AndroidNotificationDetails(
-            pushCallsChannelId,
-            'مكالمات هلبة',
-            importance: Importance.max,
-            priority: Priority.max,
-            category: AndroidNotificationCategory.call,
-            fullScreenIntent: true,
-            ongoing: true,
-            autoCancel: false,
-            playSound: true,
-            enableVibration: true,
-          ),
+        // Shared with the background handler (main.dart): full-screen
+        // intent on the helba_calls channel with Answer / Decline
+        // actions, so a foreground call answers exactly like a
+        // closed-app one.
+        notificationDetails: NotificationDetails(
+          android: incomingCallNotificationDetails(),
         ),
         payload: encodeCallPushPayload(call),
       );

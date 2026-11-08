@@ -41,6 +41,23 @@ jobs:
       - name: Generate Android platform files
         run: flutter create --platforms=android .
 
+      - name: Install call ringtone as an Android raw resource
+        shell: bash
+        run: |
+          # The incoming-call notification channel (helba_calls) plays
+          # this file as its sound (RawResourceAndroidNotificationSound
+          # in lib/src/push.dart). The file lives in the repo under
+          # assets/ringtones/; the generated android/ tree has no
+          # res/raw/, so copy it in now. Fail LOUDLY if it is missing:
+          # a build without it would ship a silent call channel.
+          mkdir -p android/app/src/main/res/raw
+          if [ ! -f assets/ringtones/helba_ringtone.wav ]; then
+            echo "ERROR: assets/ringtones/helba_ringtone.wav is missing from the repo — refusing to build with a silent call channel" && exit 1
+          fi
+          cp assets/ringtones/helba_ringtone.wav android/app/src/main/res/raw/helba_ringtone.wav
+          test -s android/app/src/main/res/raw/helba_ringtone.wav || (echo "ERROR: copied ringtone is empty" && exit 1)
+          echo "Installed helba_ringtone.wav as android raw resource"
+
       - name: Install stable debug keystore
         shell: bash
         run: |
@@ -532,7 +549,12 @@ jobs:
           grep -q 'android:host.*chat' "$DUMP_FILE" || (echo "Built APK is missing the chat deep-link host" && exit 1)
           grep -q 'firebase_messaging_installation_id_enabled' "$DUMP_FILE" || (echo "Built APK is missing the FCM Installation ID opt-in meta-data" && exit 1)
           grep -q 'package="com.example.helba"' "$DUMP_FILE" || (echo "Built APK package is not com.example.helba (FirebaseOptions in lib/src/push.dart hardcode that package)" && exit 1)
-          echo "Built APK verified: INTERNET, helba deep links (auth + chat), FID opt-in meta-data, package com.example.helba"
+          # The helba_calls channel sound is a raw resource (copied in by
+          # the "Install call ringtone" step): it must be packaged, or
+          # closed-app calls ring silently. aapt2 may rename raw entries,
+          # so match the resource name, not a fixed path.
+          unzip -l "$APK" | grep -q 'helba_ringtone' || (echo "Built APK is missing the helba_ringtone raw resource (call channel sound)" && exit 1)
+          echo "Built APK verified: INTERNET, helba deep links (auth + chat), FID opt-in meta-data, package com.example.helba, helba_ringtone raw resource"
           rm -f "$DUMP_FILE"
 
       - name: Verify stable signing certificate
