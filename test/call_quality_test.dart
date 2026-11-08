@@ -74,11 +74,10 @@ void main() {
     });
   });
 
-  group('turnIceServers', () {
-    test('is empty by default: STUN-only until a provider is chosen', () {
-      expect(turnIceServers, isEmpty);
-    });
-  });
+  // (No static turnIceServers list any more: TURN servers are fetched
+  // per call from the `turn-credentials` Edge Function — see
+  // parseTurnIceServers in turn_credentials_test.dart. An empty fetch
+  // result is the STUN-only fallback.)
 
   group('isRenegotiationOffer', () {
     test('active call, same callId, SDP present -> renegotiation', () {
