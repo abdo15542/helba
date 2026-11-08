@@ -63,6 +63,11 @@ const SEND_CONCURRENCY = 5;
 const TOKEN_REFRESH_EARLY_SECONDS = 300;
 // OAuth tokens are minted with a 60-minute expiry (see mintAccessToken).
 const TOKEN_TTL_SECONDS = 60 * 60;
+// How long a call push stays deliverable (seconds). A call only rings
+// for 60s (callRingTimeout in lib/src/calls.dart): a message delivered
+// after the window would wake the callee for a call that already
+// ended, so FCM must drop it instead (android.ttl + apns-expiration).
+const CALL_PUSH_TTL_SECONDS = 60;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -367,10 +372,20 @@ Deno.serve(async (req: Request) => {
               notification: { title: callerName, body: notificationBody },
               android: {
                 priority: "high",
+                // Drop the message after the 60s ring window instead
+                // of waking the callee for a call that already ended.
+                ttl: `${CALL_PUSH_TTL_SECONDS}s`,
                 notification: {
                   channel_id: "helba_calls",
                   click_action: "FLUTTER_NOTIFICATION_CLICK",
                   sound: "default",
+                },
+              },
+              apns: {
+                headers: {
+                  "apns-expiration": String(
+                    Math.floor(Date.now() / 1000) + CALL_PUSH_TTL_SECONDS,
+                  ),
                 },
               },
               data: {
