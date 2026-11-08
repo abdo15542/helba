@@ -239,6 +239,27 @@ bool isRenegotiationOffer({
     signalCallId == currentCallId &&
     sdp != null;
 
+/// The offer SDP stored on a calls row, or null when the row carries
+/// none (the caller has not stored it yet, or the value is blank). A
+/// non-string or blank/whitespace-only value counts as absent. Pure:
+/// unit-tested. Used by [CallService.acceptCall] as the database
+/// fallback when the offer never arrived over Realtime broadcast.
+String? dbOfferSdp(Map? row) {
+  if (row == null) return null;
+  final sdp = row['offer_sdp'];
+  if (sdp is! String) return null;
+  if (sdp.trim().isEmpty) return null;
+  return sdp;
+}
+
+/// The stored offer SDP type, defaulting to 'offer' when the row
+/// carries none (missing, non-string, or blank). Pure: unit-tested.
+String dbOfferSdpType(Map? row) {
+  final type = row?['offer_sdp_type'];
+  if (type is String && type.trim().isNotEmpty) return type;
+  return 'offer';
+}
+
 /// Terminal call statuses: a row in one of these never changes again
 /// (migration 017's transition trigger rejects every move out of them).
 bool isTerminalCallStatus(String? status) => switch (status) {
@@ -941,6 +962,34 @@ class CallService {
       effective = current;
     }
     if (effective.sdp == null) {
+      // Database fallback first: the caller stores the offer SDP on
+      // the calls row at call start, so a callee whose Realtime offer
+      // never arrived (Realtime timed out) can fetch it with a plain
+      // select instead of waiting on the requestOffer resend. A
+      // missing row or a failed select falls through to the
+      // requestOffer wait below.
+      try {
+        final row = await _client
+            .from('calls')
+            .select('offer_sdp,offer_sdp_type')
+            .eq('id', signal.callId)
+            .maybeSingle();
+        final dbSdp = dbOfferSdp(row);
+        if (dbSdp != null) {
+          effective = CallSignal(
+            type: CallSignalType.offer,
+            from: signal.from,
+            to: myId,
+            callId: signal.callId,
+            callType: signal.callType,
+            payload: {'sdp': dbSdp, 'type': dbOfferSdpType(row)},
+          );
+        }
+      } catch (_) {
+        // Fall through to the requestOffer wait below.
+      }
+    }
+    if (effective.sdp == null) {
       // No SDP yet: ask the caller to resend the stored offer and wait
       // for it (bounded). The caller is still ringing, so the offer
       // should arrive immediately; a timeout means they are gone.
@@ -990,6 +1039,11 @@ class CallService {
           callId: effective.callId,
           callType: effective.callType,
           payload: {'sdp': answer.sdp, 'type': answer.type}));
+      // Store the answer on the calls row as well (future caller-side
+      // fallback; the caller currently reads the answer over
+      // Realtime). Fire-and-forget: it is not on the critical path.
+      unawaited(
+          _storeAnswerSdp(effective.callId, answer.sdp, answer.type));
       await _updateCallRow('ongoing');
       _answered = true;
       incomingCall.value = null;
@@ -1087,6 +1141,13 @@ class CallService {
             callId: callId,
             callType: callType,
             payload: {'sdp': offer.sdp, 'type': offer.type}));
+        // Store the offer on the calls row as well: a callee whose
+        // Realtime offer never arrived can fetch it with a plain
+        // select on accept instead of waiting on the requestOffer
+        // resend. Awaited (so the row has it before the callee can
+        // answer) but best-effort — a failed store never breaks the
+        // call, the Realtime offer is still the primary path.
+        await _storeOfferSdp(callId, offer.sdp, offer.type);
         // Wake the callee if their app is closed or backgrounded: the
         // Realtime offer only reaches a connected client. Fix 8: the
         // push is AWAITED (bounded to 5s inside _sendCallPush) and its
@@ -1698,6 +1759,34 @@ class CallService {
     } catch (_) {
       // History is best-effort; a failed update must never break the call.
     }
+  }
+
+  /// Best-effort store of the offer SDP on the calls row (signalling
+  /// fallback for a callee whose Realtime offer never arrived). Never
+  /// throws; a failed store leaves the Realtime offer as the only
+  /// route. The [callId] is the calls row id.
+  Future<void> _storeOfferSdp(
+      String callId, String? sdp, String? type) async {
+    if (sdp == null || sdp.isEmpty) return;
+    try {
+      await _client.from('calls').update({
+        'offer_sdp': sdp,
+        'offer_sdp_type': type ?? 'offer',
+      }).eq('id', callId);
+    } catch (_) {}
+  }
+
+  /// Best-effort store of the answer SDP on the calls row (stored for
+  /// a future caller-side fallback). Never throws.
+  Future<void> _storeAnswerSdp(
+      String callId, String? sdp, String? type) async {
+    if (sdp == null || sdp.isEmpty) return;
+    try {
+      await _client.from('calls').update({
+        'answer_sdp': sdp,
+        'answer_sdp_type': type ?? 'answer',
+      }).eq('id', callId);
+    } catch (_) {}
   }
 
   void _resetCall() {
