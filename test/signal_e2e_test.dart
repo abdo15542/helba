@@ -277,6 +277,7 @@ SignalSync _makeSync(
     userId: userId,
     deviceUuid: deviceUuid,
     sentPlaintexts: SentSignalPlaintextStore(backend),
+    decryptAttempts: SignalDecryptAttemptStore(backend),
   );
 }
 
@@ -712,6 +713,52 @@ void main() {
         'after reset',
       );
     });
+
+    test('healSessionFor rebuilds a desynced session in one call',
+        timeout: const Timeout(Duration(minutes: 2)), () async {
+      await LibSignal.init();
+
+      final store = FakeSignalBundleStore();
+      const aliceDevice = 'alice-device-uuid-4002';
+      const bobDevice = 'bob-device-uuid-4002';
+      final alice = _makeSync(
+        MemoryKvStore(),
+        userId: 'alice',
+        deviceUuid: aliceDevice,
+        store: store,
+      );
+      final bob = _makeSync(
+        MemoryKvStore(),
+        userId: 'bob',
+        deviceUuid: bobDevice,
+        store: store,
+      );
+      await bob.ensurePublished(minOneTimePreKeys: 5, minKyberPreKeys: 2);
+
+      final first = await alice.encryptFor('bob', bobDevice, 'before heal');
+      expect(first, isNotNull);
+      expect(await alice.hasSessionFor('bob', bobDevice), isTrue);
+
+      // The auto-heal: one call deletes the desynced session and
+      // rebuilds it from Bob's current bundle.
+      expect(await alice.healSessionFor('bob', bobDevice), isTrue);
+      expect(await alice.hasSessionFor('bob', bobDevice), isTrue);
+
+      // The next send is a pre-key message (first on the fresh
+      // session) and Bob decrypts it — the peer re-syncs.
+      final second = await alice.encryptFor('bob', bobDevice, 'after heal');
+      expect(second, isNotNull);
+      expect(second!.isPreKeyMessage, isTrue);
+      expect(
+        await bob.decryptFrom(
+          'alice',
+          aliceDevice,
+          second.ciphertextBase64,
+          second.isPreKeyMessage,
+        ),
+        'after heal',
+      );
+    });
   });
 
   group('failure paths', () {
@@ -833,6 +880,60 @@ void main() {
       expect(sentSignalPlaintextKey('abc'),
           isNot(sentSignalPlaintextKey('def')));
       expect(sentSignalPlaintextKey('abc'), isNot(startsWith('signal:')));
+    });
+  });
+
+  group('decrypt attempt store (persistent budget + one heal)', () {
+    test('attempts persist across store instances (chat reopen)',
+        () async {
+      final backend = MemoryKvStore();
+      // First "chat open": two failed attempts.
+      final first = SignalDecryptAttemptStore(backend);
+      expect(await first.attempts('msg-1'), 0);
+      expect(await first.recordAttempt('msg-1'), 1);
+      expect(await first.recordAttempt('msg-1'), 2);
+      // Second "chat open": a new store over the SAME backend still
+      // sees the two attempts — the budget is not reset by reopening.
+      final second = SignalDecryptAttemptStore(backend);
+      expect(await second.attempts('msg-1'), 2);
+      expect(await second.recordAttempt('msg-1'), 3);
+      // A different message is unaffected.
+      expect(await second.attempts('msg-2'), 0);
+    });
+
+    test('clear prunes attempts and heal marker', () async {
+      final backend = MemoryKvStore();
+      final store = SignalDecryptAttemptStore(backend);
+      await store.recordAttempt('msg-1');
+      await store.markHealed('msg-1');
+      expect(await store.attempts('msg-1'), 1);
+      expect(await store.wasHealed('msg-1'), isTrue);
+      await store.clear('msg-1');
+      await store.clearHealed('msg-1');
+      expect(await store.attempts('msg-1'), 0);
+      expect(await store.wasHealed('msg-1'), isFalse);
+    });
+
+    test('heal marker is per message', () async {
+      final backend = MemoryKvStore();
+      final store = SignalDecryptAttemptStore(backend);
+      expect(await store.wasHealed('msg-1'), isFalse);
+      await store.markHealed('msg-1');
+      expect(await store.wasHealed('msg-1'), isTrue);
+      expect(await store.wasHealed('msg-2'), isFalse);
+    });
+
+    test('keys are namespaced away from the protocol stores', () {
+      expect(
+        signalDecryptAttemptsKey('abc'),
+        'helba:signal-decrypt-attempts:abc',
+      );
+      expect(
+        signalDecryptHealedKey('abc'),
+        'helba:signal-decrypt-healed:abc',
+      );
+      expect(signalDecryptAttemptsKey('abc'), isNot(startsWith('signal:')));
+      expect(signalDecryptHealedKey('abc'), isNot(startsWith('signal:')));
     });
   });
 

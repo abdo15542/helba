@@ -147,6 +147,44 @@ void main() {
           isFalse);
     });
 
+    test('shouldHealSessionAfterFailure: only once, only at budget', () {
+      // Below the budget: no heal (the session may still converge).
+      expect(
+        shouldHealSessionAfterFailure(attempts: 0, wasHealed: false),
+        isFalse,
+      );
+      expect(
+        shouldHealSessionAfterFailure(
+          attempts: maxSignalDecryptAttempts - 1,
+          wasHealed: false,
+        ),
+        isFalse,
+      );
+      // Budget spent and never healed: heal once.
+      expect(
+        shouldHealSessionAfterFailure(
+          attempts: maxSignalDecryptAttempts,
+          wasHealed: false,
+        ),
+        isTrue,
+      );
+      // Already healed: never heal again for the same row.
+      expect(
+        shouldHealSessionAfterFailure(
+          attempts: maxSignalDecryptAttempts,
+          wasHealed: true,
+        ),
+        isFalse,
+      );
+      expect(
+        shouldHealSessionAfterFailure(
+          attempts: maxSignalDecryptAttempts + 5,
+          wasHealed: true,
+        ),
+        isFalse,
+      );
+    });
+
     test('shouldRefreshMessagesOnResume: only resumed refreshes', () {
       // A silently disconnected Realtime stream freezes the list
       // (rows that arrived while away never appear); rebuilding it on
